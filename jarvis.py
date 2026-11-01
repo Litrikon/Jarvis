@@ -456,6 +456,16 @@ def _shot_small(src_png):
     """v2.2.3: уменьшенная JPEG-копия скриншота (макс. 1600px) — в разы
     меньше image-токенов, ниже риск переполнить контекст 8192."""
     dst = os.path.join(DATA, "shot_small.jpg")
+    try:  # v3.5.0: сначала PIL in-process — быстро и без кодировки
+        from PIL import Image
+        with Image.open(src_png) as im:
+            w = min(1600, im.width)
+            h = int(im.height * w / im.width)
+            im.convert("RGB").resize((w, h)).save(dst, "JPEG", quality=82)
+        if os.path.exists(dst) and os.path.getsize(dst) > 5000:
+            return dst
+    except Exception:
+        pass
     try:
         ps_run(r"""
 Add-Type -AssemblyName System.Drawing
@@ -915,19 +925,80 @@ Get-Process|Where-Object {$_.CPU -gt 0}|Sort-Object CPU -Descending|Select-Objec
             txt_cpu += "• %s — %s\n" % tuple(ln.split("\t", 1))
     return txt_ram + "\n" + txt_cpu
 
-def take_shot():
-    out = ps_run(r"""
+def _station_locked():
+    """v3.5.0: True — станция залочена (Win+L). Входной десктоп открыт
+    только в незалоченной сессии — честный индикатор, без гаданий."""
+    try:
+        h = ctypes.windll.user32.OpenInputDesktop(0, False, 0x0100)
+        if h:
+            ctypes.windll.user32.CloseDesktop(h)
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _shot_ps():
+    """v3.5.0: запасной скрин через PowerShell CopyFromScreen.
+    ГРАБЛЯ v2.x-v3.4: у $bmp.Save(...) не хватало закрывающей скобки —
+    скрин падал ВСЕГДА, а вина сваливалась на «экран заблокирован»."""
+    ps_run(r"""
 Add-Type -AssemblyName System.Windows.Forms,System.Drawing
 $b=[System.Windows.Forms.SystemInformation]::VirtualScreen
 $bmp=New-Object System.Drawing.Bitmap $b.Width,$b.Height
 $g=[System.Drawing.Graphics]::FromImage($bmp)
 $g.CopyFromScreen($b.X,$b.Y,0,0,$bmp.Size)
-$bmp.Save('""" + SHOT + r"""',[System.Drawing.Imaging.ImageFormat]::Png
+$bmp.Save('%s',[System.Drawing.Imaging.ImageFormat]::Png)
 $g.Dispose();$bmp.Dispose()
-"OK"
-""", timeout=60)
-    if os.path.exists(SHOT) and os.path.getsize(SHOT) > 10000:
-        return SHOT
+'OK'
+""" % SHOT.replace("'", "''"), timeout=60)
+
+
+def _shot_ok():
+    """Скрин есть, не пустой и не сплошной чёрный (гасший монитор)."""
+    if not (os.path.exists(SHOT) and os.path.getsize(SHOT) > 10000):
+        return False
+    try:
+        from PIL import Image
+        with Image.open(SHOT) as im:
+            px = list(im.convert("L").resize((64, 36)).getdata())
+        return not (max(px) < 12 and sum(px) / len(px) < 10)
+    except ImportError:
+        return True  # PIL нет — хотя бы файл есть
+    except Exception:
+        return True
+
+
+def take_shot():
+    """v3.5.0: скрин in-process через PIL (процесс DPI-aware — честные
+    3840x2160), запасной путь — PowerShell. Погасший монитор будим
+    шевелением мыши и пробуем второй раз. Залоченный Win+L — честный
+    отказ (Windows прячет картинку даже от администратора)."""
+    for attempt in range(2):
+        try:
+            os.remove(SHOT)
+        except OSError:
+            pass
+        try:
+            from PIL import ImageGrab
+            ImageGrab.grab(all_screens=True).save(SHOT, "PNG")
+        except Exception as e:
+            log("shot PIL ERR: %s" % e)
+            try:
+                _shot_ps()
+            except Exception as e2:
+                log("shot PS ERR: %s" % e2)
+        if _shot_ok():
+            return SHOT
+        if attempt == 0:
+            try:  # разбудить погасший монитор (CONSOLELOCK=0 — без пароля)
+                import win_ctl
+                win_ctl.mouse_action("движение", x=100, y=100)
+                time.sleep(0.5)
+                win_ctl.mouse_action("движение", x=300, y=300)
+                time.sleep(1.5)
+            except Exception:
+                pass
     return None
 
 def cmd_shot():
@@ -935,7 +1006,10 @@ def cmd_shot():
         send_photo(SHOT, caption="📸 Экран ПК2, " + time.strftime("%d.%m %H:%M"))
         os.remove(SHOT)
         return None
-    return "⚠️ Скриншот не получился (экран заблокирован?)"
+    if _station_locked():
+        return ("🔒 Экран сейчас ЗАБЛОКИРОВАН (Win+L) — Windows прячет картинку "
+                "даже от меня. Разблокируй — и «скрин» сразу заработает.")
+    return "⚠️ Скриншот не получился (ошибка захвата — детали в jarvis.log)"
 
 def cmd_journal():
     out = ps_run(r"""
@@ -2343,8 +2417,10 @@ def brain_reply(text):
         if res == "SCREENSHOT":
             path = take_shot()
             if not path:
-                hist_append(text, "скриншот не удался (экран заблокирован)")
-                return "⚠️ Скриншот не получился — экран заблокирован?"
+                why = ("экран залочен (Win+L) — Windows прячет картинку"
+                       if _station_locked() else "ошибка захвата, см. jarvis.log")
+                hist_append(text, "скриншот не удался: " + why)
+                return "⚠️ Скриншот не получился: " + why + "."
             if not vision_available():
                 send_photo(path, caption="📸 Экран (зрение не загружено — просто фото)")
                 os.remove(path)
