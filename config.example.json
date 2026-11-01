@@ -1,0 +1,43 @@
+{
+    "token": "ТОКЕН_ТЕЛЕГРАМ_БОТА",
+    "chat_id": "ID_ЧАТА_ВЛАДЕЛЬЦА",
+    "llm_url": "http://127.0.0.1:1234",
+    "model_id": "qwen3.8-27b",
+    "llama_exe": "D:\\Jarvis\\llama_rocm\\llama-server.exe",
+    "llama_exe_cpu": "D:\\Jarvis\\llama_cpu\\llama-server.exe",
+    "model_path": "D:\\Jarvis\\models\\Qwen3.8-27B-GGUF\\Qwen3.8-27B-UD-Q3_K_XL.gguf",
+    "mmproj_path": "D:\\Jarvis\\models\\Qwen3.8-27B-GGUF\\mmproj-F16.gguf",
+    "llm_ngl": "99",
+    "llm_threads": "6",
+    "llm_ctx": "8192",
+    "llm_slots": "1",
+    "llm_max_tokens": "600",
+    "asr_exe": "D:\\Jarvis\\whisper\\whisper-cli.exe",
+    "asr_model": "D:\\Jarvis\\whisper\\models\\ggml-small.bin",
+    "asr_threads": "8",
+    "ffmpeg_exe": "D:\\Jarvis\\ffmpeg\\bin\\ffmpeg.exe",
+    "game_auto_vram": true,
+    "game_paths": [
+        "C:\\Program Files (x86)\\Steam\\steamapps\\common",
+        "D:\\SteamLibrary\\steamapps\\common",
+        "F:\\SteamLibrary\\steamapps\\common",
+        "F:\\games",
+        "C:\\Users\\USER\\AppData\\Local\\GameCenter"
+    ],
+    "game_exes_exclude": [
+        "steam.exe",
+        "steamwebhelper.exe",
+        "gamecenter.exe",
+        "epicgameslauncher.exe",
+        "unitycrashhandler64.exe",
+        "rockstarerrorhandler64.exe",
+        "socialclubhelper.exe"
+    ],
+    "files_dir": "E:\\Downloads\\Jarvis",
+    "ptt_enabled": true,
+    "ptt_key": "caps lock",
+    "ptt_speak": true,
+    "ptt_toast_sec": 15,
+    "piper_exe": "D:\\Jarvis\\piper\\piper.exe",
+    "piper_voice": "D:\\Jarvis\\piper\\voices\\ru_RU-irina-medium.onnx"
+}

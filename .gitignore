@@ -1,0 +1,46 @@
+# секреты и приватное — НИКОГДА в публичный репозиторий
+config.json
+*.token
+*.key
+*.pem
+
+# приватные данные ассистента
+memory/
+data/
+chat/chat.log
+chat/err*.log
+chat/out*.log
+ptt.log
+jarvis.log
+llama*.log
+__pycache__/
+*.pyc
+
+# тяжёлые бинарники и модели (не для гита)
+models/
+llama/
+llama_alt/
+llama_cpu/
+llama_rocm/
+whisper/
+ffmpeg/
+python/
+piper/
+
+# папки пользователей ассистента
+Входящие/
+
+# бэкапы и мусор
+*.bak
+jarvis_bak_*
+jarvis_v*
+chat_server_bak_*
+index_bak_*
+win_ctl_bak_*
+vram_ctl_bak_*
+brain_test_result.txt
+hello_v2_sent.txt
+t1.txt
+test_v22.py
+import_test.py
+send_hello.py
