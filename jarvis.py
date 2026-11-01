@@ -1001,6 +1001,93 @@ def take_shot():
                 pass
     return None
 
+def cmd_sensors():
+    """v3.5.0: живые датчики из HWiNFO (shared memory SM2) — температуры
+    GPU/CPU/платы, вентиляторы, мощности, диски. Данные уже лежат в памяти
+    HWiNFO64: ничего не запускаем и не открываем (просьба Шефа 02.11 —
+    «это можно всё брать с HWiNFO», без Adrenalin глазами)."""
+    try:
+        import hwinfo_sensors as hw
+        rows = hw.read_all()
+    except Exception as e:
+        return "Датчики недоступны: %s (HWiNFO64 запущен?)" % e
+    if not rows:
+        return ("Датчики пусты — HWiNFO64 не запущен или в его настройках "
+                "выключен Shared Memory Support.")
+    U = {"темп": "°C", "вент": " RPM", "мощн": " Вт", "част": " МГц",
+         "напр": " В", "нагр": " %", "ток": " А"}
+
+    def val(r):
+        f = "%.2f" if r["type"] == "напр" else "%.0f"
+        return (f % r["value"]) + U.get(r["type"], "")
+
+    def find(pref, pat, typ, biggest=False):
+        rx = re.compile(pat, re.I)
+        c = [r for r in rows if r["sensor"].startswith(pref)
+             and r["type"] == typ and rx.search(r["label"])]
+        if not c:
+            return None
+        return max(c, key=lambda r: r["value"]) if biggest else c[0]
+
+    L = ["🌡 *Датчики BULLDOZER (HWiNFO)*", ""]
+    # --- GPU ---
+    parts = []
+    for pat, nm in ((r"GPU Temperature|GPU Tctl|GPU Die", "GPU"),
+                    (r"Memory Junction|Hot ?Spot", "память")):
+        r = find("GPU", pat, "темп", True)
+        if r:
+            extra = " (макс %.0f)" % r["max"] if r["max"] > r["value"] + 2 else ""
+            parts.append("%s %s%s" % (nm, val(r), extra))
+    if parts:
+        L.append("🎮 RX 9070 XT: " + ", ".join(parts))
+    fan = find("GPU", r"^GPU Fan$|^GPU Fan[^P]", "вент")
+    pwm = find("GPU", r"Fan PWM", "нагр")
+    if fan or pwm:
+        L.append("   кулер: %s%s" % (val(fan) if fan else "?",
+                                     (", PWM " + val(pwm)) if pwm else ""))
+    pwr = find("GPU", r"Board Power|Total Power|PPT|TGP", "мощн", True) or \
+        find("GPU", r"Power", "мощн", True)
+    clk = find("GPU", r"Core Clock", "част", True)
+    mclk = find("GPU", r"Memory Clock", "част", True)
+    extra = []
+    if pwr:
+        extra.append(val(pwr))
+    if clk:
+        extra.append(val(clk))
+    if mclk:
+        extra.append("пам. " + val(mclk))
+    if extra:
+        L.append("   мощность/частоты: " + ", ".join(extra))
+    # --- CPU ---
+    ct = find("CPU", r"Tdie|Tctl|Die \(average\)|CPU Temperature", "темп", True)
+    cp = find("CPU", r"Package Power|PPT", "мощн", True)
+    cc = find("CPU", r"^CPU Clock$", "част", True)
+    if ct or cp or cc:
+        L.append("⚙️ Ryzen 5 5600: " + ", ".join(x for x in (
+            (val(ct) + " ядро") if ct else "",
+            val(cp) if cp else "",
+            val(cc) if cc else "") if x))
+    # --- плата ---
+    st = find("System", r"System|Motherboard|Chipset", "темп", True)
+    fans = [r for r in rows if r["type"] == "вент"
+            and (r["sensor"].startswith("GIGABYTE") or r["sensor"].startswith("System"))][:4]
+    if st or fans:
+        fs = ", ".join("%s %s" % (r["label"].replace("Fan", "").strip()[:10] or "?",
+                                   val(r)) for r in fans)
+        L.append("🖥 Плата B550: %s%s" % (val(st) + "; " if st else "",
+                                         ("вент.: " + fs) if fs else ""))
+    # --- диски ---
+    ds = []
+    for r in rows:
+        if r["sensor"].startswith("S.M.A.R.T.") and r["type"] == "темп":
+            m = re.search(r"\[([A-Z]:)\]", r["sensor"])
+            if m:
+                ds.append("%s %s" % (m.group(1), val(r)))
+    if ds:
+        L.append("💾 Диски: " + ", ".join(ds))
+    return "\n".join(L)
+
+
 def cmd_shot():
     if take_shot():
         send_photo(SHOT, caption="📸 Экран BULLDOZER, " + time.strftime("%d.%m %H:%M"))
@@ -1692,6 +1779,7 @@ SYSTEM = """Ты — Джарвис, ИИ-ассистент Шефа, живё�
 - найти {"mask":"маска файла","where":"путь"} — поиск файлов (по умолчанию D:\\)
 - скрин {} — скриншот экрана; описание придёт следующим сообщением
 - журнал {} — последние записи AI_Журнала
+- датчики {} — живые температуры/обороты/мощности GPU, CPU, платы, дисков (HWiNFO — мгновенно, ничего не открываю)
 - run_ps {"cmd":"<PowerShell>"} — ЛЮБАЯ команда PowerShell от имени АДМИНИСТРАТОРА: чтение, создание, удаление, реестр, службы, установка и запуск программ, скачивание, настройки системы — ВСЁ РАЗРЕШЕНО. Вывод вернётся тебе следующим сообщением.
 
 ИНТЕРНЕТ (у тебя ЕСТЬ доступ, никогда не говори «нет доступа»):
@@ -2083,6 +2171,8 @@ def tool_exec(name, args):
             return cmd_processes()
         if name == "журнал":
             return cmd_journal()
+        if name == "датчики":
+            return cmd_sensors()
         if name == "скрин":
             return "SCREENSHOT"
         if name == "найти":
@@ -2699,7 +2789,7 @@ def events_loop():
     (термозона ACPI), GPU под полной нагрузкой долго, игра долго грузится/
     зависла. Уведомляет Шефа с кулдаунами, каждое событие — в журнал."""
     log("events запущен")
-    ram_low = hot = gpu_hi = None
+    ram_low = hot = gpu_hi = gpu_hot = None
     game_seen = {}
     last_alert = {}
 
@@ -2764,16 +2854,38 @@ try { $g=(Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngi
                           cooldown=6 * 3600)
             else:
                 hot = None
-            # GPU: полная нагрузка 15+ минут — разовая справка
+            # v3.5.0: реальная температура GPU из HWiNFO (SM2)
+            gpu_temp = None
+            try:
+                import hwinfo_sensors as _hw
+                for _r in _hw.read_all():
+                    if (_r["sensor"].startswith("GPU") and _r["type"] == "темп"
+                            and _r["label"].strip().lower() in
+                            ("gpu temperature", "gpu tctl", "gpu die")):
+                        gpu_temp = _r["value"]
+                        break
+            except Exception:
+                pass
+            # GPU: полная нагрузка 15+ минут — справка с температурой
             if gpu is not None and gpu > 85.0:
                 gpu_hi = gpu_hi or now
                 if now - gpu_hi > 900:
-                    alert("gpu", "Видеокарта под полной нагрузкой уже %d мин. "
-                          "Температуру смотри в Adrenalin — скажи, открою "
-                          "и покажу." % ((now - gpu_hi) / 60),
-                          cooldown=12 * 3600)
+                    t = (" GPU сейчас %d°C." % gpu_temp
+                         if gpu_temp is not None else
+                         " Температуру скажу по «датчики».")
+                    alert("gpu", "Видеокарта под полной нагрузкой уже %d мин.%s"
+                          % ((now - gpu_hi) / 60, t), cooldown=12 * 3600)
             else:
                 gpu_hi = None
+            # GPU перегрев: реальные °C (просьба Шефа 02.11 — HWiNFO)
+            if gpu_temp is not None and gpu_temp > 85.0:
+                gpu_hot = gpu_hot or now
+                if now - gpu_hot > 300:
+                    alert("gputemp", "Видеокарта %.0f°C уже %d мин — проверь "
+                          "охлаждение и пыль. «датчики» — полная сводка."
+                          % (gpu_temp, (now - gpu_hot) / 60), cooldown=6 * 3600)
+            else:
+                gpu_hot = None
             # игра молода (<40 мин), но GPU почти не грузится 10+ минут:
             # возможно, долго грузится или зависла
             if games and gpu is not None and gpu < 8.0:
@@ -2841,11 +2953,11 @@ def main():
         "и профилактика; озвучка веб-чата Ириной; v3.3.0 РАЦИЯ push-to-talk "
         "+ бэкофф сети + 4K-промпт; v3.2.1 СВЕРКА; v3.2.0 ГЛАЗА И ГОЛОС; "
         "v3.1.0 ФАЙЛЫ; законы v3.0.1; ученик v3.0; v2.3.0 МАКС) ===")
-    journal("Джарвис v3.4.0 СОБЫТИЯ (Task 101, 02.11): слежу за событиями "
-            "(память на исходе, перегрев, видеокарта в поте лица, игра "
-            "зависла); клавишу рации меняю голосом («рация на f9»); экран "
-            "блокировки — профилактика включена, скилл загружен; веб-чат "
-            "озвучивает ответы Ириной")
+    journal("Джарвис v3.5.0 ЗРЕНИЕ+ДАТЧИКИ (Task 102, 02.11): скриншоты "
+            "починены (была синтаксическая скобка — «экран заблокирован» "
+            "было враньём); датчики HWiNFO — температура GPU/CPU/платы, "
+            "вентиляторы, мощности, диски («датчики»); события: GPU >85°C "
+            "по реальным градусам; события v3.4.0; рация; озвучка чата")
     if hello:
         send("🤖 *ДЖАРВИС v3.0 УЧЕНИК на связи!*\n\n"
              "Теперь я ещё и учусь: веду память и пишу себе скиллы — "
