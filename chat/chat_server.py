@@ -20,8 +20,11 @@ v3.2.1 (Task 99) «СВЕРКА»: веб-чату — 6 шагов генера
 v3.3.0 (Task 100) «РАЦИЯ»: DPI-осознанность (скрины 4K@200% в физических
   пикселях, без мыльных 1920x1080); /api/asr и /api/chat теперь кормят
   ещё и push-to-talk (ptt.py) — голос из любой игры.
+v3.4.0 (Task 101) «СОБЫТИЯ»: GET /api/tts?text=... — озвучка ответа
+  голосом Ирины (piper) для кнопки 🔊 в веб-чате.
 """
 import json, os, sys, time, base64, threading, traceback
+import subprocess
 import urllib.parse
 import urllib.request
 import ctypes
@@ -187,6 +190,42 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/files":
             # v3.1.1 (Task 97): список файлов для панели браузера
             self._send_json({"ok": True, "files": _files_json()})
+        elif self.path.startswith("/api/tts"):
+            # v3.4.0 (Task 101): озвучка ответа голосом Ирины (piper)
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            text = (qs.get("text") or [""])[0][:600].strip()
+            if not text:
+                self._send_json({"error": "пустой текст"}, 400)
+                return
+            exe = jarvis.CFG.get("piper_exe")
+            voice = jarvis.CFG.get("piper_voice")
+            if not (exe and voice and os.path.isfile(exe)
+                    and os.path.isfile(voice)):
+                self._send_json({"error": "piper не установлен"}, 503)
+                return
+            out = os.path.join(jarvis.DATA, "web_tts.wav")
+            try:
+                p = subprocess.run([exe, "--model", voice,
+                                    "--output_file", out],
+                                   input=text.encode("utf-8"),
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=120)
+                if p.returncode != 0 or not os.path.isfile(out) \
+                        or os.path.getsize(out) < 200:
+                    self._send_json({"error": "синтез не удался"}, 500)
+                    return
+                with open(out, "rb") as fh:
+                    b = fh.read()
+                os.remove(out)
+            except Exception as e:
+                self._send_json({"error": str(e)[:200]}, 500)
+                return
+            clog("tts: %d симв -> %d Б" % (len(text), len(b)))
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
         elif self.path.startswith("/api/file"):
             # v3.1.1 (Task 97): скачать файл ИЗ папок Джарвиса (только они)
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)

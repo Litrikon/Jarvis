@@ -153,11 +153,12 @@
     <div class="sub"><span class="dot" id="dot"></span><span id="status">проверяю мозг…</span> · зеркало Telegram</div>
   </div>
   <button id="clear" class="hbtn" title="Очистить историю">🧹 Очистить</button>
+  <button id="speak" class="hbtn" title="Озвучка ответов">🔇</button>
   <button id="filesbtn" class="hbtn" title="Входящие и выгрузка Джарвиса">📂 Файлы</button>
 </header>
 <div id="chat"></div>
 <div id="chips"></div>
-<div class="hint">Enter — отправить · Shift+Enter — новая строка · файлы: 📎, перетаскиванием или Ctrl+V · голос: 🎤 (Esc — отмена)</div>
+<div class="hint">Enter — отправить · Shift+Enter — новая строка · файлы: 📎, перетаскиванием или Ctrl+V · голос: 🎤 (Esc — отмена) · озвучка: 🔊</div>
 <form id="f">
   <button id="attach" type="button" title="Прикрепить файлы">📎</button>
   <button id="mic" type="button" title="Голосовой ввод">🎤</button>
@@ -416,6 +417,33 @@ function stopRec(cancel){
 }
 
 micBtn.addEventListener("click", micToggle);
+
+/* ---------- v3.4.0 (Task 101): озвучка ответов 🔊 (Ирина, piper) ---------- */
+let ttsOn = localStorage.getItem("tts") === "1";
+const speakBtn = document.getElementById("speak");
+function ttsPaint(){
+  speakBtn.textContent = ttsOn ? "🔊" : "🔇";
+  speakBtn.title = ttsOn ? "Озвучка ответов включена (голос Ирины) — выключить"
+                        : "Озвучка ответов голосом Ирины — включить";
+}
+function ttsToggle(){
+  ttsOn = !ttsOn;
+  localStorage.setItem("tts", ttsOn ? "1" : "0");
+  ttsPaint();
+  if (ttsOn) speakFinal("Озвучка включена. Джарвис на связи.");
+}
+async function speakFinal(text){
+  if (!ttsOn || !text) return;
+  try {
+    const r = await fetch("/api/tts?text=" + encodeURIComponent(text.slice(0, 600)));
+    if (!r.ok) return;
+    const b = await r.blob();
+    new Audio(URL.createObjectURL(b)).play();
+  } catch(e) {}
+}
+speakBtn.addEventListener("click", ttsToggle);
+ttsPaint();
+
 document.addEventListener("keydown", e => {
   if (e.key === "Escape" && rec){ e.preventDefault(); stopRec(true); }
 });
@@ -524,6 +552,7 @@ async function ask(text, files, disp){
     history.push({role:"user", content: disp || text});
     history.push({role:"assistant", content:acc});
     saveHist();
+    speakFinal(acc);
   }
   send.disabled = false;
   refreshStatus();
