@@ -69,7 +69,7 @@ HISTF = os.path.join(DATA, "history.json")
 LLMLOG = os.path.join(BASE, "llama.log")
 os.makedirs(DATA, exist_ok=True)
 
-with open(CFGF, encoding="utf-8") as f:
+with open(CFGF, encoding="utf-8-sig") as f:  # utf-8-sig: терпим BOM от PowerShell
     CFG = json.load(f)
 TOKEN = CFG["token"]
 CHAT = str(CFG["chat_id"])
@@ -1342,6 +1342,39 @@ Get-CimInstance Win32_Process -Filter "ExecutablePath IS NOT NULL" | ForEach-Obj
     return found
 
 
+# v3.4.0: смена клавиши рации push-to-talk — голосом «рация на f9»
+PTT_KEY_OK = frozenset(
+    ["f%d" % i for i in range(1, 25)]
+    + [chr(c) for c in range(ord("a"), ord("z") + 1)]
+    + [str(d) for d in range(10)]
+    + ["caps lock", "scroll lock", "space", "tab", "insert", "home",
+       "end", "page up", "page down", "left shift", "right shift",
+       "left ctrl", "right ctrl", "left alt", "right alt",
+       "left windows", "right windows", "x", "x2"])
+
+
+def ptt_key_set(k):
+    """v3.4.0: сменить клавишу рации (push-to-talk) и перезапустить её.
+    x / x2 — боковые кнопки мыши."""
+    k = (k or "").strip().lower()
+    if k not in PTT_KEY_OK:
+        return ("не знаю такой клавиши: %s. Можно: f1-f24, буквы, цифры, "
+                "caps lock, space, x или x2 (боковые кнопки мыши)." % k[:30])
+    try:
+        CFG["ptt_key"] = k
+        if k in ("x", "x2"):
+            CFG["ptt_key2"] = ""  # кнопка мыши уже основная — дубль не нужен
+        with open(CFGF, "w", encoding="utf-8") as f:
+            json.dump(CFG, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return "не смог записать конфиг: %s" % e
+    ps_run("schtasks /End /TN JarvisPTT", timeout=30)
+    ps_run("schtasks /Run /TN JarvisPTT", timeout=30)
+    journal("Рация: клавиша сменена на «%s»" % k)
+    return ("OK: рация теперь на «%s» (перезапустил её). Скажи Шефу: "
+            "зажми и говори." % k)
+
+
 def game_watch_loop():
     """Игра запущена -> выгрузить мозг из VRAM; игра закрыта -> вернуть."""
     log("game-watch запущен (автовыгрузка VRAM для игр)")
@@ -1607,6 +1640,7 @@ SYSTEM = """Ты — Джарвис, ИИ-ассистент Шефа, живё�
 - печатать {"текст":"..."} — набрать текст клавиатурой в АКТИВНОЕ окно (русский умею)
 - спать {} — выгрузить себя из VRAM (перед игрой)
 - проснись {} — загрузить себя обратно в VRAM
+- рация_клавиша {"клавиша":"f9"} — перевести рацию (push-to-talk) на другую клавишу: f1-f24, буквы, цифры, «x2» — боковая кнопка мыши. Рация перезапустится сама.
 
 ФАЙЛЫ (читай, создавай, отправляй):
 - читать_файл {"путь":"..."} — прочитать текстовый файл (txt/md/csv/json/log/скрипты; кодировки сам). Путь пришёл вместе с файлом — бери его.
@@ -2155,6 +2189,10 @@ Get-ChildItem -LiteralPath '%s' -Recurse -Filter '%s' -EA SilentlyContinue -Erro
                 pass
             ok = llm_start()
             return "OK: мозг снова на видеокарте" if ok else "модель не загрузилась"
+        if name in ("рация_клавиша", "рация"):
+            # v3.4.0: смена клавиши push-to-talk (голосом: «рация на f9»)
+            return ptt_key_set(str(args.get("клавиша")
+                                   or args.get("key") or "").strip())
         return "неизвестный инструмент: %s" % name
     except Exception as e:
         return "ошибка инструмента: %s" % e
@@ -2580,6 +2618,100 @@ Get-PSDrive C,D,E | ForEach-Object { "{0}={1:N1}" -f $_.Name,($_.Free/1GB) }
             log("watchdog ERR:\n" + traceback.format_exc())
         time.sleep(300)
 
+def events_loop():
+    """v3.4.0 «СОБЫТИЯ»: фоновые наблюдения — RAM на исходе, перегрев
+    (термозона ACPI), GPU под полной нагрузкой долго, игра долго грузится/
+    зависла. Уведомляет Шефа с кулдаунами, каждое событие — в журнал."""
+    log("events запущен")
+    ram_low = hot = gpu_hi = None
+    game_seen = {}
+    last_alert = {}
+
+    def alert(key, text, cooldown=3600):
+        if time.time() - last_alert.get(key, 0) < cooldown:
+            return
+        last_alert[key] = time.time()
+        send("📡 " + text)
+        journal("Событие: " + text)
+
+    while True:
+        try:
+            games = game_procs() if CFG.get("game_auto_vram", True) else set()
+            now = time.time()
+            for g in games:
+                game_seen.setdefault(g, now)
+            for g in list(game_seen):
+                if g not in games:
+                    del game_seen[g]
+            out = ps_run(r"""
+$os = Get-CimInstance Win32_OperatingSystem
+"RAM={0:N1}|{1:N1}" -f ($os.FreePhysicalMemory/1MB),($os.TotalVisibleMemorySize/1MB)
+try { $t=(Get-CimInstance -Namespace root/WMI -Class MSAcpi_ThermalZoneTemperature -EA Stop | Select-Object -First 1).CurrentTemperature; "THRM={0:N1}" -f ($t/10.0-273.15) } catch { "THRM=no" }
+try { $g=(Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine -EA Stop | Measure-Object UtilizationPercentage -Sum).Sum; "GPU={0:N0}" -f $g } catch { "GPU=no" }
+""", timeout=90)
+            ram_free = ram_tot = thrm = gpu = None
+            for ln in out.splitlines():
+                if ln.startswith("RAM=") and "|" in ln:
+                    try:
+                        ram_free, ram_tot = (float(x.replace(",", "."))
+                                             for x in ln[4:].split("|"))
+                    except ValueError:
+                        pass
+                elif ln.startswith("THRM="):
+                    if ln[5:] != "no":
+                        try:
+                            thrm = float(ln[5:].replace(",", "."))
+                        except ValueError:
+                            pass
+                elif ln.startswith("GPU="):
+                    if ln[4:] != "no":
+                        try:
+                            gpu = float(ln[4:].replace(",", "."))
+                        except ValueError:
+                            pass
+            # RAM: меньше 4 ГБ свободных 5 минут подряд
+            if ram_free is not None and ram_free < 4.0:
+                ram_low = ram_low or now
+                if now - ram_low > 300:
+                    alert("ram", "Оперативка почти кончилась: свободно "
+                          "%.1f ГБ из %.0f. Скажи «процессы» — посмотрю, "
+                          "что жрёт, и закрою лишнее." % (ram_free, ram_tot or 32),
+                          cooldown=6 * 3600)
+            else:
+                ram_low = None
+            # термозона ACPI (чипсет/VRM платы): выше 75°C 5 минут
+            if thrm is not None and thrm > 75.0:
+                hot = hot or now
+                if now - hot > 300:
+                    alert("thrm", "Термозона материнской платы %.0f°C — "
+                          "проверь охлаждение и пыль." % thrm,
+                          cooldown=6 * 3600)
+            else:
+                hot = None
+            # GPU: полная нагрузка 15+ минут — разовая справка
+            if gpu is not None and gpu > 85.0:
+                gpu_hi = gpu_hi or now
+                if now - gpu_hi > 900:
+                    alert("gpu", "Видеокарта под полной нагрузкой уже %d мин. "
+                          "Температуру смотри в Adrenalin — скажи, открою "
+                          "и покажу." % ((now - gpu_hi) / 60),
+                          cooldown=12 * 3600)
+            else:
+                gpu_hi = None
+            # игра молода (<40 мин), но GPU почти не грузится 10+ минут:
+            # возможно, долго грузится или зависла
+            if games and gpu is not None and gpu < 8.0:
+                for g, t0 in list(game_seen.items()):
+                    if 600 < now - t0 < 2400:
+                        alert("stall." + g,
+                              "Игра %s работает %.0f мин, но GPU почти не "
+                              "грузится — возможно, долго грузится или "
+                              "зависла. Скажи «скрин» — посмотрю, что там."
+                              % (g, (now - t0) / 60), cooldown=3600)
+        except Exception:
+            log("events ERR:\n" + traceback.format_exc())
+        time.sleep(120)
+
 def briefing_loop():
     sent_day = None
     while True:
@@ -2628,16 +2760,16 @@ def chat_watchdog():
 
 def main():
     hello = "--hello" in sys.argv
-    log("=== ДЖАРВИС старт (v3.3.0 РАЦИЯ: push-to-talk из любой игры — ptt.py "
-        "голосом Ирины; TG-поллинг с бэкоффом лечит моргания сети; экран честно "
-        "3840x2160@120 физическими пикселями; v3.2.1 СВЕРКА настроек по "
-        "скриншоту; v3.2.0 ГЛАЗА И ГОЛОС; v3.1.0 ФАЙЛЫ; законы v3.0.1; "
-        "ученик v3.0; v2.3.0 МАКС) ===")
-    journal("Джарвис v3.3.0 РАЦИЯ (Task 100, 02.11): push-to-talk — держи "
-            "CapsLock и говори из любой игры, отпусти — Джарвис ответит "
-            "плашкой на экране и голосом Ирины; сеть до Telegram моргает — "
-            "теперь лечится бэкоффом тихо; экран в промпте честный 4K@120, "
-            "координаты кликов физические")
+    log("=== ДЖАРВИС старт (v3.4.0 СОБЫТИЯ: события — RAM/перегрев/GPU-нагрузка/"
+        "зависшая игра; смена клавиши рации голосом; экран блокировки — скилл "
+        "и профилактика; озвучка веб-чата Ириной; v3.3.0 РАЦИЯ push-to-talk "
+        "+ бэкофф сети + 4K-промпт; v3.2.1 СВЕРКА; v3.2.0 ГЛАЗА И ГОЛОС; "
+        "v3.1.0 ФАЙЛЫ; законы v3.0.1; ученик v3.0; v2.3.0 МАКС) ===")
+    journal("Джарвис v3.4.0 СОБЫТИЯ (Task 101, 02.11): слежу за событиями "
+            "(память на исходе, перегрев, видеокарта в поте лица, игра "
+            "зависла); клавишу рации меняю голосом («рация на f9»); экран "
+            "блокировки — профилактика включена, скилл загружен; веб-чат "
+            "озвучивает ответы Ириной")
     if hello:
         send("🤖 *ДЖАРВИС v3.0 УЧЕНИК на связи!*\n\n"
              "Теперь я ещё и учусь: веду память и пишу себе скиллы — "
@@ -2648,8 +2780,8 @@ def main():
              "Пиши обычным языком: «освободи диск C», «что можно перенести», "
              "«запусти стим». «помощь» — список команд.")
     threading.Thread(target=llm_start, daemon=True).start()
-    for fn in (polling_loop, watchdog_loop, briefing_loop, llm_watchdog,
-               game_watch_loop, flags_loop, chat_watchdog):
+    for fn in (polling_loop, watchdog_loop, events_loop, briefing_loop,
+               llm_watchdog, game_watch_loop, flags_loop, chat_watchdog):
         threading.Thread(target=fn, daemon=True).start()
     while True:
         time.sleep(60)
