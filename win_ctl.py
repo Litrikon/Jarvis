@@ -1,19 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-win_ctl.py — ДЖАРВИС v2.3.0 «МАКС»: окна/мышь/клавиатура + скан-коды (Task 91).
-Приказ Шефа от 31.10: дать агенту «необходимые разрешения» — теперь доступны
-окна/мышь/клавиатура на уровне Windows. Чистый ctypes (user32), БЕЗ pip-пакетов.
+win_ctl.py — ДЖАРВИС v3.7.0 «ЧЕСТНЫЕ РУКИ»: окна/мышь/клавиатура
+со САМОПРОВЕРКОЙ каждого действия (Task 104).
+
+История: v2.3.0 «МАКС» (Task 91) дал окнам/мыши/клавиатуре полные
+разрешения. Ночь 02.11 вскрыла два изъяна: (1) мозг путал масштаб —
+слал крошечные координаты («правый 350,260») на 4K-экране, курсор
+улетал в левый верхний угол; (2) инструмент докладывал «OK: нажал»
+после ЛЮБОГО вызова — без проверки, что действие состоялось. v3.7.0
+чинит оба: координатный контракт (только физические пиксели скриншота)
+и честность (З6): «OK … проверено» — только когда факт подтверждён
+чтением состояния Windows.
 
 Экспорт (вызывается из jarvis.tool_exec):
   windows_list(limit=30)                    — список видимых окон
   window_action(act, title, x, y, w, h)     — активировать/свернуть/развернуть/
-                                              восстановить/закрыть/передвинуть/размер
+                                              восстановить/закрыть/передвинуть/размер;
+                                              каждое действие проверяется фактом
   mouse_action(act, x, y, x2, y2, amount)   — клик/двойной/правый/движение/
-                                              перетащить/прокрутить/позиция
+                                              перетащить/прокрутить/позиция;
+                                              движение подтверждается чтением
+                                              позиции курсора (±1 пиксель)
   key_combo("ctrl+s")                       — сочетание клавиш
   type_text("текст")                        — печать Юникода (русский работает)
-  screen_size()                             — размер основного экрана
+  screen_size()                             — «3840x2160» (физические пиксели)
+  screen_info()                             — физические + масштаб + логические
+
+Координатный контракт (v3.7.0):
+  процесс всегда DPI-aware (физические пиксели); скриншоты делаются в
+  той же системе координат — координаты беру прямо со скриншота, 0,0 =
+  левый верхний угол. Делить/умножать на масштаб НЕ нужно.
 
 Безопасность:
   - закрытие системных и СВОИХ окон (llama/jarvis/python/Program Manager/
@@ -24,6 +41,15 @@ win_ctl.py — ДЖАРВИС v2.3.0 «МАКС»: окна/мышь/клави�
 import ctypes
 import ctypes.wintypes as wt
 import time
+
+try:  # v3.7.0: всегда физические пиксели — как в живом jarvis.py;
+    # при повторном вызове Windows молча откажет, это норма
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
 
 u32 = ctypes.windll.user32
 
@@ -69,16 +95,48 @@ for _i in range(1, 13):
     VK["f%d" % _i] = 0x6F + _i
 
 # системные окна, которые нельзя закрывать (нижний регистр, часть заголовка)
-# v2.3.0 «МАКС»: только рабочий стол и я сам; диспетчер задач и прочее — можно
 CLOSE_DENY = ("program manager", "панель задач", "llama", "jarvis")
 
 _EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
+
+_DPI_PCT = None
 
 
 def _title(h):
     b = ctypes.create_unicode_buffer(300)
     u32.GetWindowTextW(h, b, 300)
     return b.value.strip()
+
+
+def _dpi_pct():
+    """Масштаб Windows В ПРОЦЕНТАХ (250% -> 250; DPI 240/96=2.5). Лениво."""
+    global _DPI_PCT
+    if _DPI_PCT is None:
+        try:
+            hdc = u32.GetDC(0)
+            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
+            u32.ReleaseDC(0, hdc)
+            _DPI_PCT = max(100, int(round(int(dpi) * 100 / 96)))
+        except Exception:
+            _DPI_PCT = 100
+    return _DPI_PCT
+
+
+def screen_size():
+    """«3840x2160» — ФИЗИЧЕСКИЕ пиксели (совпадают с системой координат
+    скриншотов и мыши)."""
+    return "%dx%d" % (u32.GetSystemMetrics(0), u32.GetSystemMetrics(1))
+
+
+def screen_info():
+    """Экран с масштабом: физические + логические пиксели."""
+    w, h = u32.GetSystemMetrics(0), u32.GetSystemMetrics(1)
+    pct = _dpi_pct()
+    if pct > 100:
+        return ("%dx%d физические (масштаб Windows %d%%, логические %dx%d) — "
+                "координаты мыши и скриншота в физических пикселях"
+                % (w, h, pct, round(w * 100 / pct), round(h * 100 / pct)))
+    return "%dx%d" % (w, h)
 
 
 def _visible_windows():
@@ -115,7 +173,7 @@ def windows_list(limit=30):
     if not lines:
         return "видимых окон с заголовками нет"
     return ("открыто %d окон (показаны первые %d); экран %s:\n%s" %
-            (len(_visible_windows()), len(lines), screen_size(), "\n".join(lines)))
+            (len(_visible_windows()), len(lines), screen_info(), "\n".join(lines)))
 
 
 def _find(title):
@@ -143,11 +201,13 @@ def _activate(h):
     u32.keybd_event(0x12, 0, _KEYUP, 0)
     ok = bool(u32.SetForegroundWindow(h))
     u32.BringWindowToTop(h)
-    time.sleep(0.12)
+    time.sleep(0.15)
     return ok
 
 
 def window_action(act, title, x=None, y=None, w=None, h=None):
+    """v3.7.0: каждое действие подтверждается чтением фактического
+    состояния окна. «OK … проверено» = правда; иначе честное «НЕ …»."""
     act = (act or "").strip().lower()
     if act in ("передвинуть", "размер", "resize", "move"):
         hw, info = _find(title)
@@ -164,25 +224,47 @@ def window_action(act, title, x=None, y=None, w=None, h=None):
         if nx < -2000 or ny < -2000 or nx > 8000 or ny > 8000:
             return "координаты за пределами экрана"
         u32.MoveWindow(hw, nx, ny, nw, nh, True)
-        return "OK: окно «%s» — позиция (%d,%d), размер %dx%d" % (info, nx, ny, nw, nh)
+        time.sleep(0.12)
+        r2 = wt.RECT()
+        u32.GetWindowRect(hw, ctypes.byref(r2))
+        if (abs(r2.left - nx) <= 2 and abs(r2.top - ny) <= 2 and
+                abs((r2.right - r2.left) - nw) <= 4 and
+                abs((r2.bottom - r2.top) - nh) <= 4):
+            return ("OK: окно «%s» — позиция (%d,%d), размер %dx%d — проверено "
+                    "чтением границ" % (info, r2.left, r2.top,
+                                        r2.right - r2.left, r2.bottom - r2.top))
+        return ("НЕ подтвердилось: просил (%d,%d) %dx%d, по факту (%d,%d) %dx%d — "
+                "окно могло ограничено системой или приложением"
+                % (nx, ny, nw, nh, r2.left, r2.top,
+                   r2.right - r2.left, r2.bottom - r2.top))
     hw, info = _find(title)
     if not hw:
         return info
     if act in ("активировать", "показать", "на_передний_план", "активно",
                "activate", "focus"):
-        ok = _activate(hw)
-        return ("OK: окно «%s» на переднем плане" % info if ok else
-                "окно «%s» найдено, но Windows не отдал фокус (попробуй alt+tab)"
-                % info)
+        _activate(hw)
+        if u32.GetForegroundWindow() == hw:
+            return "OK: окно «%s» на переднем плане — проверено" % info
+        return ("НЕ получилось: окно «%s» найдено, но Windows не отдал фокус "
+                "(попробуй alt+tab или клик по окну мышью)" % info)
     if act in ("свернуть", "minimize"):
         u32.ShowWindow(hw, 6)
-        return "OK: окно «%s» свёрнуто" % info
+        time.sleep(0.12)
+        if u32.IsIconic(hw):
+            return "OK: окно «%s» свёрнуто — проверено" % info
+        return "НЕ подтвердилось: окно «%s» всё ещё развёрнуто" % info
     if act in ("развернуть", "на_весь_экран", "maximize"):
         u32.ShowWindow(hw, 3)
-        return "OK: окно «%s» развёрнуто на весь экран" % info
+        time.sleep(0.12)
+        if u32.IsZoomed(hw):
+            return "OK: окно «%s» развёрнуто на весь экран — проверено" % info
+        return "НЕ подтвердилось: окно «%s» не развёрнуто" % info
     if act in ("восстановить", "обычный_размер", "restore"):
         u32.ShowWindow(hw, 9)
-        return "OK: окно «%s» восстановлено" % info
+        time.sleep(0.12)
+        if not u32.IsIconic(hw) and not u32.IsZoomed(hw):
+            return "OK: окно «%s» восстановлено — проверено" % info
+        return "НЕ подтвердилось: окно «%s» не в обычном размере" % info
     if act in ("закрыть", "close"):
         tl = info.lower()
         for d in CLOSE_DENY:
@@ -190,14 +272,39 @@ def window_action(act, title, x=None, y=None, w=None, h=None):
                 return ("ОТКАЗ: окно «%s» системное/служебное — закрывать нельзя"
                         % info)
         u32.PostMessageW(hw, 0x0010, 0, 0)           # WM_CLOSE
-        return "OK: окну «%s» отправлено закрытие" % info
+        for _ in range(16):                          # до ~1.6 с ожидания
+            time.sleep(0.1)
+            if not u32.IsWindow(hw):
+                return "OK: окно «%s» закрыто — проверено (окна больше нет)" % info
+        if not u32.IsWindowVisible(hw):
+            return ("OK: окно «%s» исчезло с экрана (закрылось или свернулось "
+                    "в трей) — проверено" % info)
+        return ("НЕ подтвердилось: окно «%s» живо спустя 1.6 с — вероятно, "
+                "приложение спросило подтверждение или несохранённые данные. "
+                "Посмотри «скрин» и скажи Шефу как есть" % info)
     return ("неизвестное действие «%s» (есть: активировать, свернуть, развернуть, "
             "восстановить, закрыть, передвинуть, размер)" % act)
 
 
 # ---------------------------------------------------------------- мышь
-def _move(x, y):
-    u32.SetCursorPos(int(x), int(y))
+def _cursor_pos():
+    pt = wt.POINT()
+    u32.GetCursorPos(ctypes.byref(pt))
+    return pt.x, pt.y
+
+
+def _move(x, y, tries=2):
+    """Переместить курсор и ДОКАЗАТЬ: позиция читается назад.
+    Возвращает (ok, факт_x, факт_y). Допуск ±1 пиксель (З6: «OK» —
+    только если курсор реально стоит в точке)."""
+    ax = ay = 0
+    for _ in range(tries):
+        u32.SetCursorPos(int(x), int(y))
+        time.sleep(0.03)
+        ax, ay = _cursor_pos()
+        if abs(ax - int(x)) <= 1 and abs(ay - int(y)) <= 1:
+            return True, ax, ay
+    return False, ax, ay
 
 
 def _click(button="left"):
@@ -212,6 +319,9 @@ def _click(button="left"):
 
 
 def mouse_action(act, x=None, y=None, x2=None, y2=None, amount=0):
+    """v3.7.0: движение всегда проверяется чтением позиции курсора;
+    в докладе — фактические координаты. Координаты — физические
+    пиксели (как на скриншоте)."""
     act = (act or "").strip().lower()
 
     def _n(v):
@@ -226,54 +336,103 @@ def mouse_action(act, x=None, y=None, x2=None, y2=None, amount=0):
     except (TypeError, ValueError):
         amt = 0
 
+    SW, SH = u32.GetSystemMetrics(0), u32.GetSystemMetrics(1)
+
+    def _in_scr(vx, vy):
+        return vx is None or vy is None or (0 <= vx <= SW and 0 <= vy <= SH)
+
     if act in ("позиция", "где_курсор", "pos"):
-        pt = wt.POINT()
-        u32.GetCursorPos(ctypes.byref(pt))
-        return "курсор на (%d, %d); экран %s" % (pt.x, pt.y, screen_size())
+        ax, ay = _cursor_pos()
+        return "курсор на (%d, %d); экран %s" % (ax, ay, screen_info())
     if act in ("движение", "переместить", "move"):
         if x is None or y is None:
             return "для движения нужны координаты x и y"
-        _move(x, y)
-        return "OK: курсор на (%d, %d)" % (x, y)
+        if not _in_scr(x, y):
+            return ("точка (%d,%d) вне экрана %s — проверь координаты по "
+                    "скриншоту" % (x, y, screen_info()))
+        ok, ax, ay = _move(x, y)
+        if not ok:
+            return ("НЕ получилось: курсор встал на (%d,%d) вместо (%d,%d) — "
+                    "возможно, его удерживает игра/захват экрана"
+                    % (ax, ay, x, y))
+        return "OK: курсор на (%d, %d) — проверено чтением позиции" % (ax, ay)
     if act in ("клик", "нажать", "click"):
         if x is not None and y is not None:
-            _move(x, y)
-            time.sleep(0.04)
+            if not _in_scr(x, y):
+                return ("точка (%d,%d) вне экрана %s — проверь координаты по "
+                        "скриншоту" % (x, y, screen_info()))
+            ok, ax, ay = _move(x, y)
+            if not ok:
+                return ("НЕ получилось навести: курсор на (%d,%d) вместо (%d,%d)"
+                        % (ax, ay, x, y))
+            _click("left")
+            return "OK: клик левой на (%d, %d) — позиция проверена" % (ax, ay)
         _click("left")
-        return "OK: клик левой кнопкой%s" % (" на (%d,%d)" % (x, y)
-                                             if x is not None and y is not None else "")
+        ax, ay = _cursor_pos()
+        return "OK: клик левой в текущей позиции (%d, %d)" % (ax, ay)
     if act in ("двойной", "двойной_клик", "double"):
         if x is not None and y is not None:
-            _move(x, y)
-            time.sleep(0.04)
+            if not _in_scr(x, y):
+                return ("точка (%d,%d) вне экрана %s — проверь координаты по "
+                        "скриншоту" % (x, y, screen_info()))
+            ok, ax, ay = _move(x, y)
+            if not ok:
+                return ("НЕ получилось навести: курсор на (%d,%d) вместо (%d,%d)"
+                        % (ax, ay, x, y))
+            _click("left")
+            time.sleep(0.06)
+            _click("left")
+            return "OK: двойной клик на (%d, %d) — позиция проверена" % (ax, ay)
         _click("left")
         time.sleep(0.06)
         _click("left")
-        return "OK: двойной клик%s" % (" на (%d,%d)" % (x, y)
-                                       if x is not None and y is not None else "")
+        ax, ay = _cursor_pos()
+        return "OK: двойной клик в текущей позиции (%d, %d)" % (ax, ay)
     if act in ("правый", "правый_клик", "right"):
         if x is not None and y is not None:
-            _move(x, y)
-            time.sleep(0.04)
+            if not _in_scr(x, y):
+                return ("точка (%d,%d) вне экрана %s — проверь координаты по "
+                        "скриншоту" % (x, y, screen_info()))
+            ok, ax, ay = _move(x, y)
+            if not ok:
+                return ("НЕ получилось навести: курсор на (%d,%d) вместо (%d,%d)"
+                        % (ax, ay, x, y))
+            _click("right")
+            return "OK: клик правой на (%d, %d) — позиция проверена" % (ax, ay)
         _click("right")
-        return "OK: клик правой кнопкой"
+        ax, ay = _cursor_pos()
+        return "OK: клик правой в текущей позиции (%d, %d)" % (ax, ay)
     if act in ("прокрутить", "скролл", "колесо", "scroll"):
         if not amt:
             return "укажи «сколько» щелчков (минус = вниз)"
+        ax, ay = _cursor_pos()
         u32.mouse_event(0x0800, 0, 0, amt * 120, 0)
-        return "OK: прокрутил %d щелчков (%s)" % (amt, "вверх" if amt > 0 else "вниз")
+        return ("OK: прокрутил %d щелчков (%s) под курсором (%d, %d)"
+                % (abs(amt), "вверх" if amt > 0 else "вниз", ax, ay))
     if act in ("перетащить", "тащить", "drag"):
         if None in (x, y, x2, y2):
             return "для перетаскивания нужны x,y (откуда) и x2,y2 (куда)"
-        _move(x, y)
+        if not (_in_scr(x, y) and _in_scr(x2, y2)):
+            return ("точки (%d,%d)->(%d,%d) вне экрана %s"
+                    % (x, y, x2, y2, screen_info()))
+        ok1, ax, ay = _move(x, y)
+        if not ok1:
+            return ("НЕ получилось навестись на старт: курсор (%d,%d) вместо (%d,%d)"
+                    % (ax, ay, x, y))
         time.sleep(0.06)
         u32.mouse_event(0x0002, 0, 0, 0, 0)
         steps = 20
         for i in range(1, steps + 1):
-            _move(x + (x2 - x) * i // steps, y + (y2 - y) * i // steps)
+            u32.SetCursorPos(x + (x2 - x) * i // steps, y + (y2 - y) * i // steps)
             time.sleep(0.012)
         u32.mouse_event(0x0004, 0, 0, 0, 0)
-        return "OK: перетащил из (%d,%d) в (%d,%d)" % (x, y, x2, y2)
+        time.sleep(0.05)
+        ok2, fx, fy = _move(x2, y2)  # дожать до конечной точки
+        if ok2:
+            return ("OK: перетащил из (%d,%d) в (%d, %d) — конечная позиция "
+                    "проверена" % (x, y, fx, fy))
+        return ("перетащил из (%d,%d), но финал (%d,%d) вместо (%d,%d) — "
+                "скажи Шефу и проверь «скрин»" % (x, y, fx, fy, x2, y2))
     return ("неизвестное действие «%s» (есть: клик, двойной, правый, движение, "
             "перетащить, прокрутить, позиция)" % act)
 
@@ -341,11 +500,7 @@ def type_text(text, delay=0.012):
     return "OK: набрал %d символов в активное окно" % n
 
 
-def screen_size():
-    return "%dx%d" % (u32.GetSystemMetrics(0), u32.GetSystemMetrics(1))
-
-
 if __name__ == "__main__":
-    print("экран:", screen_size())
+    print("экран:", screen_info())
     print(windows_list(10))
     print(mouse_action("позиция"))
