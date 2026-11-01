@@ -17,11 +17,23 @@ v3.2.1 (Task 99) «СВЕРКА»: веб-чату — 6 шагов генера
   сверки = скилл+зрение+PowerShell+ответ, в веб-чате генерация в НАЧАЛЕ
   итерации — в отличие от TG, где ответ рождается внутри последней),
   чтобы многошаговые задачи не упирались в лимит.
+v3.3.0 (Task 100) «РАЦИЯ»: DPI-осознанность (скрины 4K@200% в физических
+  пикселях, без мыльных 1920x1080); /api/asr и /api/chat теперь кормят
+  ещё и push-to-talk (ptt.py) — голос из любой игры.
 """
 import json, os, sys, time, base64, threading, traceback
 import urllib.parse
 import urllib.request
+import ctypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+try:  # v3.3.0: физические пиксели экрана — 4K@200% без виртуализации
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
 
 CHAT_DIR = os.path.dirname(os.path.abspath(__file__))        # D:\Jarvis\chat
 BASE = os.path.dirname(CHAT_DIR)                             # D:\Jarvis
@@ -310,6 +322,8 @@ class Handler(BaseHTTPRequestHandler):
                 for p, sz in clean)
         # v3 (Task 91): прямой канал ИИ-ИИ — GLM (z.ai) пишет через API как коллега
         is_glm = str(req.get("sender", "boss")).lower().strip() in ("glm", "ai")
+        # v3.3.0 «РАЦИЯ»: push-to-talk — тот же эндпоинт, но честный заголовок
+        is_ptt = str(req.get("sender", "")).lower().strip() == "ptt"
         jarvis.mirror_append("web", "glm" if is_glm else "boss", disp)
 
         self.send_response(200)
@@ -482,9 +496,11 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 jarvis.tg("sendMessage",
                           {"chat_id": jarvis.CHAT,
-                           "text": (("🤝 GLM ↔ Джарвис\nGLM: %s\n\nДжарвис: %s"
-                                     if is_glm else
-                                     "🖥 Локальный чат\nШеф: %s\n\nДжарвис: %s")
+                           "text": (("🎙 Рация (голосом)\nШеф: %s\n\nДжарвис: %s"
+                                     if is_ptt else
+                                     ("🤝 GLM ↔ Джарвис\nGLM: %s\n\nДжарвис: %s"
+                                      if is_glm else
+                                      "🖥 Локальный чат\nШеф: %s\n\nДжарвис: %s"))
                                     % (disp[:800], final_txt[:2400]))[:3900]})
             except Exception as e:
                 clog("дубль в Telegram не ушёл: %s" % e)

@@ -50,6 +50,14 @@ v3.2.1 (Task 99) «СВЕРКА»: посмотреть_файл принима�
 """
 import json, os, sys, time, base64, subprocess, threading, traceback, re
 import urllib.request, urllib.parse
+import ctypes
+try:  # v3.3.0: физические пиксели экрана — 4K@200% без виртуализации
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(BASE, "data")
@@ -1522,6 +1530,31 @@ def skill_write(name, body):
     except Exception as e:
         return "ошибка создания скилла: %s" % e
 
+def _screen_fact():
+    """v3.3.0: честный экран — физическое разрешение + масштаб Windows.
+    Считается один раз на старте (перечитается рестартом процесса)."""
+    try:
+        import win_ctl
+        res = win_ctl.screen_size()
+    except Exception:
+        res = "3840x2160"
+    pct = 100
+    try:
+        out = subprocess.run(
+            ["reg", "query", r"HKCU\Control Panel\Desktop\WindowMetrics",
+             "/v", "AppliedDPI"],
+            capture_output=True, text=True, timeout=10).stdout
+        m = re.search(r"AppliedDPI\s+REG_DWORD\s+0x([0-9a-fA-F]+)", out)
+        if m:
+            pct = int(m.group(1), 16) * 100 // 96
+    except Exception:
+        pass
+    return "%s@120 Гц, масштаб Windows %d%%" % (res, pct)
+
+
+SCREEN_FACT = _screen_fact()
+
+
 def prompt_fill(t):
     """v3.0.0: подставить дату, память и индекс скиллов в системный промпт."""
     mem = memory_read() or "(память пуста — заведи через «запомнить_факт»)"
@@ -1529,7 +1562,8 @@ def prompt_fill(t):
     return (t.replace("{date}", time.strftime("%d.%m.%Y"))
              .replace("{memory}", mem.replace("{", "(").replace("}", ")"))
              .replace("{skills}", ski.replace("{", "(").replace("}", ")"))
-             .replace("{files}", FILES_DIR))
+             .replace("{files}", FILES_DIR)
+             .replace("{screen}", SCREEN_FACT))
 
 
 # ---------------------------------------------------------------- мозг: протокол инструментов
@@ -1609,7 +1643,7 @@ SYSTEM = """Ты — Джарвис, ИИ-ассистент Шефа, живё�
 3. У тебя ПОЛНЫЕ ПРАВА АДМИНИСТРАТОРА. НИКОГДА не отвечай «не могу», «нет прав», «не разрешено», «это запрещено» — Шефу это осточертело. Не знаешь как — пробуй через run_ps: PowerShell умеет почти всё на свете. ЕДИНСТВЕННОЕ исключение — ЗАКОНЫ ШЕФА (З1-З3): там отказ обязателен.
 4. Явное «да» Шефа нужно перед: выключением/перезагрузкой ПК, форматированием, сносом программ, удалением папок мимо корзины, правкой реестра, объёмами больше 50 ГБ (закон З3). Обычную работу (чистка мусора, перенос, запуск) делай СРАЗУ.
 5. Не закрывай и не удаляй мои собственные процессы и папки (python, llama-server, D:\\Jarvis, кэш моделей) — иначе я умру. Ядро Windows (csrss, lsass, wininit, smss, services, svchost, system, winlogon, dwm) роняет ПК в синий экран — без явного приказа Шефа не трогай.
-6. Управление программами с интерфейсом (AMD Adrenalin, браузеры, лаунчеры): по шагам — «окна» найти нужное, «окно» активировать, «скрин» посмотреть, «мышь»/«клавиша»/«печатать» воздействовать, снова «скрин» проверить. Экран 2560x1440, координаты от левого верхнего угла. Одна попытка не сработала — пробуй другой путь (run_ps тоже вариант).
+6. Управление программами с интерфейсом (AMD Adrenalin, браузеры, лаунчеры): по шагам — «окна» найти нужное, «окно» активировать, «скрин» посмотреть, «мышь»/«клавиша»/«печатать» воздействовать, снова «скрин» проверить. Экран {screen} — координаты и скрины в ФИЗИЧЕСКИХ пикселях от левого верхнего угла. Одна попытка не сработала — пробуй другой путь (run_ps тоже вариант).
 7. Если действия не нужно — просто отвечай текстом без JSON.
 8. Никогда не упоминай Шефу слова «JSON» и «инструмент» — он видит только результат.
 9. Учись: после нетривиальной задачи (новое умение, ошибка и её исправление, привычка Шефа) — сразу запиши урок в память («запомнить_факт»); разобрался, как делать что-то новое, — создай скилл («записать_скилл»)."""
@@ -2407,6 +2441,7 @@ def handle(text, chat_id):
 
 def polling_loop():
     log("polling запущен")
+    poll_fail = 0  # v3.3.0: счётчик сбоев сети подряд (бэкофф)
     while True:
         try:
             off = 0
@@ -2415,6 +2450,7 @@ def polling_loop():
                     off = int(f.read().strip() or 0)
             r = tg("getUpdates", {"offset": off, "timeout": 25,
                                   "allowed_updates": ["message"]}, timeout=40)
+            poll_fail = 0
             for u in r.get("result", []):
                 with open(OFFF, "w") as f:
                     f.write(str(u["update_id"] + 1))
@@ -2499,8 +2535,23 @@ def polling_loop():
                     log("handle ERR:\n" + traceback.format_exc())
                     send("⚠️ Ошибка выполнения команды — записал в журнал.", cid)
         except Exception as e:
-            log("poll ERR: %s" % e)
-            time.sleep(5)
+            # v3.3.0: сеть до Telegram моргает кластерами (10060/10054/
+            # таймауты рукопожатия) — короткий лог + бэкофф вместо
+            # многострочных простыней Windows и слепых 5-секундных пауз
+            et = str(e)
+            poll_fail += 1
+            m10060 = re.search(r"\[WinError (\d+)\]", et)
+            short = ("WinError " + m10060.group(1)) if m10060 else et[:70]
+            netish = ("10060" in et or "10054" in et or "timed out" in et
+                      or "handshake" in et or "closed" in et.lower())
+            if netish:
+                log("poll ERR сеть x%d: %s (бэкофф %dc)"
+                    % (poll_fail, short, min(2 * poll_fail, 30)))
+                if poll_fail in (1, 20, 100):  # полный текст — редко
+                    log("poll ERR (полный): %s" % et)
+            else:
+                log("poll ERR: %s" % et)
+            time.sleep(min(2 * poll_fail, 30))
 
 def watchdog_loop():
     last_alert = {}
@@ -2577,14 +2628,16 @@ def chat_watchdog():
 
 def main():
     hello = "--hello" in sys.argv
-    log("=== ДЖАРВИС старт (v3.1.0 ФАЙЛЫ: приём из Telegram, чтение, "
-        "выгрузка в E:\\Downloads\\Jarvis, скилл из файла, отправка Шефу; "
-        "законы v3.0.1: пароли/деньги — никогда, необратимое — с «да» Шефа; "
-        "ученик v3.0: скиллы+память; v2.3.0 МАКС: полные права) ===")
-    journal("Джарвис v3.1.0 ФАЙЛЫ (Task 96, 02.11): принимаю файлы из "
-            "Telegram (документы/фото/медиа -> Входящие), читаю текст, смотрю "
-            "картинки зрением, делаю скилл из файла, выгружаю файлы в "
-            "E:\\Downloads\\Jarvis и отправляю их Шефу")
+    log("=== ДЖАРВИС старт (v3.3.0 РАЦИЯ: push-to-talk из любой игры — ptt.py "
+        "голосом Ирины; TG-поллинг с бэкоффом лечит моргания сети; экран честно "
+        "3840x2160@120 физическими пикселями; v3.2.1 СВЕРКА настроек по "
+        "скриншоту; v3.2.0 ГЛАЗА И ГОЛОС; v3.1.0 ФАЙЛЫ; законы v3.0.1; "
+        "ученик v3.0; v2.3.0 МАКС) ===")
+    journal("Джарвис v3.3.0 РАЦИЯ (Task 100, 02.11): push-to-talk — держи "
+            "CapsLock и говори из любой игры, отпусти — Джарвис ответит "
+            "плашкой на экране и голосом Ирины; сеть до Telegram моргает — "
+            "теперь лечится бэкоффом тихо; экран в промпте честный 4K@120, "
+            "координаты кликов физические")
     if hello:
         send("🤖 *ДЖАРВИС v3.0 УЧЕНИК на связи!*\n\n"
              "Теперь я ещё и учусь: веду память и пишу себе скиллы — "
