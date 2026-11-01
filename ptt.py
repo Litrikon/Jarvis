@@ -7,12 +7,14 @@
 плашка с ответом поверх любого окна + озвучка голосом Ирины (piper).
 Работает из любой игры, чат открывать не нужно.
 
-Запуск:  pythonw.exe ptt.py                      (жить и слушать хоткей)
+Запуск:  pythonw.exe ptt.py                      (жить и слушать хоткеи)
          python.exe ptt.py --selftest file.wav   (прогон конвейера без хоткея;
                                                   --speak — ещё и озвучить)
-Конфиг — config.json: ptt_enabled, ptt_key, ptt_speak, ptt_toast_sec,
-                      piper_exe, piper_voice.
-Зависимости: pip install keyboard sounddevice (tkinter/winsound — штатные).
+Конфиг — config.json: ptt_enabled, ptt_key (клавиатура), ptt_key2
+                      (кнопка мыши: x / x2), ptt_speak, ptt_toast_sec,
+                      piper_exe, piper_voice. Меняется голосом через
+                      Джарвиса («рация на f9») — конфиг подхватывается на лету.
+Зависимости: pip install keyboard mouse sounddevice (tkinter/winsound — штатные).
 """
 import json, os, sys, time, io, wave, queue, subprocess, threading
 import urllib.request
@@ -33,15 +35,24 @@ DATA = os.path.join(BASE, "data")
 CHAT_URL = "http://127.0.0.1:8123"
 SR = 16000  # частота записи для whisper
 
-with open(CFGF, encoding="utf-8") as f:
+with open(CFGF, encoding="utf-8-sig") as f:  # utf-8-sig: терпим BOM от PowerShell
     CFG = json.load(f)
 
 PTT_KEY = CFG.get("ptt_key", "caps lock")
+PTT_KEY2 = CFG.get("ptt_key2", "x2")  # v3.4.0: боковая кнопка мыши
 PTT_SPEAK = bool(CFG.get("ptt_speak", True))
 PTT_TOAST_SEC = int(CFG.get("ptt_toast_sec", 15))
 PIPER_EXE = CFG.get("piper_exe", r"D:\Jarvis\piper\piper.exe")
 PIPER_VOICE = CFG.get("piper_voice",
                       r"D:\Jarvis\piper\voices\ru_RU-irina-medium.onnx")
+
+# v3.4.0: пакет mouse может отсутствовать — рация тогда только с клавиатуры
+try:
+    import mouse as _mouse
+    MOUSE_OK = True
+except Exception:
+    _mouse = None
+    MOUSE_OK = False
 
 
 def log(msg):
@@ -366,6 +377,7 @@ def main():
     ui = UI()
     rec = Recorder()
     state = {"on": False}
+    hooks = {"kb": [], "ms": []}
 
     def on_press(_e):
         if state["on"] or not BUSY.acquire(blocking=False):
@@ -396,14 +408,88 @@ def main():
 
         threading.Thread(target=worker, daemon=True).start()
 
-    keyboard.on_press_key(PTT_KEY, on_press, suppress=True)
-    keyboard.on_release_key(PTT_KEY, on_release, suppress=True)
-    log("=== РАЦИЯ на связи: держи «%s» и говори; отпускай — ответ "
-        "плашкой%s ===" % (PTT_KEY,
+    def unregister_all():
+        # v3.4.0: перерегистрация хуков при смене клавиши на лету
+        try:
+            keyboard.unhook_all()
+        except Exception:
+            pass
+        if MOUSE_OK:
+            try:
+                _mouse.unhook_all()
+            except Exception:
+                pass
+        hooks["kb"].clear()
+        hooks["ms"].clear()
+
+    def register_all():
+        # v3.4.0: клавиша может быть и клавиатурной, и кнопкой мыши (x/x2)
+        global PTT_KEY, PTT_KEY2
+        keys = []
+        if PTT_KEY in ("x", "x2"):
+            if MOUSE_OK:
+                keys.append(("ms", PTT_KEY))
+            else:
+                log("кнопка мыши «%s» недоступна: пакет mouse не установлен"
+                    % PTT_KEY)
+        else:
+            keys.append(("kb", PTT_KEY))
+        if PTT_KEY2 in ("x", "x2") and MOUSE_OK and PTT_KEY2 != PTT_KEY:
+            keys.append(("ms", PTT_KEY2))
+        for kind, k in keys:
+            if kind == "kb":
+                keyboard.on_press_key(k, on_press, suppress=True)
+                keyboard.on_release_key(k, on_release, suppress=True)
+                hooks["kb"].append(k)
+            else:
+                _mouse.on_button(on_press, buttons=[k], types=["down"])
+                _mouse.on_button(on_release, buttons=[k], types=["up"])
+                hooks["ms"].append(k)
+        return keys
+
+    def config_watcher():
+        """v3.4.0: смена клавиши голосом («рация на f9») — без перезапуска:
+        следим за config.json и перерегистрируем хуки на лету."""
+        global PTT_KEY, PTT_KEY2, PTT_SPEAK, PTT_TOAST_SEC
+        last_mtime = os.path.getmtime(CFGF)
+        while True:
+            time.sleep(3)
+            try:
+                m = os.path.getmtime(CFGF)
+                if m == last_mtime:
+                    continue
+                last_mtime = m
+                with open(CFGF, encoding="utf-8") as f:
+                    cfg = json.load(f)
+                if not cfg.get("ptt_enabled", True):
+                    unregister_all()
+                    log("ptt выключен в конфиге — хуки сняты")
+                    continue
+                nk = cfg.get("ptt_key", "caps lock")
+                nk2 = cfg.get("ptt_key2", "")
+                if nk != PTT_KEY or nk2 != PTT_KEY2:
+                    PTT_KEY, PTT_KEY2 = nk, nk2
+                    unregister_all()
+                    keys = register_all()
+                    log("конфиг перечитан: рация теперь на %s"
+                        % " + ".join("%s(%s)" % (k, t) for t, k in keys))
+                    ui.post(lambda: ui.toast(
+                        "🎙 Рация теперь на: %s" %
+                        " + ".join(k for _t, k in keys), 5000, small=True))
+                PTT_SPEAK = bool(cfg.get("ptt_speak", True))
+                PTT_TOAST_SEC = int(cfg.get("ptt_toast_sec", 15))
+            except Exception as e:
+                log("config-watcher ERR: %s" % e)
+
+    keys = register_all()
+    threading.Thread(target=config_watcher, daemon=True).start()
+    log("=== РАЦИЯ на связи: держи %s и говори; отпускай — ответ "
+        "плашкой%s ===" % (" + ".join(k for _t, k in keys),
                            " и голосом Ирины" if PTT_SPEAK else ""))
-    log("конфиг: ключ=%s speak=%s toast=%dc piper=%s"
-        % (PTT_KEY, PTT_SPEAK, PTT_TOAST_SEC,
-           os.path.isfile(PIPER_EXE) and os.path.isfile(PIPER_VOICE)))
+    log("конфиг: ключ=%s ключ2=%s speak=%s toast=%dc piper=%s mouse=%s"
+        % (PTT_KEY, PTT_KEY2 or "-", PTT_SPEAK, PTT_TOAST_SEC,
+           os.path.isfile(PIPER_EXE) and os.path.isfile(PIPER_VOICE),
+           MOUSE_OK))
     ui.root.mainloop()
 
 
