@@ -17,9 +17,10 @@ v3.2.1 (Task 99) «СВЕРКА»: веб-чату — 6 шагов генера
   сверки = скилл+зрение+PowerShell+ответ, в веб-чате генерация в НАЧАЛЕ
   итерации — в отличие от TG, где ответ рождается внутри последней),
   чтобы многошаговые задачи не упирались в лимит.
-v3.3.0 (Task 100) «РАЦИЯ»: DPI-осознанность (скрины 4K@200% в физических
-  пикселях, без мыльных 1920x1080); /api/asr и /api/chat теперь кормят
-  ещё и push-to-talk (ptt.py) — голос из любой игры.
+v3.3.0 (Task 100): DPI-осознанность (скрины 4K@200% в физических
+  пикселях, без мыльных 1920x1080).
+v3.8.3 (Task 103): push-to-talk «рация» (ptt.py) удалён по приказу
+  Шефа — /api/asr кормит только кнопку 🎤 веб-чата.
 v3.4.0 (Task 101) «СОБЫТИЯ»: GET /api/tts?text=... — озвучка ответа
   голосом Ирины (piper) для кнопки 🔊 в веб-чате.
 """
@@ -361,8 +362,6 @@ class Handler(BaseHTTPRequestHandler):
                 for p, sz in clean)
         # v3 (Task 91): прямой канал ИИ-ИИ — GLM (z.ai) пишет через API как коллега
         is_glm = str(req.get("sender", "boss")).lower().strip() in ("glm", "ai")
-        # v3.3.0 «РАЦИЯ»: push-to-talk — тот же эндпоинт, но честный заголовок
-        is_ptt = str(req.get("sender", "")).lower().strip() == "ptt"
         jarvis.mirror_append("web", "glm" if is_glm else "boss", disp)
 
         self.send_response(200)
@@ -431,7 +430,8 @@ class Handler(BaseHTTPRequestHandler):
             called = set()
             retried_claim = False
             retried_file = False
-            for _step in range(6):  # v3.2.1: скилл+зрение+PS+PS+ответ+запас
+            retried_plan = False
+            for _step in range(8):  # v3.8.2: 8 шагов — цепочка печать->скрин->клик->печать требовала больше
                 buf, head, visible = [], "", None
                 for tok in llm_stream(msgs):
                     if visible is None:
@@ -477,6 +477,16 @@ class Handler(BaseHTTPRequestHandler):
                         msgs.append({"role": "assistant", "content": ans})
                         msgs.append({"role": "user",
                                      "content": jarvis.CLAIM_FIX_MSG})
+                        continue
+                    # v3.8.2 (Task 68): план-гард — «сейчас сделаю/запущу/
+                    # наберу» текстом без единого инструмента = НИЧЕГО
+                    # не произошло. Один перезапрос.
+                    if jarvis.plan_without_tool(ans, called) and not retried_plan:
+                        retried_plan = True
+                        clog("plan-guard: обещание действия без инструмента — перезапрос")
+                        msgs.append({"role": "assistant", "content": ans})
+                        msgs.append({"role": "user",
+                                     "content": jarvis.PLAN_FIX_MSG})
                         continue
                     final = ans
                     if len(final.strip()) < 3 and _step < 2:
@@ -535,11 +545,9 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 jarvis.tg("sendMessage",
                           {"chat_id": jarvis.CHAT,
-                           "text": (("🎙 Рация (голосом)\nШеф: %s\n\nДжарвис: %s"
-                                     if is_ptt else
-                                     ("🤝 GLM ↔ Джарвис\nGLM: %s\n\nДжарвис: %s"
-                                      if is_glm else
-                                      "🖥 Локальный чат\nШеф: %s\n\nДжарвис: %s"))
+                           "text": (("🤝 GLM ↔ Джарвис\nGLM: %s\n\nДжарвис: %s"
+                                     if is_glm else
+                                     "🖥 Локальный чат\nШеф: %s\n\nДжарвис: %s")
                                     % (disp[:800], final_txt[:2400]))[:3900]})
             except Exception as e:
                 clog("дубль в Telegram не ушёл: %s" % e)
