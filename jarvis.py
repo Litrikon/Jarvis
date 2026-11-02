@@ -97,6 +97,17 @@ TOKEN = CFG["token"]
 CHAT = str(CFG["chat_id"])
 API = "https://api.telegram.org/bot" + TOKEN
 
+# v3.8.1 «СВЯЗЬ»: Telegram через прокси на московском сервере. Прямые
+# соединения с ПК2 плавали всю ночь 02.11 (IPv4-шум, IPv6 нет) — бот
+# терял polling и ответы Шефу. Прокси живёт в config.json (tg_proxy),
+# пароль не в гите и не называется (З1). Пусто = напрямую, как раньше.
+TG_PROXY = (CFG.get("tg_proxy") or "").strip()
+if TG_PROXY:
+    TG_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler(
+        {"http": TG_PROXY, "https": TG_PROXY}))
+else:
+    TG_OPENER = None
+
 LLM_URL = CFG.get("llm_url", "http://127.0.0.1:1234")
 MODEL_ID = CFG.get("model_id", "qwen3.8-27b")
 LLAMA_EXE = CFG.get("llama_exe", r"D:\Jarvis\llama\llama-server.exe")
@@ -164,7 +175,7 @@ def tg(method, params=None, timeout=40):
     data = json.dumps(params or {}).encode()
     req = urllib.request.Request(url, data=data,
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with (TG_OPENER or urllib.request).open(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
 
 def send(text, chat=None):
@@ -199,7 +210,7 @@ def send_photo(path, caption="", chat=None):
         body += ("--%s--\r\n" % boundary).encode()
         req = urllib.request.Request(API + "/sendPhoto", data=body,
                 headers={"Content-Type": "multipart/form-data; boundary=%s" % boundary})
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with (TG_OPENER or urllib.request).open(req, timeout=60) as resp:
             r = json.loads(resp.read().decode())
         mirror_append("tg", "jarvis", "\U0001F4F8 [фото] " + (caption or ""))
         return r
@@ -225,7 +236,7 @@ def send_document(path, caption="", chat=None):
         body += ("--%s--\r\n" % boundary).encode()
         req = urllib.request.Request(API + "/sendDocument", data=body,
                 headers={"Content-Type": "multipart/form-data; boundary=%s" % boundary})
-        with urllib.request.urlopen(req, timeout=180) as resp:
+        with (TG_OPENER or urllib.request).open(req, timeout=180) as resp:
             r = json.loads(resp.read().decode())
         mirror_append("tg", "jarvis", "\U0001F4CE [файл] " + os.path.basename(path))
         return r
@@ -1140,6 +1151,32 @@ def cmd_router(what=""):
                 "не трогаю, закон З1)." % e)
 
 
+def cmd_torrents(what="", which="", files=""):
+    """v3.8.0 «ТОРРЕНТЫ»: uTorrent под моим управлением — список и удаление.
+    Приказ Шефа (ночь 02.11): пустой uTorrent, игру удаляет Джарвис.
+    Полная очистка списка: клиент останавливается, база сбрасывается,
+    клиент стартует заново пустым. Данные — только по путям из его же
+    базы и только при явном «файлы»=«да»."""
+    try:
+        import torrent_ctl as T
+    except Exception as e:
+        return "Модуль торрентов не завёлся: %s" % e
+    q = (what or "").strip().lower()
+    try:
+        if any(w in q for w in ("список", "показ", "что кач", "какие", "раздач",
+                                "list", "в торрент")):
+            return T.list_torrents()
+        if any(w in q for w in ("удал", "убер", "снес", "очист", "вычист",
+                                "delete", "remove")):
+            return T.remove_torrents(which, files)
+        return ("Скажи: «список» — что сейчас в uTorrent, или «удалить» "
+                "(+ «какая» = имя раздачи или пусто = все, «файлы» = "
+                "да/нет — удалять ли данные с диска).")
+    except Exception as e:
+        journal("торренты: ошибка: %s" % e)
+        return "Ошибка модуля торрентов: %s" % e
+
+
 def cmd_shot():
     if take_shot():
         send_photo(SHOT, caption="📸 Экран ПК2, " + time.strftime("%d.%m %H:%M"))
@@ -1833,6 +1870,7 @@ SYSTEM = """Ты — Джарвис, ИИ-ассистент Шефа, живё�
 - журнал {} — последние записи AI_Журнала
 - датчики {} — живые температуры/обороты/мощности GPU, CPU, платы, дисков (HWiNFO — мгновенно, ничего не открываю)
 - роутер {"что":"статус|устройства|интернет|wifi"} — наш Keenetic-роутер напрямую через API, без браузера и экрана: аптайм/нагрузка, кто сейчас в сети (имена, IP), интернет/WAN-адрес, Wi-Fi (каналы, ширина полосы, сигнал). Доступ у меня уже есть — пароль не нужен и не называть. Перезагрузку роутера НЕ делаю (оборву интернет всему дому).
+- торренты {"что":"список|удалить","какая":"имя раздачи или пусто=все","файлы":"да|нет"} — uTorrent: «список» покажет раздачи и пути данных; «удалить» очищает список (клиент перезапускается и стартует ПУСТЫМ — это нормальный результат). «файлы»=«да» — удалить и скачанные данные с диска (необратимо; ставь только когда Шеф ЯВНО приказал удалить вместе с файлами, иначе спроси его одним коротким вопросом).
 - run_ps {"cmd":"<PowerShell>"} — ЛЮБАЯ команда PowerShell от имени АДМИНИСТРАТОРА: чтение, создание, удаление, реестр, службы, установка и запуск программ, скачивание, настройки системы — ВСЁ РАЗРЕШЕНО. Вывод вернётся тебе следующим сообщением.
 
 ИНТЕРНЕТ (у тебя ЕСТЬ доступ, никогда не говори «нет доступа»):
@@ -1970,7 +2008,8 @@ def tg_download(file_id, fname):
         dst = _unique_path(INCOMING, _safe_name(fname or os.path.basename(fp)))
         req = urllib.request.Request(url, headers={"User-Agent": UA})
         size = 0
-        with urllib.request.urlopen(req, timeout=300) as resp, open(dst, "wb") as f:
+        with (TG_OPENER or urllib.request).open(req, timeout=300) as resp, \
+                open(dst, "wb") as f:
             while True:
                 chunk = resp.read(65536)
                 if not chunk:
@@ -2251,6 +2290,14 @@ def tool_exec(name, args):
         if name == "роутер":
             return cmd_router(str(args.get("что") or args.get("what")
                                     or args.get("запрос") or ""))
+        if name in ("торренты", "торрент", "utorrent", "раздача"):
+            return cmd_torrents(str(args.get("что") or args.get("what")
+                                    or args.get("запрос") or ""),
+                                str(args.get("какая") or args.get("какую")
+                                    or args.get("имя") or args.get("name")
+                                    or ""),
+                                str(args.get("файлы") or args.get("данные")
+                                    or args.get("files") or ""))
         if name == "скрин":
             return "SCREENSHOT"
         if name == "найти":
@@ -3043,13 +3090,24 @@ def chat_watchdog():
 # ---------------------------------------------------------------- main
 
 def main():
+    log("TG-канал: %s" % ("через прокси MSK (стабильно)" if TG_OPENER
+                            else "напрямую (плавающая сеть)"))
     hello = "--hello" in sys.argv
-    log("=== ДЖАРВИС старт (v3.7.0 ЧЕСТНЫЕ РУКИ: мышь/окна с самопроверкой — "
+    log("=== ДЖАРВИС старт (v3.8.1 СВЯЗЬ: Telegram через прокси MSK — прямые соединения с ПК2 плавали; v3.8.0 ТОРРЕНТЫ: uTorrent под управлением — список/удаление с верификацией, данные только по путям из базы; v3.7.0 ЧЕСТНЫЕ РУКИ: мышь/окна с самопроверкой — "
         "«проверено» или честное «НЕ получилось»; законы З5 язык + З6 "
         "честность, языковой страж; координатный контракт — только "
         "физические пиксели скриншота; v3.6.0 РОУТЕР; v3.5.0 ЗРЕНИЕ+ДАТЧИКИ; "
         "события v3.4.0; рация v3.3.0; v3.2.1 СВЕРКА; v3.2.0 ГЛАЗА И ГОЛОС; "
         "v3.1.0 ФАЙЛЫ; законы v3.0.1; ученик v3.0; v2.3.0 МАКС) ===")
+    journal("Джарвис v3.8.1 СВЯЗЬ (Task 105, ночь 02.11): Telegram ходит "
+            "через прокси на MSK (config.json tg_proxy) — прямые соединения "
+            "с ПК2 всю ночь рвались (poll ERR, send ERR в jarvis.log); "
+            "мозг и локальный чат по-прежнему напрямую (127.0.0.1)")
+    journal("Джарвис v3.8.0 ТОРРЕНТЫ (Task 105, ночь 02.11): приказ Шефа — "
+            "пустой uTorrent и игру (RDR2, 101 ГБ) удаляет Джарвис. "
+            "Инструмент «торренты»: список/удаление, полная очистка через "
+            "сброс базы при остановленном клиенте, данные — только по путям "
+            "из resume.dat и только при явном «файлы=да»")
     journal("Джарвис v3.7.0 ЧЕСТНЫЕ РУКИ (Task 104, 02.11): ночь вскрыла "
             "промахи мыши (мозг путал логические/физические пиксели 4K@250%) "
             "и доклады «нажал» без проверки. Теперь win_ctl проверяет каждое "
