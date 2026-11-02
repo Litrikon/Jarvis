@@ -34,10 +34,6 @@
         "socialclubhelper.exe"
     ],
     "files_dir": "E:\\Downloads\\Jarvis",
-    "ptt_enabled": true,
-    "ptt_key": "caps lock",
-    "ptt_speak": true,
-    "ptt_toast_sec": 15,
     "piper_exe": "D:\\Jarvis\\piper\\piper.exe",
     "piper_voice": "D:\\Jarvis\\piper\\voices\\ru_RU-irina-medium.onnx"
 }

@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-win_ctl.py — ДЖАРВИС v3.7.0 «ЧЕСТНЫЕ РУКИ»: окна/мышь/клавиатура
+win_ctl.py — ДЖАРВИС v3.7.1 «ЧЕСТНЫЕ РУКИ»: окна/мышь/клавиатура
 со САМОПРОВЕРКОЙ каждого действия (Task 104).
+
+v3.7.1 (Task 68, 02.11.2026): живой аудит вскрыл краш key_combo на
+ЛЮБОЙ букве/цифре — функции VkKeyW в user32.dll НЕ СУЩЕСТВУЕТ (нужно
+VkKeyScanW); «ctrl+t» и прочие буквенные сочетания падали исключением,
+из-за чего мозг терял вкладки и текст мог уйти не туда. Плюс type_text
+теперь докладывает, В КАКОЕ ОКНО реально ушёл текст и не сменилось ли
+окно во время набора (честность З6).
 
 История: v2.3.0 «МАКС» (Task 91) дал окнам/мыши/клавиатуре полные
 разрешения. Ночь 02.11 вскрыла два изъяна: (1) мозг путал масштаб —
@@ -40,6 +47,7 @@ win_ctl.py — ДЖАРВИС v3.7.0 «ЧЕСТНЫЕ РУКИ»: окна/мы�
 """
 import ctypes
 import ctypes.wintypes as wt
+import os
 import time
 
 try:  # v3.7.0: всегда физические пиксели — как в живом jarvis.py;
@@ -74,12 +82,28 @@ class _IU(ctypes.Union):
 
 
 class _IN(ctypes.Structure):
-    _fields_ = (("type", ctypes.c_ulong), ("u", _IU), ("pad", ctypes.c_ubyte * 8))
+    # v3.7.1: НИКАКОГО pad! Настоящий INPUT на x64 = 40 байт
+    # (DWORD type + выравнивание + union 32). Лишний pad давал 48 —
+    # SendInput молча отклонял КАЖДЫЙ вызов: «печатать» не мог ввести
+    # ни одного символа, выживали только \n через старый keybd_event.
+    _fields_ = (("type", ctypes.c_ulong), ("u", _IU))
+
+
+assert ctypes.sizeof(_IN) == 40, "INPUT должен быть 40 байт на x64, а не %d" % ctypes.sizeof(_IN)
 
 
 _KBD = 1
 _KEYUP = 0x0002
 _UNICODE = 0x0004
+# v3.7.1: мышь — тоже SendInput (как и клавиатуру): единый современный
+# путь вместо древнего mouse_event (который из чат-сервера срабатывал
+# не всегда — живой аудит 14:45: клик прошёл «ОК», а фокус не поставил)
+_MOU = 0
+_MLEFT_DOWN = 0x0002
+_MLEFT_UP = 0x0004
+_MRIGHT_DOWN = 0x0008
+_MRIGHT_UP = 0x0010
+_MWHEEL = 0x0800
 
 # ---------------------------------------------------------------- виртуальные клавиши
 VK = {
@@ -308,14 +332,15 @@ def _move(x, y, tries=2):
 
 
 def _click(button="left"):
+    # v3.7.1: SendInput вместо mouse_event
     if button == "right":
-        u32.mouse_event(0x0008, 0, 0, 0, 0)
+        _si(_IN(_MOU, _IU(_MI(0, 0, 0, _MRIGHT_DOWN, 0, None))))
         time.sleep(0.03)
-        u32.mouse_event(0x0010, 0, 0, 0, 0)
+        _si(_IN(_MOU, _IU(_MI(0, 0, 0, _MRIGHT_UP, 0, None))))
     else:
-        u32.mouse_event(0x0002, 0, 0, 0, 0)
+        _si(_IN(_MOU, _IU(_MI(0, 0, 0, _MLEFT_DOWN, 0, None))))
         time.sleep(0.03)
-        u32.mouse_event(0x0004, 0, 0, 0, 0)
+        _si(_IN(_MOU, _IU(_MI(0, 0, 0, _MLEFT_UP, 0, None))))
 
 
 def mouse_action(act, x=None, y=None, x2=None, y2=None, amount=0):
@@ -406,7 +431,7 @@ def mouse_action(act, x=None, y=None, x2=None, y2=None, amount=0):
         if not amt:
             return "укажи «сколько» щелчков (минус = вниз)"
         ax, ay = _cursor_pos()
-        u32.mouse_event(0x0800, 0, 0, amt * 120, 0)
+        _si(_IN(_MOU, _IU(_MI(0, 0, amt * 120, _MWHEEL, 0, None))))
         return ("OK: прокрутил %d щелчков (%s) под курсором (%d, %d)"
                 % (abs(amt), "вверх" if amt > 0 else "вниз", ax, ay))
     if act in ("перетащить", "тащить", "drag"):
@@ -420,12 +445,12 @@ def mouse_action(act, x=None, y=None, x2=None, y2=None, amount=0):
             return ("НЕ получилось навестись на старт: курсор (%d,%d) вместо (%d,%d)"
                     % (ax, ay, x, y))
         time.sleep(0.06)
-        u32.mouse_event(0x0002, 0, 0, 0, 0)
+        _si(_IN(_MOU, _IU(_MI(0, 0, 0, _MLEFT_DOWN, 0, None))))
         steps = 20
         for i in range(1, steps + 1):
             u32.SetCursorPos(x + (x2 - x) * i // steps, y + (y2 - y) * i // steps)
             time.sleep(0.012)
-        u32.mouse_event(0x0004, 0, 0, 0, 0)
+        _si(_IN(_MOU, _IU(_MI(0, 0, 0, _MLEFT_UP, 0, None))))
         time.sleep(0.05)
         ok2, fx, fy = _move(x2, y2)  # дожать до конечной точки
         if ok2:
@@ -455,8 +480,9 @@ def _key_unicode(ch):
     code = ord(ch)
     dn = _IN(_KBD, _IU(_KI(0, code, _UNICODE, 0, None)))
     up = _IN(_KBD, _IU(_KI(0, code, _UNICODE | _KEYUP, 0, None)))
-    _si(dn)
-    _si(up)
+    # v3.7.1: SendInput возвращает число ДОСТАВЛЕННЫХ событий; 0 = отказ
+    if _si(dn) != 1 or _si(up) != 1:
+        raise RuntimeError("SendInput отклонил символ U+%04X" % code)
 
 
 def key_combo(combo):
@@ -469,8 +495,21 @@ def key_combo(combo):
     for p in parts:
         if p in VK:
             keys.append(VK[p])
-        elif len(p) == 1 and (p.isalnum() or p in " ,./;'[]\\`-="):
-            keys.append(u32.VkKeyW(ord(p)) & 0xFF)
+        elif len(p) == 1 and p.isalnum():
+            # v3.7.1: буквы/цифры — ФИКСИРОВАННЫЕ VK-коды (0x41+ / 0x30+):
+            # VkKeyScanW в русской раскладке не знает латиницу (-1), а
+            # «ctrl+t» обязан работать в любой раскладке (VK не зависит от неё)
+            if p.isdigit():
+                keys.append(0x30 + int(p))
+            else:
+                keys.append(0x41 + (ord(p.lower()) - ord("a")))
+        elif len(p) == 1 and p in " ,./;'[]\\`-=":
+            # пунктуация —_best effort через раскладку
+            vk = u32.VkKeyScanW(ord(p))
+            if vk < 0 or (vk & 0xFF) == 0xFF:
+                return ("не знаю клавишу «%s» (нет VK-кода в текущей "
+                        "раскладке)" % p)
+            keys.append(vk & 0xFF)
         else:
             return "не знаю клавишу «%s» (ctrl/shift/alt/win/esc/enter/tab/f1-f12/буква)" % p
     for vk in keys:
@@ -485,19 +524,113 @@ def key_combo(combo):
     return "OK: нажал %s" % "+".join(parts)
 
 
+def _caret_hwnd():
+    """v3.7.1: hwnd каретки активного GUI-потока (None = фокус не в поле
+    ввода — печатать некуда)."""
+    try:
+        class _GUITHREADINFO(ctypes.Structure):
+            _fields_ = (("cbSize", ctypes.c_ulong), ("flags", ctypes.c_ulong),
+                        ("hwndActive", ctypes.c_void_p),
+                        ("hwndFocus", ctypes.c_void_p),
+                        ("hwndCapture", ctypes.c_void_p),
+                        ("hwndMenuOwner", ctypes.c_void_p),
+                        ("hwndMoveSize", ctypes.c_void_p),
+                        ("hwndCaret", ctypes.c_void_p),
+                        ("rcCaret", wt.RECT))
+        gti = _GUITHREADINFO()
+        gti.cbSize = ctypes.sizeof(_GUITHREADINFO)
+        h = u32.GetForegroundWindow()
+        tid = u32.GetWindowThreadProcessId(h, None) if h else 0
+        if tid and u32.GetGUIThreadInfo(tid, ctypes.byref(gti)):
+            return (h, gti.hwndFocus, gti.hwndCaret)
+    except Exception:
+        pass
+    return (None, None, None)
+
+
+def _gui_focus_info():
+    """v3.7.1 (отладка): фокус-контроль и каретка активного потока GUI."""
+    h, foc, car = _caret_hwnd()
+    if h is None:
+        return "(no gui info)"
+    return "fg=%s focus=%s caret=%s" % (h, foc, car)
+
+
+TRACE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "data", "type_trace.log") if os.path.isdir(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")) else None
+
+
 def type_text(text, delay=0.012):
     text = str(text)
     if not text:
         return "пустой текст"
+    fg = u32.GetForegroundWindow()
+    ttl = _title(fg) if fg else "(активного окна НЕТ!)"
+    # v3.7.1: ГЛАВНЫЙ ФИКС «пропавших первых символов» — живой аудит нашёл:
+    # после активации окна фокус внутри него может стоять НЕ в поле ввода
+    # (полоса вкладок, панель) — каретки нет, а SendInput-символы уходят
+    # «в никуда» (съедаются этим контролом). Печать без каретки = отказ
+    # с готовой точкой клика (центр активного окна) для повторной попытки.
+    _h, _foc, car = _caret_hwnd()
+    if not car:
+        hint = ""
+        try:
+            r = wt.RECT()
+            if _h and u32.GetWindowRect(_h, ctypes.byref(r)):
+                cx = (r.left + r.right) // 2
+                cy = (r.top + r.bottom) // 2
+                hint = " — примерно (%d,%d)" % (cx, cy)
+        except Exception:
+            pass
+        return ("НЕ получилось: в активном окне «%s» нет текстового курсора "
+                "(фокус не в поле ввода — например, на полосе вкладок или "
+                "панели). Кликни мышью в центр окна%s и сразу повтори "
+                "печать" % (ttl, hint))
+    tr = None
+    if TRACE and len(text) > 20:      # трейс только для заметных печатей
+        try:
+            tr = open(TRACE, "a", encoding="utf-8")
+            tr.write("[%s] печать %d симв. в «%s»; %s\n"
+                     % (time.strftime("%H:%M:%S"), len(text), ttl,
+                        _gui_focus_info()))
+        except Exception:
+            tr = None
     n = 0
+    failed = 0
     for ch in text[:1500]:
-        if ch == "\n":
-            _tap_vk(0x0D)
-        else:
-            _key_unicode(ch)
+        try:
+            if ch == "\n":
+                _tap_vk(0x0D)
+            else:
+                _key_unicode(ch)
+        except Exception:
+            failed += 1
+        if tr is not None and n < 40:
+            tr.write("  [%03d] %r t=%.3f %s\n"
+                     % (n, ch, time.time() % 60.0, _gui_focus_info()
+                        if n in (0, 1, 2, 3, 5, 8, 12, 20, 39) else ""))
         time.sleep(delay)
         n += 1
-    return "OK: набрал %d символов в активное окно" % n
+    if tr is not None:
+        try:
+            tr.write("[конец] %s\n" % _gui_focus_info())
+            tr.close()
+        except Exception:
+            pass
+    # v3.7.1: сверяем ОКНО (hwnd), а не заголовок — Notepad сам меняет
+    # заголовок вкладки на первую строку набранного текста (это норма)
+    fg2 = u32.GetForegroundWindow()
+    if failed:
+        return ("НЕ получилось: %d из %d символов НЕ дошли (SendInput "
+                "отклонил) — текст в окне «%s» неполный, проверь «скрин»"
+                % (failed, n, ttl))
+    if fg2 != fg:
+        ttl2 = _title(fg2) if fg2 else "?"
+        return ("ВНИМАНИЕ: во время печати активное окно сменилось «%s» -> "
+                "«%s» — текст мог уйти не туда, проверь «скрин»"
+                % (ttl, ttl2))
+    return "OK: набрал %d символов в активное окно «%s»" % (n, ttl)
 
 
 if __name__ == "__main__":
