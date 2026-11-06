@@ -99,6 +99,7 @@ CFGF = os.path.join(BASE, "config.json")
 OFFF = os.path.join(DATA, "offset.txt")
 SHOT = os.path.join(DATA, "shot.png")
 HISTF = os.path.join(DATA, "history.json")
+DIARYF = os.path.join(DATA, "diary.jsonl")  # v3.9.0: дневник вытесненных обменов
 LLMLOG = os.path.join(BASE, "llama.log")
 os.makedirs(DATA, exist_ok=True)
 
@@ -118,6 +119,18 @@ if TG_PROXY:
         {"http": TG_PROXY, "https": TG_PROXY}))
 else:
     TG_OPENER = None
+
+# v3.9.0 «ФОЛБЭК СВЯЗИ»: прокси — основной путь, но сервер может лечь —
+# тогда Джарвис молчал бы совсем. Считаем ошибки подряд: 3 на прокси ->
+# уходим напрямую; 6 напрямую (прямое исторически плавает) -> возврат
+# на прокси. Успех обнуляет счётчик своего режима.
+TG_MODE = {"direct": False, "pfail": 0, "dfail": 0}
+
+
+def _tg_opener():
+    if TG_OPENER and not TG_MODE["direct"]:
+        return TG_OPENER
+    return urllib.request
 
 LLM_URL = CFG.get("llm_url", "http://127.0.0.1:1234")
 MODEL_ID = CFG.get("model_id", "qwen3.8-27b")
@@ -159,6 +172,13 @@ def log(msg):
     try:
         with open(LOGF, "a", encoding="utf-8") as f:
             f.write(time.strftime("[%d.%m.%Y %H:%M:%S] ") + msg + "\n")
+        # v3.9.0: ротация jarvis.log — при 3 МБ остаётся хвост (2000
+        # строк), голова уходит (приём mirror.jsonl из Task 89)
+        if os.path.getsize(LOGF) > 3000000:
+            with open(LOGF, encoding="utf-8") as f:
+                tail = f.readlines()[-2000:]
+            with open(LOGF, "w", encoding="utf-8") as f:
+                f.writelines(tail)
     except Exception:
         pass
 
@@ -186,8 +206,31 @@ def tg(method, params=None, timeout=40):
     data = json.dumps(params or {}).encode()
     req = urllib.request.Request(url, data=data,
                                  headers={"Content-Type": "application/json"})
-    with (TG_OPENER or urllib.request).open(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode())
+    via_proxy = bool(TG_OPENER) and not TG_MODE["direct"]
+    try:
+        with _tg_opener().open(req, timeout=timeout) as resp:
+            r = json.loads(resp.read().decode())
+        if via_proxy:
+            TG_MODE["pfail"] = 0
+        else:
+            TG_MODE["dfail"] = 0
+        return r
+    except Exception:
+        if TG_OPENER:
+            if via_proxy:
+                TG_MODE["pfail"] += 1
+                if TG_MODE["pfail"] >= 3 and not TG_MODE["direct"]:
+                    TG_MODE["direct"] = True
+                    log("СВЯЗЬ: прокси молчит x%d — ухожу на прямое соединение"
+                        % TG_MODE["pfail"])
+            else:
+                TG_MODE["dfail"] += 1
+                if TG_MODE["dfail"] >= 6 and TG_MODE["direct"]:
+                    TG_MODE["direct"] = False
+                    TG_MODE["pfail"] = 0
+                    log("СВЯЗЬ: прямое соединение плавает x%d — "
+                        "возвращаюсь на прокси" % TG_MODE["dfail"])
+        raise
 
 def send(text, chat=None):
     # v2.3.0: до 4 попыток с паузами — сеть до Telegram плавает, ответы
@@ -221,7 +264,7 @@ def send_photo(path, caption="", chat=None):
         body += ("--%s--\r\n" % boundary).encode()
         req = urllib.request.Request(API + "/sendPhoto", data=body,
                 headers={"Content-Type": "multipart/form-data; boundary=%s" % boundary})
-        with (TG_OPENER or urllib.request).open(req, timeout=60) as resp:
+        with _tg_opener().open(req, timeout=60) as resp:
             r = json.loads(resp.read().decode())
         mirror_append("tg", "jarvis", "\U0001F4F8 [фото] " + (caption or ""))
         return r
@@ -247,7 +290,7 @@ def send_document(path, caption="", chat=None):
         body += ("--%s--\r\n" % boundary).encode()
         req = urllib.request.Request(API + "/sendDocument", data=body,
                 headers={"Content-Type": "multipart/form-data; boundary=%s" % boundary})
-        with (TG_OPENER or urllib.request).open(req, timeout=180) as resp:
+        with _tg_opener().open(req, timeout=180) as resp:
             r = json.loads(resp.read().decode())
         mirror_append("tg", "jarvis", "\U0001F4CE [файл] " + os.path.basename(path))
         return r
@@ -396,6 +439,17 @@ def llm_start():
         for att in _llm_attempts():
             log("llm_start: попытка «%s»" % att["name"])
             try:
+                # v3.9.0: ротация llama.log — старый процесс мёртв,
+                # файл свободен; храним одно поколение (.old)
+                try:
+                    if os.path.getsize(LLMLOG) > 3000000:
+                        try:
+                            os.remove(LLMLOG + ".old")
+                        except OSError:
+                            pass
+                        os.rename(LLMLOG, LLMLOG + ".old")
+                except OSError:
+                    pass
                 lf = open(LLMLOG, "ab")
                 p = subprocess.Popen(att["args"], stdout=lf, stderr=subprocess.STDOUT,
                                      creationflags=0x08000000)
@@ -1901,6 +1955,8 @@ SYSTEM = """Ты — Джарвис, ИИ-ассистент Шефа, живё�
 
 ПАМЯТЬ (твои собственные записи, читаешь их каждый раз):
 {memory}
+- дневник {"сколько":"30"} — что было ДО текущего окна памяти: вытесненные
+  старые обмены с Шефом. Потерял нить диалога или дня — загляни туда.
 
 СКИЛЛЫ (индекс папки skills\\, полный текст — инструментом «скилл»):
 {skills}
@@ -1996,7 +2052,7 @@ def tg_download(file_id, fname):
         dst = _unique_path(INCOMING, _safe_name(fname or os.path.basename(fp)))
         req = urllib.request.Request(url, headers={"User-Agent": UA})
         size = 0
-        with (TG_OPENER or urllib.request).open(req, timeout=300) as resp, \
+        with _tg_opener().open(req, timeout=300) as resp, \
                 open(dst, "wb") as f:
             while True:
                 chunk = resp.read(65536)
@@ -2610,6 +2666,24 @@ Get-ChildItem -LiteralPath '%s' -Recurse -Filter '%s' -EA SilentlyContinue -Erro
             return skill_write(args.get("имя") or args.get("name") or "",
                                args.get("тело") or args.get("body") or
                                args.get("текст") or args.get("инструкция") or "")
+        if name in ("дневник", "diary"):
+            # v3.9.0: обмены, вытесненные из окна памяти (hist_append)
+            try:
+                _n = int(args.get("сколько") or args.get("n") or 30)
+            except Exception:
+                _n = 30
+            _n = max(1, min(_n, 80))
+            try:
+                with open(DIARYF, encoding="utf-8") as f:
+                    lines = f.readlines()[-_n:]
+                if not lines:
+                    return "дневник пуст — старых обменов ещё не было"
+                return ("ДНЕВНИК (последние %d записей до текущего окна "
+                        "памяти):\n%s" % (_n, "".join(lines).strip()))
+            except FileNotFoundError:
+                return "дневник пуст — старых обменов ещё не было"
+            except Exception as e:
+                return "ошибка дневника: %s" % e
         if name == "спать":
             llm_stop("manual")
             journal("Мозг выгружен из VRAM (вызов инструмента)")
@@ -2681,15 +2755,36 @@ def hist_append(user_text, assistant_text):
               "ts": time.strftime("%d.%m %H:%M")})
     h.append({"role": "assistant", "content": (assistant_text or "")[:1000],
               "ts": time.strftime("%d.%m %H:%M")})
+    # v3.9.0 «ПАМЯТЬ ГЛУБЖЕ»: хранение 96 (было 40); вытесненное — в
+    # дневник diary.jsonl (ротация ~2 МБ): старые обмены не теряются,
+    # мозг поднимает их инструментом «дневник». Окно в LLM — hist_msgs.
+    keep = 96
+    if len(h) > keep:
+        evicted = h[:len(h) - keep]
+        h = h[-keep:]
+        try:
+            with open(DIARYF, "a", encoding="utf-8") as f:
+                for m in evicted:
+                    f.write(json.dumps(
+                        {"ts": m.get("ts", ""), "role": m.get("role", ""),
+                         "text": (m.get("content") or "")[:600]},
+                        ensure_ascii=False) + "\n")
+            if os.path.getsize(DIARYF) > 2000000:
+                with open(DIARYF, encoding="utf-8") as f:
+                    tail = f.readlines()[-1500:]
+                with open(DIARYF, "w", encoding="utf-8") as f:
+                    f.writelines(tail)
+        except Exception:
+            pass
     try:
         with open(HISTF, "w", encoding="utf-8") as f:
-            json.dump(h[-40:], f, ensure_ascii=False)
+            json.dump(h[-keep:], f, ensure_ascii=False)
     except Exception:
         pass
 
 def hist_msgs(h):
     out = []
-    for m in h[-16:]:
+    for m in h[-32:]:
         c = m.get("content", "")
         if not c:
             continue
@@ -2704,7 +2799,7 @@ def hist_msgs(h):
                 re.fullmatch(r"\((веб: ответ сорвался|"
                              r"заявил без инструмента)\)", c.strip()):
             continue
-        out.append({"role": m.get("role", "user"), "content": c[:1100]})
+        out.append({"role": m.get("role", "user"), "content": c[:1000]})
     return out
 
 FRESH_RE = re.compile(r"(курс|цен[аыу]|стоит|новост|новинк|погод|сегодня|сейчас|"
@@ -2733,8 +2828,21 @@ def brain_reply(text):
                  "инструмент «новости», для курса валют/крипты — «курсы», для "
                  "прочего свежего — «интернет». Не отвечай без данных.)")
     msgs = [sysmsg] + hist_msgs(hist) + [{"role": "user", "content": utext}]
+    _hist_len = len(msgs) - 2
 
-    ans = llm_chat(msgs)
+    def _fit(ms):
+        """v3.9.0: жёсткий бюджет 28К символов — контекст 12288 не
+        переполняется даже на длинных цепочках инструментов (урок
+        v3.8.4: переполнение = HTTP 400 и обрыв). Режу ТОЛЬКО старую
+        историю (msgs[1:1+_hist_len]), текущий обмен не трогаю."""
+        nonlocal _hist_len
+        while (sum(len(m.get("content", "")) for m in ms) > 28000
+               and _hist_len > 0):
+            ms.pop(1)
+            _hist_len -= 1
+        return ms
+
+    ans = llm_chat(_fit(msgs))
     called = set()
     retried_claim = False
     retried_file = False
@@ -2756,7 +2864,7 @@ def brain_reply(text):
                 log("file-guard: ответ о файле без чтения — перезапрос")
                 msgs.append({"role": "assistant", "content": ans})
                 msgs.append({"role": "user", "content": FILE_FIX_MSG})
-                ans = llm_chat(msgs)
+                ans = llm_chat(_fit(msgs))
                 continue
             # v3.1.0: трос — «сохранил/создал» без вызова = ложь (Task 96)
             _claim_fix = claim_without_tool(ans, called)
@@ -2774,7 +2882,7 @@ def brain_reply(text):
                 # v3.8.6: мозгу идёт ИМЕННО то сообщение стража, которое
                 # вернулось (руки/фантом/файлы), а не всегда CLAIM_FIX_MSG
                 msgs.append({"role": "user", "content": _claim_fix})
-                ans = llm_chat(msgs)
+                ans = llm_chat(_fit(msgs))
                 continue
             # v3.8.2 (Task 68): план-гард — «сейчас сделаю/запущу/наберу»
             # текстом без единого инструмента = действие НЕ выполнено
@@ -2786,7 +2894,7 @@ def brain_reply(text):
                 log("plan-guard: обещание действия без инструмента — перезапрос")
                 msgs.append({"role": "assistant", "content": ans})
                 msgs.append({"role": "user", "content": PLAN_FIX_MSG})
-                ans = llm_chat(msgs)
+                ans = llm_chat(_fit(msgs))
                 continue
             # v3.8.6: приказ-гард — Шеф приказал руки-действие, а за весь
             # ход НИ ОДНОГО руки-инструмента = приказ не выполнен
@@ -2797,7 +2905,7 @@ def brain_reply(text):
                 log("order-guard: приказ рук без инструмента — перезапрос")
                 msgs.append({"role": "assistant", "content": ans})
                 msgs.append({"role": "user", "content": HANDS_ORDER_FIX_MSG})
-                ans = llm_chat(msgs)
+                ans = llm_chat(_fit(msgs))
                 continue
             break
         name, args, say = tool
@@ -2848,7 +2956,7 @@ def brain_reply(text):
                      "обычным текстом без JSON. Если нужен ещё один инструмент — "
                      "ответь снова одним JSON-объектом."
                      % (name, str(res)[:3000])})
-        ans = llm_chat(msgs)
+        ans = llm_chat(_fit(msgs))
 
     clean = _strip_md(ans)
     if len(clean.strip()) < 3 or clean.lstrip().startswith('{"tool"'):
@@ -2862,7 +2970,7 @@ def brain_reply(text):
         journal("З5: ответ сорвался не на русский — перезапрос")
         msgs.append({"role": "assistant", "content": ans})
         msgs.append({"role": "user", "content": LANG_FIX_MSG})
-        ans2 = llm_chat(msgs)
+        ans2 = llm_chat(_fit(msgs))
         clean2 = _strip_md(ans2)
         if _is_russian(clean2) and len(clean2.strip()) >= 3:
             ans, clean = ans2, clean2
@@ -2875,7 +2983,7 @@ def brain_reply(text):
 
 # ---------------------------------------------------------------- обработка
 
-HELP = ("🤖 *ДЖАРВИС v3.1 — думаю, ДЕЙСТВУЮ, УЧУСЬ, ФАЙЛЫ*\n\n"
+HELP = ("🤖 *ДЖАРВИС v3.9 — думаю, ДЕЙСТВУЮ, УЧУСЬ, НАДЁЖНОСТЬ*\n\n"
         "Мозг — Qwen3.8-27B локально. С каждой задачей я становлюсь "
         "умнее: пишу себе скиллы и веду память.\n\n"
         "Мозг — Qwen3.8-27B прямо на твоей видеокарте, без облака. Пиши "
@@ -3271,13 +3379,171 @@ def chat_watchdog():
         time.sleep(60)
 
 
+# ---------------------------------------------------------------- v3.9.0 самопроверка
+
+def _selftest_image():
+    """Тест-картинка «ТЕСТ 7391» для проверки зрения (PIL -> PS)."""
+    p = os.path.join(DATA, "selftest_img.png")
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        im = Image.new("RGB", (460, 150), "white")
+        d = ImageDraw.Draw(im)
+        try:
+            f = ImageFont.truetype("C:\\Windows\\Fonts\\arialbd.ttf", 52)
+        except Exception:
+            f = ImageFont.load_default()
+        d.text((25, 40), "ТЕСТ 7391", fill="black", font=f)
+        im.save(p)
+        return p
+    except Exception:
+        pass
+    try:
+        ps_run(r"""
+Add-Type -AssemblyName System.Drawing
+$bmp=New-Object System.Drawing.Bitmap 460,150
+$g=[System.Drawing.Graphics]::FromImage($bmp)
+$g.Clear('White')
+$f=New-Object System.Drawing.Font('Arial',40,[System.Drawing.FontStyle]::Bold)
+$g.DrawString('ТЕСТ 7391',$f,[System.Drawing.Brushes]::Black,20,40)
+$bmp.Save('%s',[System.Drawing.Imaging.ImageFormat]::Png)
+$g.Dispose();$bmp.Dispose();'OK'
+""" % p.replace("'", "''"), timeout=45)
+        if os.path.exists(p) and os.path.getsize(p) > 1000:
+            return p
+    except Exception:
+        pass
+    return None
+
+
+def _run_selftest():
+    """v3.9.0 «САМОПРОВЕРКА»: живой прогон стражей, мозга, зрения,
+    поиска, файлов и связи. SKIP — не тревога (мозг спит / зрения нет);
+    FAIL — сообщение Шефу + журнал. Полный отчёт — в jarvis.log."""
+    res = {}
+
+    def check(name, fn):
+        try:
+            res[name] = str(fn())
+        except Exception as e:
+            res[name] = "FAIL: %s" % e
+
+    def t_guards():
+        # юнит-тесты стражей честности (уроки Task 97/104/107/68)
+        assert claim_without_tool(
+            "я сохранил файл отчёт в папку", set()), "файл-трос молчит"
+        assert claim_without_tool(
+            "передвинул курсор в (2500,1200), проверено", set()), \
+            "руки-трос молчит"
+        assert claim_without_tool(
+            "инструмент вернул «НЕ подтвердилось»", set()), \
+            "фантом-страж молчит"
+        assert plan_without_tool(
+            "Сейчас сделаю: запущу блокнот и наберу текст.", set()), \
+            "план-гард молчит"
+        assert claim_without_tool(
+            "погода сегодня хорошая", set()) is None, \
+            "трос ложно срабатывает"
+        return "OK (4 стража)"
+
+    def t_brain():
+        if LLM_PROC["sleeping"] or os.path.exists(
+                os.path.join(DATA, "BRAIN.SLEEP")):
+            return "SKIP (мозг спит — VRAM для игры)"
+        if not llm_health():
+            return "FAIL: llama-server не отвечает /health"
+        ans = llm_chat([{"role": "user",
+                         "content": "Ответь ровно одним словом: привет"}],
+                       max_tokens=30)
+        return "OK" if len(ans.strip()) >= 3 else "FAIL: пустой ответ"
+
+    def t_vision():
+        if LLM_PROC["sleeping"]:
+            return "SKIP (мозг спит)"
+        if not vision_available():
+            return "SKIP (зрение не загружено — не хватило VRAM)"
+        img = _selftest_image()
+        if not img:
+            return "SKIP (тест-картинка не создалась)"
+        try:
+            desc = llm_vision(img, question="Какие ЦИФРЫ написаны на "
+                                            "картинке? Ответь только цифрами.")
+            return "OK" if "7391" in desc else \
+                "FAIL: не прочитало (%s)" % desc[:60]
+        finally:
+            try:
+                os.remove(img)
+            except OSError:
+                pass
+
+    def t_web():
+        r = web_search("новости сегодня", n=3)
+        return "OK" if (len(r) > 60 and "не дал результатов" not in r) \
+            else "FAIL: %s" % r[:80]
+
+    def t_files():
+        p = os.path.join(DATA, "selftest_проверка.txt")
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("содержимое теста 7391")
+            txt = file_read_text(p)
+            return "OK" if "7391" in txt else \
+                "FAIL: прочиталось не то (%s)" % txt[:60]
+        finally:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    def t_tg():
+        try:
+            r = tg("getMe")
+        except Exception as e:
+            return "FAIL: %s" % e
+        if r.get("ok"):
+            return "OK (@%s)" % ((r.get("result") or {}).get("username") or "?")
+        return "FAIL: %s" % r
+
+    for _n, _f in (("стражи", t_guards), ("мозг", t_brain),
+                   ("зрение", t_vision), ("поиск", t_web),
+                   ("файлы", t_files), ("связь", t_tg)):
+        check(_n, _f)
+
+    report = (time.strftime("%d.%m.%Y %H:%M") + " САМОПРОВЕРКА:\n"
+              + "\n".join("- %s: %s" % (k, v) for k, v in res.items()))
+    log(report.replace("\n", " | "))
+    fails = [k for k, v in res.items() if str(v).startswith("FAIL")]
+    if fails:
+        send("🔬 Самопроверка нашла проблемы: " + ", ".join(fails)
+             + ". Подробности — в jarvis.log (строка САМОПРОВЕРКА).")
+        journal("Самопроверка FAIL: " + ", ".join(fails))
+    else:
+        journal("Самопроверка пройдена (SKIP не считаются)")
+    return report
+
+
+def selftest_loop():
+    """v3.9.0: раз в сутки в 12:00 местного — _run_selftest()."""
+    log("selftest запущен (ежедневно в 12:00)")
+    ran_day = None
+    while True:
+        try:
+            now = time.localtime()
+            today = time.strftime("%Y-%m-%d", now)
+            if now.tm_hour == 12 and ran_day != today:
+                ran_day = today
+                _run_selftest()
+        except Exception:
+            log("selftest ERR:\n" + traceback.format_exc())
+        time.sleep(600)
+
+
 # ---------------------------------------------------------------- main
 
 def main():
-    log("TG-канал: %s" % ("через прокси MSK (стабильно)" if TG_OPENER
-                            else "напрямую (плавающая сеть)"))
+    log("TG-канал: %s" % ("через прокси MSK + автофолбэк на прямое"
+                            if TG_OPENER else "напрямую (плавающая сеть)"))
     hello = "--hello" in sys.argv
-    log("=== ДЖАРВИС старт (v3.8.6 ФАНТОМ-РЕЗУЛЬТАТ: описание результата/проверки инструмента («инструмент вернул „НЕ подтвердилось“», «клик в (X,Y) не закрыл диалог», «курсор реально в (X,Y)») при НУЛЕ вызовов в ходе = выдумка — живой тест 02.11 19:47 поймал два таких ответа за 3-4 с; v3.8.5 ЧЕСТНЫЕ РУКИ-ТРОС: «передвинул/кликнул/напечатал/закрыл» без вызова инструмента рук = перезапрос — живой тест 02.11 поймал фантомное «курсор в (2500,1200), проверено» за 3 с без единого вызова, теперь это ловится уровнем кода; v3.8.4 АВТОФОКУС ПЕЧАТИ: без каретки печатать сам кликает в центр окна и повторяет проверку — у мозга стало на 2 шага меньше, цепочка не рвётся; v3.8.3 БЕЗ РАЦИИ: push-to-talk (ptt.py) удалён по приказу Шефа — Шеф не играет, пока мозг на видеокарте; голос — кнопка 🎤 в веб-чате; v3.8.1 СВЯЗЬ: Telegram через прокси MSK — прямые соединения с ПК2 плавали; v3.8.0 ТОРРЕНТЫ: uTorrent под управлением — список/удаление с верификацией, данные только по путям из базы; v3.7.0 ЧЕСТНЫЕ РУКИ: мышь/окна с самопроверкой — "
+    log("=== ДЖАРВИС старт (v3.9.0 НАДЁЖНОСТЬ (Task 124, приказ Шефа 06.11 «делай все пункты кроме 7»): ротация логов jarvis.log/llama.log ~3 МБ с сохранением хвоста — логи больше не растут вечно; ФОЛБЭК СВЯЗИ: прокси Telegram молчит 3 раза подряд — автоуход на прямое соединение, прямое плавает 6 раз — возврат на прокси; ПАМЯТЬ ГЛУБЖЕ: окно истории 16 -> 32 сообщения + жёсткий бюджет 28К символов (контекст 12288 защищён) + дневник diary.jsonl для вытесненных обменов (инструмент «дневник»); САМОПРОВЕРКА ежедневно в 12:00: стражи честности/мозг/зрение/поиск/файлы/связь — FAIL приходит Шефу в Telegram; v3.8.6 ФАНТОМ-РЕЗУЛЬТАТ: описание результата/проверки инструмента («инструмент вернул „НЕ подтвердилось“», «клик в (X,Y) не закрыл диалог», «курсор реально в (X,Y)») при НУЛЕ вызовов в ходе = выдумка — живой тест 02.11 19:47 поймал два таких ответа за 3-4 с; v3.8.5 ЧЕСТНЫЕ РУКИ-ТРОС: «передвинул/кликнул/напечатал/закрыл» без вызова инструмента рук = перезапрос — живой тест 02.11 поймал фантомное «курсор в (2500,1200), проверено» за 3 с без единого вызова, теперь это ловится уровнем кода; v3.8.4 АВТОФОКУС ПЕЧАТИ: без каретки печатать сам кликает в центр окна и повторяет проверку — у мозга стало на 2 шага меньше, цепочка не рвётся; v3.8.3 БЕЗ РАЦИИ: push-to-talk (ptt.py) удалён по приказу Шефа — Шеф не играет, пока мозг на видеокарте; голос — кнопка 🎤 в веб-чате; v3.8.1 СВЯЗЬ: Telegram через прокси MSK — прямые соединения с ПК2 плавали; v3.8.0 ТОРРЕНТЫ: uTorrent под управлением — список/удаление с верификацией, данные только по путям из базы; v3.7.0 ЧЕСТНЫЕ РУКИ: мышь/окна с самопроверкой — "
         "«проверено» или честное «НЕ получилось»; законы З5 язык + З6 "
         "честность, языковой страж; координатный контракт — только "
         "физические пиксели скриншота; v3.6.0 РОУТЕР; v3.5.0 ЗРЕНИЕ+ДАТЧИКИ; "
@@ -3325,6 +3591,14 @@ def main():
             "и доклады «нажал» без проверки. Теперь win_ctl проверяет каждое "
             "действие чтением факта; законы З5 (язык) и З6 (честность); "
             "языковой страж — ответ не по-русски переспрашивается")
+    journal("Джарвис v3.9.0 НАДЁЖНОСТЬ (Task 124, 06.11, приказ Шефа "
+            "«делай все пункты кроме 7»): ротация логов jarvis.log и "
+            "llama.log (~3 МБ, хвост сохраняется); фолбэк связи — прокси "
+            "Telegram молчит 3 раза -> прямое соединение, прямое плавает "
+            "6 раз -> возврат на прокси; окно истории 16 -> 32 сообщения + "
+            "бюджет 28К символов + дневник diary.jsonl (инструмент "
+            "«дневник»); ежедневная самопроверка в 12:00 (стражи/мозг/"
+            "зрение/поиск/файлы/связь — FAIL приходит Шефу)")
     if hello:
         send("🤖 *ДЖАРВИС v3.0 УЧЕНИК на связи!*\n\n"
              "Теперь я ещё и учусь: веду память и пишу себе скиллы — "
@@ -3336,7 +3610,8 @@ def main():
              "«запусти стим». «помощь» — список команд.")
     threading.Thread(target=llm_start, daemon=True).start()
     for fn in (polling_loop, watchdog_loop, events_loop, briefing_loop,
-               llm_watchdog, game_watch_loop, flags_loop, chat_watchdog):
+               llm_watchdog, game_watch_loop, flags_loop, chat_watchdog,
+               selftest_loop):
         threading.Thread(target=fn, daemon=True).start()
     while True:
         time.sleep(60)
