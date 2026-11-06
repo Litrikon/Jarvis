@@ -28,6 +28,7 @@ import json, os, sys, time, base64, threading, traceback
 import subprocess
 import urllib.parse
 import urllib.request
+import urllib.error
 import ctypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -431,20 +432,40 @@ class Handler(BaseHTTPRequestHandler):
             retried_claim = False
             retried_file = False
             retried_plan = False
+            retried_order = False
+            hist_n = len(jarvis.hist_msgs(jarvis.hist_load()))
             for _step in range(8):  # v3.8.2: 8 шагов — цепочка печать->скрин->клик->печать требовала больше
                 buf, head, visible = [], "", None
-                for tok in llm_stream(msgs):
-                    if visible is None:
-                        head += tok
-                        st = head.lstrip()
-                        if st.startswith("{"):
-                            visible = False
-                        elif len(st) >= 8 or "\n" in st:
-                            visible = True
-                            emit({"type": "tok", "text": head})
-                    elif visible:
-                        emit({"type": "tok", "text": tok})
-                    buf.append(tok)
+                ctx_retry = False
+                while True:
+                    try:
+                        for tok in llm_stream(msgs):
+                            if visible is None:
+                                head += tok
+                                st = head.lstrip()
+                                if st.startswith("{"):
+                                    visible = False
+                                elif len(st) >= 8 or "\n" in st:
+                                    visible = True
+                                    emit({"type": "tok", "text": head})
+                            elif visible:
+                                emit({"type": "tok", "text": tok})
+                            buf.append(tok)
+                    except urllib.error.HTTPError as _e:
+                        # v3.8.4 ctx-guard: llama-server ответил 400 «request
+                        # exceeds context size» — раньше это убивало весь
+                        # запрос. Сбрасываем старую историю (системный промпт
+                        # и текущая цепочка инструментов остаются) и повторяем
+                        # тот же шаг.
+                        if _e.code == 400 and not ctx_retry:
+                            ctx_retry = True
+                            clog("ctx-guard: 400 (контекст переполнен) — "
+                                 "сброс истории, повтор шага")
+                            msgs = [sysmsg] + msgs[1 + hist_n:]
+                            buf, head, visible = [], "", None
+                            continue
+                        raise
+                    break
                 if visible is None and head:
                     emit({"type": "tok", "text": head})
                 ans = jarvis._strip_think("".join(buf))
@@ -463,7 +484,11 @@ class Handler(BaseHTTPRequestHandler):
                                      "content": jarvis.FILE_FIX_MSG})
                         continue
                     # v3.1.0: трос — «сохранил/создал» без вызова (Task 96)
-                    if jarvis.claim_without_tool(ans, called):
+                    # v3.8.5: + руки («передвинул/кликнул/напечатал» без
+                    # инструмента) — claim_without_tool возвращает ГОТОВОЕ
+                    # сообщение-исправление (файловое или рук)
+                    _claim_fix = jarvis.claim_without_tool(ans, called)
+                    if _claim_fix:
                         if retried_claim:
                             clog("claim-guard: повторная ложь — честный отказ")
                             jarvis.hist_append(disp, "(заявил без инструмента)")
@@ -476,7 +501,7 @@ class Handler(BaseHTTPRequestHandler):
                         clog("claim-guard: перезапрос после ложного «сделал»")
                         msgs.append({"role": "assistant", "content": ans})
                         msgs.append({"role": "user",
-                                     "content": jarvis.CLAIM_FIX_MSG})
+                                     "content": _claim_fix})
                         continue
                     # v3.8.2 (Task 68): план-гард — «сейчас сделаю/запущу/
                     # наберу» текстом без единого инструмента = НИЧЕГО
@@ -487,6 +512,22 @@ class Handler(BaseHTTPRequestHandler):
                         msgs.append({"role": "assistant", "content": ans})
                         msgs.append({"role": "user",
                                      "content": jarvis.PLAN_FIX_MSG})
+                        continue
+                    # v3.8.6 (Task 107): приказ-гард — Шеф ПРИКАЗАЛ
+                    # руки-действие (передвинь/кликни/напечатай/открой...),
+                    # а за весь ход НИ ОДНОГО руки-инструмента = приказ
+                    # НЕ выполнен (живой тест 02.11 20:03/20:09: мозг дважды
+                    # уходил в «Честно: я ничего не делал — это была ложь.
+                    # Сейчас делаю по факту» и заканчивал без вызовов).
+                    if (jarvis.HANDS_ORDER_VERB_RE.search(message)
+                            and jarvis.HANDS_ORDER_CTX_RE.search(message)
+                            and not (called & jarvis.HANDS_ACT_TOOLS)
+                            and not retried_order):
+                        retried_order = True
+                        clog("order-guard: приказ рук без инструмента — перезапрос")
+                        msgs.append({"role": "assistant", "content": ans})
+                        msgs.append({"role": "user",
+                                     "content": jarvis.HANDS_ORDER_FIX_MSG})
                         continue
                     final = ans
                     if len(final.strip()) < 3 and _step < 2:
