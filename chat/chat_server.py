@@ -452,11 +452,17 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if _gr["mode"] == "photo":
                     # фото — синхронно (обычно до минуты)
-                    jarvis.GEN_PROC["busy"] = True
+                    # v3.11.2: общий замок с Telegram (файл data/GEN.BUSY)
+                    if not jarvis.gen_busy_trylock():
+                        jarvis.mirror_append("web", "jarvis",
+                                             "⏳ Уже делаю предыдущую — дождись.")
+                        emit({"type": "done",
+                              "text": "⏳ Уже делаю предыдущую — дождись."})
+                        return
                     try:
                         _path, _err = jarvis.gen_run("photo", _gp)
                     finally:
-                        jarvis.GEN_PROC["busy"] = False
+                        jarvis.gen_busy_unlock()
                     if not _path:
                         emit({"type": "done",
                               "text": "⚠️ Не получилось: %s" % _err})
@@ -477,11 +483,14 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 # видео — в фоне (несколько минут), придёт файлом в TG
                 def _vjob(_p=_gp):
-                    jarvis.GEN_PROC["busy"] = True
+                    # v3.11.2: общий замок с Telegram (файл data/GEN.BUSY)
+                    if not jarvis.gen_busy_trylock():
+                        jarvis.send("⏳ Уже делаю предыдущую — дождись.")
+                        return
                     try:
                         _path, _err = jarvis.gen_run("video", _p)
                     finally:
-                        jarvis.GEN_PROC["busy"] = False
+                        jarvis.gen_busy_unlock()
                     if not _path:
                         jarvis.send("🎬 Видео не получилось (%s)" % _err)
                         return
