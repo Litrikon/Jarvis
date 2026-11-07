@@ -23,6 +23,13 @@ v3.8.3 (Task 103): push-to-talk «рация» (ptt.py) удалён по при
   Шефа — /api/asr кормит только кнопку 🎤 веб-чата.
 v3.4.0 (Task 101) «СОБЫТИЯ»: GET /api/tts?text=... — озвучка ответа
   голосом Ирины (piper) для кнопки 🔊 в веб-чате.
+v3.14.3 (Task 133) «МЫШЬ-СТРАЖ»: вопрос «где сейчас мышь/курсор» без
+  вызова скрин/область/мышь = перезапрос (e2e поймал выдуманные «3839, 0»
+  без единого инструмента) — страж в jarvis.MOUSE_NOW_RE/MOUSE_FIX_MSG.
+v3.14.2 (Task 133) «КУРСОР ВИДЕН»: результат «скрин» содержит ТОЧНЫЕ
+  координаты курсора из ОС (jarvis.SHOT_CURSOR через jarvis._cursor_note)
+  рядом с описанием зрения, а на самом фото курсор дорисован красным
+  перекрестием с подписью (доклад Шефа: «ИИ не понимает, где мышь сейчас»).
 v3.13 (Task 131): генерация изображений удалена по приказу Шефа
   («только текстовая модель») — честный отказ в чате, как в Telegram;
   «найти_на_странице» доступен и из веб-чата (через мозг).
@@ -518,6 +525,7 @@ class Handler(BaseHTTPRequestHandler):
             retried_file = False
             retried_plan = False
             retried_order = False
+            retried_mouse = False   # v3.14.3: мышь-страж
             hist_n = len(jarvis.hist_msgs(jarvis.hist_load()))
             for _step in range(12):  # v3.14.0 (Task 132): 8 -> 12 — GUI-цепочки настроек длинные
                 buf, head, visible = [], "", None
@@ -574,6 +582,18 @@ class Handler(BaseHTTPRequestHandler):
                         msgs.append({"role": "assistant", "content": ans})
                         msgs.append({"role": "user",
                                      "content": jarvis.FILE_FIX_MSG})
+                        continue
+                    # v3.14.3 (Task 133): мышь-страж — «где мышь» без
+                    # скрина/мыши = выдуманные координаты (живой e2e)
+                    if (jarvis.MOUSE_NOW_RE.search(message)
+                            and not (called & jarvis.MOUSE_NOW_TOOLS)
+                            and not retried_mouse):
+                        retried_mouse = True
+                        clog("mouse-guard: «где мышь» без инструмента — "
+                             "перезапрос")
+                        msgs.append({"role": "assistant", "content": ans})
+                        msgs.append({"role": "user",
+                                     "content": jarvis.MOUSE_FIX_MSG})
                         continue
                     # v3.1.0: трос — «сохранил/создал» без вызова (Task 96)
                     # v3.8.5: + руки («передвинул/кликнул/напечатал» без
@@ -675,8 +695,11 @@ class Handler(BaseHTTPRequestHandler):
                             except Exception as e:
                                 jarvis.log("vision ERR: %s" % e)
                                 desc = ""
-                            res = ("скриншот показан Шефу в чате. Описание "
-                                   "зрением: %s" % (desc or "(не разобрал)"))
+                            # v3.14.2: точная позиция мыши — текстом мозгу
+                            res = ("скриншот показан Шефу в чате.%s "
+                                   "Описание зрением: %s"
+                                   % (jarvis._cursor_note(),
+                                      desc or "(не разобрал)"))
                         else:
                             res = ("скриншот показан Шефу в чате (зрение не "
                                    "загружено — не выдумывай описание, скажи "
