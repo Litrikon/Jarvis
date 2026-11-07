@@ -23,6 +23,12 @@ v3.8.3 (Task 103): push-to-talk «рация» (ptt.py) удалён по при
   Шефа — /api/asr кормит только кнопку 🎤 веб-чата.
 v3.4.0 (Task 101) «СОБЫТИЯ»: GET /api/tts?text=... — озвучка ответа
   голосом Ирины (piper) для кнопки 🔊 в веб-чате.
+v3.10 (Task 128) «УМНЫЙ РЕЖИМ + СТАРШИЕ»: /api/chat теперь с тем же
+  умным маршрутом, что и Telegram (jarvis.smart_mode): простое —
+  мгновенно; слово «подумай»/авто-сложное — с размышлениями модели на
+  первом шаге (думание Шефу не показываем); авто-сложное при наличии
+  cloud_api_key и явное «спроси у старших» — облачный старший брат
+  (jarvis.cloud_ask), отвечает даже при спящем локальном мозге (игра).
 """
 import json, os, sys, time, base64, threading, traceback
 import subprocess
@@ -114,15 +120,19 @@ def _files_json():
     return out[:60]
 
 
-def llm_stream(messages, max_tokens=800, temperature=0.7):
+def llm_stream(messages, max_tokens=800, temperature=0.7, think=False):
+    """v3.10 (Task 128): think=True — включаю размышления модели (умный
+    режим). reasoning_content сервера не читаем (не показываем); если
+    <think> идёт прямо в content — придерживаем поток до </think>."""
     body = {"model": jarvis.MODEL_ID, "messages": messages,
             "max_tokens": max_tokens, "temperature": temperature, "top_p": 0.8,
-            "chat_template_kwargs": {"enable_thinking": False},
+            "chat_template_kwargs": {"enable_thinking": bool(think)},
             "stream": True}
     data = json.dumps(body).encode()
     req = urllib.request.Request(
         jarvis.LLM_URL + "/v1/chat/completions", data=data,
         headers={"Content-Type": "application/json"})
+    _hold, _in_think, _checked = [], False, False
     with urllib.request.urlopen(req, timeout=420) as r:
         for raw in r:
             line = raw.decode("utf-8", "replace").strip()
@@ -137,8 +147,30 @@ def llm_stream(messages, max_tokens=800, temperature=0.7):
                 continue
             delta = (j.get("choices") or [{}])[0].get("delta") or {}
             txt = delta.get("content") or ""
-            if txt:
+            if not txt:
+                continue
+            if not think:
                 yield txt
+                continue
+            if not _checked:
+                _hold.append(txt)
+                st = "".join(_hold).lstrip()
+                if st.startswith("<think"):
+                    _in_think, _checked = True, True
+                elif len(st) >= 12:
+                    yield "".join(_hold)
+                    _hold, _checked = [], True
+                continue
+            if _in_think:
+                _hold.append(txt)
+                joined = "".join(_hold)
+                if "</think>" in joined:
+                    tail = joined.split("</think>", 1)[1]
+                    _in_think, _hold = False, []
+                    if tail:
+                        yield tail
+                continue
+            yield txt
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -364,6 +396,10 @@ class Handler(BaseHTTPRequestHandler):
         # v3 (Task 91): прямой канал ИИ-ИИ — GLM (z.ai) пишет через API как коллега
         is_glm = str(req.get("sender", "boss")).lower().strip() in ("glm", "ai")
         jarvis.mirror_append("web", "glm" if is_glm else "boss", disp)
+        # v3.10 (Task 128): умный маршрут как в Telegram (коллега GLM — без)
+        _mode = None if is_glm else jarvis.smart_mode(message)
+        _want_cloud = _mode == "cloud" or (
+            _mode == "big" and (jarvis.CFG.get("cloud_api_key") or "").strip())
 
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
@@ -389,6 +425,39 @@ class Handler(BaseHTTPRequestHandler):
                       "text": "🏓 Локальный чат жив. Мозг: %s." %
                               ("на связи" if jarvis.llm_health() else "спит")})
                 return
+            if _want_cloud:
+                # v3.10 (Task 128): старший брат — облако, VRAM не занимает,
+                # отвечает даже когда локальный мозг спит (игра)
+                emit({"type": "waiting"})
+                try:
+                    c_ans, c_err = jarvis.cloud_ask(
+                        message, jarvis.hist_msgs(jarvis.hist_load()))
+                except Exception as e:
+                    c_ans, c_err = None, str(e)
+                if c_ans:
+                    txt = "🛰 %s\n\n%s" % (
+                        "Сложный вопрос — спросил у старшего брата:"
+                        if _mode == "big" else "Спросил у старших братьев:",
+                        jarvis._strip_md(c_ans))
+                    jarvis.hist_append(
+                        disp, ("[старший брат] " if _mode == "big"
+                               else "[старшие братья] ") + c_ans[:900])
+                    jarvis.mirror_append("web", "jarvis", txt)
+                    emit({"type": "tok", "text": txt})
+                    emit({"type": "done", "text": txt})
+                    try:
+                        jarvis.tg("sendMessage",
+                                  {"chat_id": jarvis.CHAT,
+                                   "text": ("🖥 Локальный чат\nШеф: %s\n\n"
+                                            "Джарвис: %s"
+                                            % (disp[:800], txt[:2400]))[:3900]})
+                    except Exception:
+                        pass
+                    return
+                emit({"type": "tok", "text":
+                      "🛰 Старший брат не на связи (%s) — отвечаю сам, "
+                      "глубоко.\n\n" % str(c_err or "?")[:70]})
+                _mode = "think"
             if not jarvis.llm_health():
                 emit({"type": "waiting"})
                 if not jarvis.llm_ensure(timeout=200):
@@ -439,7 +508,14 @@ class Handler(BaseHTTPRequestHandler):
                 ctx_retry = False
                 while True:
                     try:
-                        for tok in llm_stream(msgs):
+                        # v3.10 (Task 128): думание — только первый шаг
+                        _think_now = (_mode in ("think", "big")) and _step == 0
+                        for tok in llm_stream(
+                                msgs,
+                                max_tokens=(int(jarvis.CFG.get(
+                                    "llm_think_tokens", 2000))
+                                    if _think_now else 800),
+                                think=_think_now):
                             if visible is None:
                                 head += tok
                                 st = head.lstrip()
@@ -628,7 +704,8 @@ def main():
             time.sleep(0.8)
             os.startfile("http://127.0.0.1:%d" % PORT)
         threading.Thread(target=_open, daemon=True).start()
-    clog("чат-сервер запущен v3.2.0 глаза и голос (pid %s)" % os.getpid())
+    clog("чат-сервер запущен v3.10 умный режим + старшие братья (pid %s)"
+         % os.getpid())
     while True:  # v2: serve_forever может упасть — цикл перезапускает
         try:
             srv.serve_forever(poll_interval=0.5)
