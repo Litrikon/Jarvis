@@ -31,6 +31,27 @@ v3.1.0 «ФАЙЛЫ» (Task 96, 02.11.2026): Шеф присылает файл�
 выгружает свои файлы в FILES_DIR (дефолт E:\\Downloads\\Jarvis, ключ
 config.json files_dir) и отправляет файлы Шефу («отправить_файл»).
 
+v3.13.0 «ТОЛЬКО ТЕКСТ» (Task 131, 07.11.2026, приказ Шефа
+  «хватит экспериментов — оставляй только текстовую модель как
+  изначально задумывалось, всё остальное — картинки, видео,
+  кузнецов — удаляй»): генерация изображений ВЫРЕЗАНА ПОЛНОСТЬЮ —
+  весь код ComfyUI/FLUX/RealVisXL и папка comfyui_rocm (~28,5 ГБ)
+  удалены; промпт-кузнец Qwen2.5-3B на CPU удалён (модель стёрта;
+  ночью 07.11 он съедал RAM — из-за этого мозг не поднялся после
+  генерации); ген-команды честно отвечают «удалено»; сохранено
+  всё текстовое: умный режим, старшие братья, поиск по странице,
+  инструменты, зрение, голос, файлы.
+
+v3.12.2 «ПОИСК НА СТРАНИЦЕ» (Task 130, 07.11.2026): (1) инструмент
+  «найти_на_странице» — текст страницы по ссылке (HTTP) или прямо из
+  открытого браузера (Ctrl+A/Ctrl/C -> буфер, фокус выводится из полей
+  ввода через Ctrl+F/Esc) + точные строки по ключевым словам запроса;
+  раньше Джарвис лишь описывал скриншот («что вижу»), и Шеф не мог
+  найти фильм на руторе. (2) Промпт-кузнец: правило деталей + примеры —
+  переносит КАЖДУЮ деталь заказа (живой сбой: «чёрную лошадь с
+  крыльями в море» -> просто «A horse»); 3-й переводчик — облако.
+  (3) Веб-чат: честный отказ на видео (раньше молчание).
+
 v3.2.0 «ГЛАЗА И ГОЛОС» (Task 98, 02.11.2026): (1) зрение — честный опрос
   САМОГО llama-server (vision_available: пробный кадр в
   /v1/chat/completions, кэш 2 мин) — локальный флаг процесса врал, когда
@@ -81,7 +102,7 @@ v3.8.2 «ПРОВЕРКА РУК» (Task 68, 02.11.2026): живой аудит 
 
 Запуск: pythonw.exe jarvis.py [--hello]
 """
-import json, os, sys, time, base64, subprocess, threading, traceback, re
+import json, os, sys, time, base64, subprocess, threading, traceback, re, shutil
 import urllib.request, urllib.parse
 import ctypes
 try:  # v3.3.0: физические пиксели экрана — 4K@200% без виртуализации
@@ -417,17 +438,6 @@ def _llm_attempts():
     return attempts
 
 def llm_start():
-    # v3.11.0: генератор занимает VRAM — мозг не поднимаем, пока
-    # активен режим генерации (защита от watchdog/игр/ярлыков)
-    try:
-        if gen_mode_get() != "off" and comfy_alive():
-            LLM_PROC["sleeping"] = True
-            LLM_PROC["reason"] = "gen"
-            LLM_PROC["starting"] = False
-            log("llm_start: пропуск — активен режим генерации")
-            return False
-    except Exception:
-        pass
     if llm_health():
         LLM_PROC["sleeping"] = False
         return True
@@ -447,7 +457,11 @@ def llm_start():
         log("llm_start: skip - brain unloaded on purpose (BRAIN.SLEEP)")
         return False
     try:
-        _n = int(ps_run("(Get-Process llama-server -EA SilentlyContinue | Measure-Object).Count", 30).strip() or 0)
+        # считаю только мозг (--port 1234); посторонние llama-server
+        # (например, старые) не трогаю
+        _n = int(ps_run("(Get-CimInstance Win32_Process -Filter \"Name='llama-server.exe'\" | "
+                        "Where-Object {$_.CommandLine -match '--port 1234'} | "
+                        "Measure-Object).Count", 30).strip() or 0)
     except Exception:
         _n = 0
     if _n > 0:
@@ -457,7 +471,9 @@ def llm_start():
                 LLM_PROC["starting"] = False
                 return True
             time.sleep(3)
-        ps_run("Get-Process llama-server -EA SilentlyContinue | Stop-Process -Force", 30)
+        ps_run("Get-CimInstance Win32_Process -Filter \"Name='llama-server.exe'\" | "
+               "Where-Object {$_.CommandLine -match '--port 1234'} | "
+               "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }", 30)
     try:
         for att in _llm_attempts():
             log("llm_start: попытка «%s»" % att["name"])
@@ -508,7 +524,10 @@ def llm_stop(reason="manual"):
         p = LLM_PROC["p"]
         if p and p.poll() is None:
             p.kill()
-        ps_run("Get-Process llama-server -EA SilentlyContinue | Stop-Process -Force")
+        # бью только мозг на --port 1234
+        ps_run("Get-CimInstance Win32_Process -Filter \"Name='llama-server.exe'\" | "
+               "Where-Object {$_.CommandLine -match '--port 1234'} | "
+               "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }", 40)
     except Exception:
         pass
     LLM_PROC["p"] = None
@@ -950,6 +969,132 @@ def open_url(url):
     return ("Заголовок: %s\n\n" % title[:200]) + text[:6000]
 
 
+def _browser_page_text():
+    """v3.12.2: текст ОТКРЫТОЙ страницы в браузере Шефа. Активирую окно
+    браузера, вывожу фокус из полей ввода (Ctrl+F -> Esc), выделяю всю
+    страницу (Ctrl+A), копирую (Ctrl+C), снимаю выделение (Esc) и читаю
+    буфер обмена. -> текст | '' (браузера нет / не скопировалось)."""
+    import win_ctl
+    wins = win_ctl.windows_list(60)
+    if not isinstance(wins, str):
+        return ""
+    lines = [l for l in wins.split("\n") if "«" in l and "»" in l]
+    title = ""
+    # сперва АКТИВНОЕ окно-браузер, затем любое окно-браузер
+    for want_active in (True, False):
+        for ln in lines:
+            active = "[АКТИВНО]" in ln
+            if active != want_active:
+                continue
+            for pat in ("Chrome", "Chromium", "Firefox", "Microsoft Edge",
+                        "Opera", "Яндекс", "Vivaldi", "Brave", "Браузер"):
+                if pat.lower() in ln.lower():
+                    t = ln.split("«")[1].split("»")[0].strip()
+                    if t:
+                        title = t
+                    break
+            if title:
+                break
+        if title:
+            break
+    if not title:
+        return ""
+    r = win_ctl.window_action("activate", title)
+    if "OK" not in str(r):
+        return ""
+    time.sleep(0.8)
+    try:
+        win_ctl.key_combo("ctrl+f")   # фокус из полей ввода -> строка поиска
+        time.sleep(0.25)
+        win_ctl.key_combo("esc")      # закрыть её — фокус на страницу
+        time.sleep(0.25)
+    except Exception:
+        pass
+    win_ctl.key_combo("ctrl+a")
+    time.sleep(0.3)
+    win_ctl.key_combo("ctrl+c")
+    time.sleep(0.6)
+    try:
+        win_ctl.key_combo("esc")      # снять выделение — Шефу не мешаем
+    except Exception:
+        pass
+    txt = ps_run("Get-Clipboard -Raw -ErrorAction SilentlyContinue", 60)
+    return (txt or "").strip()
+
+
+def page_find(what, url=""):
+    """v3.12.2: найти НУЖНУЮ информацию на странице — ТЕКСТОМ, а не
+    описанием скриншота (живой сбой 07.11 19:28-19:38: Шеф просил найти
+    фильм на руторе, Джарвис лишь говорил «что видит на картинке»).
+    Порядок источников текста: 1) страница по ссылке (HTTP, без
+    браузера); 2) ОТКРЫТАЯ страница в браузере (Ctrl+A/Ctrl+C -> буфер);
+    3) подсказка перейти на зрение. Возвращает мозгу найденные точные
+    строки по ключевым словам запроса + начало текста страницы."""
+    what = (what or "").strip()
+    url = (url or "").strip()
+    text = ""
+    src = ""
+    if url:
+        if " " in url:               # пробелы в ссылке — кодируем
+            url = urllib.parse.quote(url, safe=":/?&=+%#")
+        try:
+            text = open_url(url)
+            src = "ссылка %s" % url[:120]
+        except Exception:
+            text = ""
+    if (not text or len(text) < 300
+            or text.startswith("не смог открыть")
+            or text.startswith("страница пустая")):
+        try:
+            btxt = _browser_page_text()
+        except Exception as e:
+            btxt = ""
+            log("найти_на_странице: браузер не отдал текст (%s)"
+                % str(e)[:100])
+        if btxt and len(btxt) > len(text):
+            text = btxt
+            src = "открытая страница в браузере"
+    if not text or len(text) < 40:
+        return ("текст страницы не читается (ссылки нет, браузер закрыт "
+                "или страница — сплошная картинка). План Б: «скрин» + "
+                "зрение с ТОЧНЫМ вопросом «%s», листать страницу и "
+                "повторить поиск." % what[:120])
+    kws = [w for w in re.split(r"[^\wёЁ]+", what.lower())
+           if len(w) > 2 and w not in
+           ("и", "the", "для", "как", "что", "где", "найди", "найти",
+            "site", "http", "https", "www", "ru", "com")][:10]
+    frags = []
+    seen = set()
+    if kws:
+        low = text.lower()
+        for kw in kws:
+            start = 0
+            while len(frags) < 14:
+                i = low.find(kw, start)
+                if i < 0:
+                    break
+                frag = text[max(0, i - 120):i + 170].replace("\r", " ")
+                frag = re.sub(r"\s+", " ", frag).strip()
+                key = frag[:60]
+                if key not in seen:
+                    seen.add(key)
+                    frags.append(frag)
+                start = i + len(kw)
+    head = re.sub(r"\s+", " ", text[:500]).strip()
+    if frags:
+        res = ["ИСТОЧНИК: %s" % src,
+               "НАЙДЕНО по словам «%s» — точные строки со страницы:"
+               % " ".join(kws[:6])]
+        res += ["%d. …%s…" % (n, f) for n, f in enumerate(frags[:12], 1)]
+        res.append("НАЧАЛО СТРАНИЦЫ: %s" % head)
+        return "\n".join(res)[:5200]
+    return ("ИСТОЧНИК: %s\nТочных слов «%s» на странице не нашёл. "
+            "НАЧАЛО ТЕКСТА: %s\nПодсказка: если нужное глубже в сайте — "
+            "открой поисковый URL сайта с этим запросом и повтори "
+            "«найти_на_странице»."
+            % (src, " ".join(kws[:6])[:120], head))[:5200]
+
+
 # ---------------------------------------------------------------- команды пульта (фаза 1)
 
 def cmd_status():
@@ -985,19 +1130,6 @@ foreach($p in $top){ "top=$($p.Name) $([int]($p.WorkingSet64/1MB))MB" }
     txt += "⏱ Аптайм: %s\n" % d.get("uptime", "?")
     txt += "🧠 CPU: %s%%   RAM: %s\n" % (d.get("cpu", "?"), d.get("ram", "?"))
     txt += "🎮 GPU: %s\n" % d.get("gpu", "?")
-    try:
-        _gm = gen_mode_get()
-        txt += ("📷 Генератор: %s%s\n" % (
-            {"photo": "режим ФОТО", "video": "режим ВИДЕО"}
-            .get(_gm, "выключен"),
-            " (работает)" if comfy_alive(1) else ""))
-        _allreq = (GEN_REQ["photo"]["flux"] + GEN_REQ["photo"]["sdxl"]
-                   + GEN_REQ["video"])
-        _okm, _mname, _mpct = _gen_models_state(_allreq)
-        if not _okm:
-            txt += "⬇️ Докачка моделей: %s — %.0f%%\n" % (_mname, _mpct)
-    except Exception:
-        pass
     for dsk in disks:
         txt += "💾 %s\n" % dsk[5:]
     if tops:
@@ -1973,6 +2105,7 @@ SYSTEM = """Ты — Джарвис, ИИ-ассистент Шефа, живё�
 - новости {"тема":"..."} — свежие новости (пустая тема = главное в мире)
 - курсы {} — курсы валют/крипты точно (ЦБ РФ, Binance)
 - открыть_ссылку {"url":"..."} — прочитать текст страницы
+- найти_на_странице {"что":"...","url":"..."} — найти НУЖНУЮ информацию на странице: читаю ТЕКСТ (по ссылке ИЛИ из открытого браузера) и выписываю ТОЧНЫЕ строки (название/размер/цена/сиды/дата/ссылка). Шеф просит «найди на странице/на сайте …» — это ЗНАЧИТ этот инструмент, а НЕ «скрин»: описание картинки ≠ поиск. Для поиска ПО САЙТУ открой его поисковый URL (rutracker.org/forum/tracker.php?nm=запрос, rutor.info/search/0/1/000/0/запрос) и снова найти_на_странице.
 
 ДЕЙСТВИЯ (Шеф просит действия — ДЕЙСТВУЙ сразу):
 - очистить_мусор {"диск":"C"} — безопасная очистка: временные файлы, кэши браузеров/DirectX/AMD, корзина, кэш обновлений. Вызывай СРАЗУ на «освободи/почисти диск».
@@ -2028,7 +2161,7 @@ SYSTEM = """Ты — Джарвис, ИИ-ассистент Шефа, живё�
 3. У тебя ПОЛНЫЕ ПРАВА АДМИНИСТРАТОРА. НИКОГДА не отвечай «не могу», «нет прав», «не разрешено», «это запрещено» — Шефу это осточертело. Не знаешь как — пробуй через run_ps: PowerShell умеет почти всё на свете. ЕДИНСТВЕННОЕ исключение — ЗАКОНЫ ШЕФА (З1-З3): там отказ обязателен.
 4. Явное «да» Шефа нужно перед: выключением/перезагрузкой ПК, форматированием, сносом программ, удалением папок мимо корзины, правкой реестра, объёмами больше 50 ГБ (закон З3). Обычную работу (чистка мусора, перенос, запуск) делай СРАЗУ.
 5. Не закрывай и не удаляй мои собственные процессы и папки (python, llama-server, D:\\Jarvis, кэш моделей) — иначе я умру. Ядро Windows (csrss, lsass, wininit, smss, services, svchost, system, winlogon, dwm) роняет ПК в синий экран — без явного приказа Шефа не трогай.
-6. Управление программами с интерфейсом (AMD Adrenalin, браузеры, лаунчеры): по шагам — «окна» найти нужное, «окно» активировать, «скрин» посмотреть, «мышь»/«клавиша»/«печатать» воздействовать, снова «скрин» проверить. Экран {screen}; координаты мыши — ТОЛЬКО в ФИЗИЧЕСКИХ пикселях свежего скриншота (0,0 = левый верхний угол), НЕ дели и не умножай на масштаб. Мышь и окна сами проверяют каждое действие: ответ «OK … проверено» — правда, «НЕ получилось/НЕ подтвердилось» — передай Шефу как есть и пробуй другой путь (клавиша, run_ps тоже вариант).
+6. Управление программами с интерфейсом (AMD Adrenalin, браузеры, лаунчеры): по шагам — «окна» найти нужное, «окно» активировать, «скрин» посмотреть, «мышь»/«клавиша»/«печатать» воздействовать, снова «скрин» проверить. Экран {screen}; координаты мыши — ТОЛЬКО в ФИЗИЧЕСКИХ пикселях свежего скриншота (0,0 = левый верхний угол), НЕ дели и не умножай на масштаб. Мышь и окна сами проверяют каждое действие: ответ «OK … проверено» — правда, «НЕ получилось/НЕ подтвердилось» — передай Шефу как есть и пробуй другой путь (клавиша, run_ps тоже вариант). Поиск информации на сайте/в интернете: «интернет» (найти сайт/факты) -> «найти_на_странице» (точные строки со страницы; можно с url, можно без — возьму из открытого браузера). «Скрин» — только для картинок, капчи и проверки кнопок: «что я вижу» НЕ заменяет поиск.
 7. Если действия не нужно — просто отвечай текстом без JSON.
 8. Никогда не упоминай Шефу слова «JSON» и «инструмент» — он видит только результат.
 9. Учись: после нетривиальной задачи (новое умение, ошибка и её исправление, привычка Шефа) — сразу запиши урок в память («запомнить_факт»); разобрался, как делать что-то новое, — создай скилл («записать_скилл»).
@@ -2636,6 +2769,15 @@ Get-ChildItem -LiteralPath '%s' -Recurse -Filter '%s' -EA SilentlyContinue -Erro
             if not u:
                 return "нет ссылки"
             return open_url(u)
+        if name in ("найти_на_странице", "page_find", "найти_в_браузере",
+                    "найти_на_сайте"):
+            what = str(args.get("что") or args.get("запрос") or
+                       args.get("информация") or args.get("query")
+                       or "")[:300]
+            u = str(args.get("url") or args.get("ссылка") or "")[:300]
+            if not what:
+                return "не указано, что искать"
+            return page_find(what, u)
         if name in ("очистить_мусор", "очистка", "почистить", "очистить"):
             disk = str(args.get("диск") or args.get("disk") or "C").upper()[:1]
             return cmd_cleanup(disk)
@@ -2921,7 +3063,7 @@ CLOUD_SYS = ("Ты — «старший брат» Джарвиса: облач�
              "и без лишних извинений.")
 
 
-def cloud_ask(text, hist):
+def cloud_ask(text, hist, msgs=None, temperature=0.6, max_tokens=None):
     """v3.10.0: бесплатный облачный «старший брат» (по умолчанию
     Pollinations — ключ не нужен; endpoint/model/key в config.json,
     можно заменить на любой OpenAI-совместимый API: GLM (z.ai),
@@ -2933,11 +3075,13 @@ def cloud_ask(text, hist):
     if not url:
         return None, "старшие не настроены (cloud_api_url)"
     key = (CFG.get("cloud_api_key") or "").strip()
-    msgs = ([{"role": "system", "content": CLOUD_SYS}] + list(hist[-8:])
-            + [{"role": "user", "content": text[:4000]}])
+    if msgs is None:   # msgs можно передать извне
+        msgs = ([{"role": "system", "content": CLOUD_SYS}] + list(hist[-8:])
+                + [{"role": "user", "content": text[:4000]}])
     body = {"model": (CFG.get("cloud_model") or "openai-fast"),
-            "messages": msgs, "temperature": 0.6,
-            "max_tokens": int(CFG.get("cloud_max_tokens", 1200) or 1200)}
+            "messages": msgs, "temperature": temperature,
+            "max_tokens": int(max_tokens or
+                              CFG.get("cloud_max_tokens", 1200) or 1200)}
     headers = {"Content-Type": "application/json"}
     if "pollinations" in url:
         body["referrer"] = "jarvis-pc2-ПК2"
@@ -2974,660 +3118,30 @@ def cloud_ask(text, hist):
     return None, "старшие не ответили"
 
 
-# ------------------------------------------------ v3.11.0 ГЕНЕРАЦИЯ (Task 129)
+# --------------------------------------------- v3.13.0 ТОЛЬКО ТЕКСТ (Task 131)
 
-COMFY_DIR = str(CFG.get("comfy_dir") or r"D:\Jarvis\comfyui_rocm")
-COMFY_URL = "http://127.0.0.1:%s" % int(CFG.get("comfy_port", 8188) or 8188)
-COMFY_BAT = os.path.join(COMFY_DIR, "comfy_headless.bat")
-COMFY_OUT = os.path.join(COMFY_DIR, "output")
-COMFY_LOG = os.path.join(COMFY_DIR, "comfyui.log")
-GEN_MODEF = os.path.join(DATA, "GEN.MODE")
-GEN_PROC = {"p": None, "busy": False}
-GEN_NOTE = {"txt": ""}  # v3.11.1: заметка к доставке (русский на «быстро»)
-GEN_LOCKF = os.path.join(DATA, "GEN.BUSY")  # v3.11.2: общий замок TG+веб
-GEN_LASTF = os.path.join(DATA, "GEN.LAST")  # v3.11.2: семейство моделей в генераторе
-
-
-def _pid_alive(pid):
-    """v3.11.2: жив ли процесс (Win API, без psutil)."""
-    try:
-        import ctypes
-        h = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))
-        if not h:
-            return False
-        ctypes.windll.kernel32.CloseHandle(h)
-        return True
-    except Exception:
-        return True  # не смогли спросить — считаем живым
-
-
-def gen_busy_held():
-    """v3.11.2: генерация занята? Общий замок Telegram + веб-чата
-    (файл с pid владельца; протухший замок владельца-мертвеца снимаю)."""
-    try:
-        with open(GEN_LOCKF, encoding="utf-8") as f:
-            pid = int((f.read().strip() or "0"))
-    except (OSError, ValueError):
-        return False
-    if pid == os.getpid() or _pid_alive(pid):
-        return True
-    try:
-        os.remove(GEN_LOCKF)  # владелец умер — замок протух
-    except OSError:
-        pass
-    return False
-
-
-def gen_busy_trylock():
-    """v3.11.2: занять генерацию (True = удалось)."""
-    if gen_busy_held():
-        return False
-    try:
-        with open(GEN_LOCKF, "w", encoding="utf-8") as f:
-            f.write(str(os.getpid()))
-    except OSError:
-        pass  # не записался — работаем без замка: лучше две задачи, чем вечное «занято»
-    return True
-
-
-def gen_busy_unlock():
-    """v3.11.2: освободить генерацию (снимаю только свой замок)."""
-    mine = False
-    try:
-        with open(GEN_LOCKF, encoding="utf-8") as f:
-            mine = f.read().strip() == str(os.getpid())
-    except OSError:
-        return
-    if mine:
-        try:
-            os.remove(GEN_LOCKF)
-        except OSError:
-            pass
-
-# v3.11.1: какие файлы нужны каждому workflow (путь от models/, точный
-# размер в байтах) — для честного «докачивается N%» вместо загадочного
-# сбоя посреди генерации.
-GEN_REQ = {
-    "photo": {
-        "flux": [("diffusion_models/flux1-dev-Q4_K_S.gguf", 6805988640),
-                 ("text_encoders/clip_l.safetensors", 246144152),
-                 ("text_encoders/t5xxl_fp8_e4m3fn.safetensors", 4893934904),
-                 ("vae/flux-vae-bf16.safetensors", 167664710)],
-        "sdxl": [("checkpoints/RealVisXL_V5.0_fp16.safetensors", 6938065488)],
-    },
-    "video": [("diffusion_models/Wan2.2-TI2V-5B-Q6_K.gguf", 4211683680),
-              ("text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
-               6735906897),
-              ("vae/wan2.2_vae.safetensors", 1409400960)],
-}
-
-
-def _gen_models_state(files):
-    """v3.11.1: файлы моделей на месте? -> (ok, имя худшего, % готовности)."""
-    worst = None
-    for rel, want in files:
-        have = 0
-        try:
-            have = os.path.getsize(os.path.join(COMFY_DIR, "models",
-                                                *rel.split("/")))
-        except OSError:
-            pass
-        if have < want:
-            pct = 100.0 * have / want
-            if worst is None or pct < worst[1]:
-                worst = (rel.split("/")[-1], pct)
-    if worst is None:
-        return True, None, 0.0
-    return False, worst[0], worst[1]
-
-
-def _comfy_err(rec):
-    """v3.11.1: человекочитаемая причина сбоя из истории ComfyUI."""
-    try:
-        for m in (rec.get("status") or {}).get("messages") or []:
-            if len(m) >= 2 and "error" in str(m[0]):
-                d = m[1] if isinstance(m[1], dict) else {}
-                node = d.get("node_type") or d.get("node_id") or "узел"
-                msg = d.get("exception_message") or str(d)[:160]
-                et = d.get("exception_type") or ""
-                s = ("%s: %s %s" % (node, et, msg)).strip()
-                return s[:220]
-    except Exception:
-        pass
-    return "без деталей (см. comfyui.log)"
-
-GEN_BACK_RE = re.compile(r"верни\s+(основн|мозг)|вернись\s+к\s+основн|"
-                         r"обычн\w*\s+режим|(выключи|отключи|заверши)\s+"
-                         r"(фото|видео|генератор|режим)")
-GEN_PHOTO_RE = re.compile(r"переключ\w*\s+на\s+(фото|картинк)|режим\s+фото|"
-                          r"включи\s+фото|фото\s*[-—]?\s*режим")
-GEN_VIDEO_RE = re.compile(r"переключ\w*\s+на\s+видео|режим\s+видео|"
-                          r"включи\s+видео|видео\s*[-—]?\s*режим")
-GEN_VIDGEN_RE = re.compile(r"(сделай|сгенерируй|создай|нарисуй)\s+видео|"
-                           r"видеоролик")
-GEN_DRAW_RE = re.compile(r"^\s*нарисуй\b|"
-                         r"^\s*(сгенерируй|создай|сделай)\s+"
-                         r"(мне\s+)?(фото|картинк\w*|изображение)")
-
-
-def gen_mode_get():
-    """Текущий режим генерации: photo / video / off (живёт в data/GEN.MODE)."""
-    try:
-        with open(GEN_MODEF, encoding="utf-8") as f:
-            m = f.read().strip().lower()
-        return m if m in ("photo", "video") else "off"
-    except Exception:
-        return "off"
-
-
-def gen_mode_set(mode):
-    try:
-        if mode == "off":
-            try:
-                os.remove(GEN_MODEF)
-            except OSError:
-                pass
-        else:
-            with open(GEN_MODEF, "w", encoding="utf-8") as f:
-                f.write(mode)
-    except Exception:
-        log("gen_mode_set ERR:\n" + traceback.format_exc())
-
-
-def comfy_alive(timeout=3):
-    try:
-        with urllib.request.urlopen(COMFY_URL + "/system_stats",
-                                    timeout=timeout) as r:
-            return r.status == 200
-    except Exception:
-        return False
-
-
-def _comfy_kill_zombies():
-    """v3.11.2: добить полумёртвые процессы ComfyUI (порт умер, тело
-    живо) — иначе новый старт споткнётся о занятую VRAM.
-    v3.11.3: у генератора ОТНОСИТЕЛЬНЫЙ cmdline (python_env\\python.exe
-    main.py --port 8188, без слова comfyui_rocm) — старый фильтр его не
-    видел и taskkill молча проходил мимо; матчу по порту генератора."""
-    try:
-        ps_run("Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
-               "Where-Object {$_.CommandLine -like '*main.py*--port 8188*' "
-               "-or $_.CommandLine -like '*comfyui_rocm*main.py*'} | "
-               "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }", 40)
-    except Exception:
-        pass
-
-
-def comfy_start(timeout=300):
-    """Поднять генератор (ComfyUI). VRAM должна быть свободна — 27B и
-    генератор вместе на 16 ГБ не помещаются, поэтому мозг выгружаем
-    заранее. -> True/False."""
-    if comfy_alive():
-        return True
-    if not os.path.isfile(COMFY_BAT):
-        log("comfy_start: нет %s" % COMFY_BAT)
-        return False
-    _comfy_kill_zombies()
-    # v3.11.3 ГРАБЛИ ХОЛОДНОГО СТАРТА (живой сбой 16:42-17:11 07.11):
-    # раньше cmd наследовал открытый хэндл comfyui.log (stdout=lf) —
-    # тогда его собственное "echo >> comfyui.log" получало «файл занят
-    # другим процессом» и весь старт умирал с code=1. Bat сам пишет
-    # лог — наследовать ему ничего нельзя, stdout в никуда.
-    try:
-        p = subprocess.Popen(["cmd", "/c", COMFY_BAT], cwd=COMFY_DIR,
-                             stdin=subprocess.DEVNULL,
-                             stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL,
-                             creationflags=0x08000000)
-    except Exception:
-        log("comfy_start Popen ERR:\n" + traceback.format_exc())
-        return False
-    GEN_PROC["p"] = p
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        time.sleep(3)
-        if comfy_alive():
-            log("ComfyUI готов (pid %s, %.0f c)" % (p.pid, time.time() - t0))
-            return True
-        if p.poll() is not None:
-            log("ComfyUI умер при старте (code=%s)" % p.returncode)
-            return False
-    return comfy_alive()
-
-
-def comfy_stop():
-    """Остановить ComfyUI: по дереву PID + зачистка одиночек по cmdline."""
-    p = GEN_PROC.get("p")
-    if p is not None:
-        try:
-            subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"],
-                           capture_output=True, timeout=40)
-        except Exception:
-            pass
-        GEN_PROC["p"] = None
-    _comfy_kill_zombies()
-    t0 = time.time()
-    while time.time() - t0 < 25 and comfy_alive(1):
-        time.sleep(2)
-    log("ComfyUI остановлен (%.0f c)" % (time.time() - t0))
-
-
-def _gen_seed():
-    return int.from_bytes(os.urandom(6), "big")
-
-
-def _wf_photo_flux(prompt, seed):
-    """FLUX.1-dev (GGUF Q4_K_S) — флагманское качество, ~1 мин/кадр."""
-    return {
-        "1": {"class_type": "UnetLoaderGGUF",
-              "inputs": {"unet_name": "flux1-dev-Q4_K_S.gguf"}},
-        "2": {"class_type": "DualCLIPLoader",
-              "inputs": {"clip_name1": "clip_l.safetensors",
-                         "clip_name2": "t5xxl_fp8_e4m3fn.safetensors",
-                         "type": "flux"}},
-        "3": {"class_type": "VAELoader",
-              "inputs": {"vae_name": "flux-vae-bf16.safetensors"}},
-        "10": {"class_type": "CLIPTextEncode",
-               "inputs": {"text": prompt[:1200], "clip": ["2", 0]}},
-        "11": {"class_type": "FluxGuidance",
-               "inputs": {"conditioning": ["10", 0], "guidance": 3.5}},
-        "12": {"class_type": "CLIPTextEncode",
-               "inputs": {"text": "", "clip": ["2", 0]}},
-        "13": {"class_type": "EmptySD3LatentImage",
-               "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
-        "20": {"class_type": "KSampler",
-               "inputs": {"seed": seed, "steps": 20, "cfg": 1.0,
-                          "sampler_name": "euler", "scheduler": "simple",
-                          "denoise": 1.0, "model": ["1", 0],
-                          "positive": ["11", 0], "negative": ["12", 0],
-                          "latent_image": ["13", 0]}},
-        "30": {"class_type": "VAEDecode",
-               "inputs": {"samples": ["20", 0], "vae": ["3", 0]}},
-        "40": {"class_type": "SaveImage",
-               "inputs": {"filename_prefix": "jarvis_photo",
-                          "images": ["30", 0]}}
-    }
-
-
-def _wf_photo_sdxl(prompt, seed):
-    """RealVisXL V5 (SDXL) — быстро и фотореалистично (слово «быстро»)."""
-    neg = ("(worst quality, low quality, illustration, 3d, 2d, painting), "
-           "(bad anatomy, extra digits, fewer digits), watermark, text, logo")
-    return {
-        "1": {"class_type": "CheckpointLoaderSimple",
-              "inputs": {"ckpt_name":
-                         "RealVisXL_V5.0_fp16.safetensors"}},
-        "10": {"class_type": "CLIPTextEncode",
-               "inputs": {"text": prompt[:1200], "clip": ["1", 1]}},
-        "11": {"class_type": "CLIPTextEncode",
-               "inputs": {"text": neg, "clip": ["1", 1]}},
-        "12": {"class_type": "EmptyLatentImage",
-               "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
-        "20": {"class_type": "KSampler",
-               "inputs": {"seed": seed, "steps": 30, "cfg": 6.0,
-                          "sampler_name": "dpmpp_2m", "scheduler": "karras",
-                          "denoise": 1.0, "model": ["1", 0],
-                          "positive": ["10", 0], "negative": ["11", 0],
-                          "latent_image": ["12", 0]}},
-        "30": {"class_type": "VAEDecode",
-               "inputs": {"samples": ["20", 0], "vae": ["1", 2]}},
-        "40": {"class_type": "SaveImage",
-               "inputs": {"filename_prefix": "jarvis_photo",
-                          "images": ["30", 0]}}
-    }
-
-
-def _wf_video_wan(prompt, seed, width=832, height=480, length=81):
-    """Wan 2.2 TI2V-5B (GGUF Q6_K) — текст->видео, 480p, ~5 с ролика."""
-    neg = ("色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，"
-           "静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，"
-           "多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，"
-           "形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，"
-           "背景人很多，倒着走")
-    return {
-        "1": {"class_type": "UnetLoaderGGUF",
-              "inputs": {"unet_name": "Wan2.2-TI2V-5B-Q6_K.gguf"}},
-        "2": {"class_type": "CLIPLoader",
-              "inputs": {"clip_name":
-                         "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
-                         "type": "wan"}},
-        "3": {"class_type": "VAELoader",
-              "inputs": {"vae_name": "wan2.2_vae.safetensors"}},
-        "10": {"class_type": "CLIPTextEncode",
-               "inputs": {"text": prompt[:1200], "clip": ["2", 0]}},
-        "11": {"class_type": "CLIPTextEncode",
-               "inputs": {"text": neg, "clip": ["2", 0]}},
-        "12": {"class_type": "Wan22ImageToVideoLatent",
-               "inputs": {"width": width, "height": height,
-                          "length": length, "batch_size": 1,
-                          "vae": ["3", 0]}},
-        "13": {"class_type": "ModelSamplingSD3",
-               "inputs": {"shift": 8.0, "model": ["1", 0]}},
-        "20": {"class_type": "KSampler",
-               "inputs": {"seed": seed, "steps": 20, "cfg": 5.0,
-                          "sampler_name": "uni_pc", "scheduler": "simple",
-                          "denoise": 1.0, "model": ["13", 0],
-                          "positive": ["10", 0], "negative": ["11", 0],
-                          "latent_image": ["12", 0]}},
-        "30": {"class_type": "VAEDecodeTiled",
-               "inputs": {"samples": ["20", 0], "vae": ["3", 0],
-                          "tile_size": 512, "overlap": 64,
-                          "temporal_size": 32, "temporal_overlap": 8}},
-        "40": {"class_type": "CreateVideo",
-               "inputs": {"fps": 16, "images": ["30", 0]}},
-        "50": {"class_type": "SaveVideo",
-               "inputs": {"filename_prefix": "jarvis_video",
-                          "format": "auto",
-                          "video": ["40", 0]}}
-    }
-
-
-def _comfy_submit(wf):
-    """v3.11.2: поставить workflow в очередь. -> prompt_id | None."""
-    try:
-        j = http_json(COMFY_URL + "/prompt",
-                      {"prompt": wf, "client_id": "jarvis"}, timeout=30)
-    except urllib.request.HTTPError as e:
-        try:
-            detail = e.read().decode("utf-8", "replace")[:300]
-        except Exception:
-            detail = ""
-        log("comfy_submit: ComfyUI отклонил задачу: %s %s" % (e, detail))
-        return None
-    except Exception as e:
-        log("comfy_submit: генератор не отвечает: %s" % str(e)[:160])
-        return None
-    return (j or {}).get("prompt_id")
-
-
-def comfy_generate(wf, timeout):
-    """Поставить workflow в очередь ComfyUI и дождаться файла.
-    v3.11.2 САМОВОССТАНОВЛЕНИЕ: если генератор умер СЕРЕДИНА задачи
-    (живой сбой 16:16 07.11: access violation в GGUF-unpatch на ROCm),
-    раньше Джарвис молча ждал трупа до таймаута; теперь сам
-    перезапускаю генератор и повторяю задачу (один раз).
-    -> (путь, None) или (None, причина)."""
-    if not comfy_alive():
-        return None, "генератор не поднят"
-    prompt_id = _comfy_submit(wf)
-    if not prompt_id:
-        return None, "ComfyUI не принял задачу (comfyui.log)"
-    t0 = time.time()
-    misses = 0    # подряд неответы /history — генератор умер
-    raised = False  # уже перезапускали в этой задаче
-    while time.time() - t0 < timeout:
-        time.sleep(3)
-        try:
-            with urllib.request.urlopen(COMFY_URL + "/history/" + prompt_id,
-                                        timeout=10) as r:
-                h = json.loads(r.read().decode())
-            misses = 0
-        except urllib.error.HTTPError:
-            h = {}      # сервер жив, просто ответил ошибкой — ждём дальше
-            misses = 0
-        except Exception:
-            h = None    # соединения нет — генератор мёртв или висит
-        if h is None:
-            misses += 1
-            if misses >= 4:
-                if raised:
-                    return None, ("генератор упал во время работы и не "
-                                  "поднялся повторно (comfyui.log)")
-                log("ГЕНЕРАЦИЯ: генератор умер во время задачи — "
-                    "перезапускаю и повторяю задачу")
-                if comfy_alive():
-                    comfy_stop()   # жив, но не отвечает — начисто
-                if not comfy_start():
-                    return None, "генератор упал и не поднялся (comfyui.log)"
-                prompt_id = _comfy_submit(wf)
-                if not prompt_id:
-                    return None, "генератор поднялся, но не принял повтор"
-                raised = True
-                misses = 0
-            continue
-        rec = h.get(prompt_id)
-        if not rec:
-            continue
-        status = rec.get("status") or {}
-        outputs = rec.get("outputs") or {}
-        for _nid, out in outputs.items():
-            for _key in ("images", "gifs", "video", "images_output"):
-                for item in (out.get(_key) or []):
-                    fn = item.get("filename")
-                    if not fn:
-                        continue
-                    p = os.path.join(COMFY_OUT, item.get("subfolder") or "", fn)
-                    if os.path.isfile(p):
-                        return p, None
-        if status.get("status_str") == "error":
-            return None, "ошибка генерации: %s" % _comfy_err(rec)
-        return None, "генератор закончил без файла"
-    return None, "не дождался за %d с" % timeout
-
-
-def gen_run(mode, text):
-    """Сгенерировать фото/видео по тексту. -> (путь, None) | (None, причина)."""
-    seed = _gen_seed()
-    prompt = re.sub(r"^\s*(нарисуй|сгенерируй|создай|сделай)\s*", "",
-                    text.strip(), flags=re.I)
-    prompt = re.sub(r"^\s*мне\s+", "", prompt, flags=re.I)
-    prompt = re.sub(r"^\s*(быстрое|быстро)\s*[:\-—]?\s*", "", prompt,
-                    flags=re.I)
-    prompt = re.sub(r"^\s*(фото|картинк\w*|изображение|видео|видеоролик)"
-                    r"\s*(с|про|где)?\s*[:\-—]?\s*", "", prompt, flags=re.I)
-    prompt = prompt.strip(" ,.:-")
-    if not prompt:
-        return None, "пустое описание — напиши, что именно нарисовать"
-    fast = bool(re.search(r"\bбыстр", text.lower()))
-    GEN_NOTE["txt"] = ""
-    if fast and mode == "photo" and re.search(r"[а-яё]", prompt, re.I):
-        # v3.11.1: RealVisXL (CLIP) не понимает русский — русские описания
-        # «быстро:» автоматически идут через FLUX (t5xxl многоязычный)
-        fast = False
-        GEN_NOTE["txt"] = " — быстро знает только английский, сделал через FLUX"
-    reqs = (GEN_REQ["photo"]["sdxl" if fast else "flux"]
-            if mode == "photo" else GEN_REQ["video"])
-    okm, mname, mpct = _gen_models_state(reqs)
-    if not okm:
-        _st = ("ещё докачивается, %.0f%% готово" % mpct) if mpct > 0 \
-            else "ещё не скачана"
-        return None, ("модель «%s» %s — докачка идёт в фоне, попробуй "
-                      "чуть позже" % (mname, _st))
-    t0 = time.time()
-    fam = ("video" if mode == "video" else ("sdxl" if fast else "flux"))
-    okc, cerr = gen_ensure(fam)   # v3.11.2: поднять/перезапустить генератор
-    if not okc:
-        _gen_release_brain()
-        threading.Thread(target=llm_start, daemon=True).start()
-        log("ГЕНЕРАЦИЯ [%s]: провал: %s — вернул мозг" % (mode, cerr))
-        return None, cerr + " — вернул мозг"
-    if mode == "photo":
-        wf = (_wf_photo_sdxl(prompt, seed) if fast
-              else _wf_photo_flux(prompt, seed))
-        timeout = int(CFG.get("gen_photo_timeout", 480) or 480)
-    else:
-        wf = _wf_video_wan(prompt, seed)
-        timeout = int(CFG.get("gen_video_timeout", 2400) or 2400)
-    path, err = comfy_generate(wf, timeout)
-    if path:
-        log("ГЕНЕРАЦИЯ [%s%s]: «%s» -> %s (%.0f c)"
-            % (mode, " fast" if fast else "", prompt[:60], path,
-               time.time() - t0))
-    else:
-        log("ГЕНЕРАЦИЯ [%s%s]: провал: %s" % (mode, " fast" if fast else "",
-                                              err))
-    return path, err
-
-
-def gen_route(text):
-    """v3.11.0: разбор команд генерации. -> dict | None.
-    {"do": "switch"|"gen"|"back", "mode": "photo"|"video", "prompt": str}"""
-    t = " " + text.strip().lower() + " "
-    if GEN_BACK_RE.search(t):
-        return {"do": "back", "mode": "off", "prompt": ""}
-    if GEN_VIDEO_RE.search(t):
-        return {"do": "switch", "mode": "video", "prompt": ""}
-    if GEN_PHOTO_RE.search(t):
-        return {"do": "switch", "mode": "photo", "prompt": ""}
-    mode = gen_mode_get()
-    if mode in ("photo", "video"):
-        if mode == "photo" and GEN_VIDGEN_RE.search(t):
-            return {"do": "switch", "mode": "video", "prompt": text.strip()}
-        return {"do": "gen", "mode": mode, "prompt": text.strip()}
-    if GEN_VIDGEN_RE.search(t):
-        return {"do": "switch", "mode": "video", "prompt": text.strip()}
-    if GEN_DRAW_RE.match(t):
-        return {"do": "switch", "mode": "photo", "prompt": text.strip()}
-    return None
-
-
-def _gen_hold_brain():
-    """Выгрузить мозг и записать флаг, чтобы никто не поднял его сам."""
-    llm_stop("gen")
-    try:
-        with open(os.path.join(DATA, "BRAIN.SLEEP"), "w") as f:
-            f.write("gen")
-    except OSError:
-        pass
-
-
-def _gen_release_brain():
-    try:
-        os.remove(os.path.join(DATA, "BRAIN.SLEEP"))
-    except OSError:
-        pass
-    LLM_PROC["sleeping"] = False
-    LLM_PROC["reason"] = None
-
-
-def _gen_fam_get():
-    """v3.11.2: семейство моделей, живущее в генераторе (или None)."""
-    try:
-        with open(GEN_LASTF, encoding="utf-8") as f:
-            v = f.read().strip()
-        return v or None
-    except OSError:
-        return None
-
-
-def _gen_fam_mark(fam):
-    try:
-        with open(GEN_LASTF, "w", encoding="utf-8") as f:
-            f.write(fam)
-    except OSError:
-        pass
-
-
-def gen_ensure(fam):
-    """v3.11.2: генератор готов работать с семейством fam
-    (flux / sdxl / video)? -> (True, "") | (False, причина).
-    Живой сбой 16:16 07.11: после видеозадачи (Wan GGUF в VRAM) фото-
-    задача FLUX попросила место под VAE — выгрузка чужой GGUF-модели
-    (unpatch) уронила ComfyUI нативно (access violation). Поэтому при
-    смене семейства генератор перезапускается начисто; если он вообще
-    не поднят — поднимаю (мозг выгружаю заранее)."""
-    last = _gen_fam_get()
-    if last and last != fam and comfy_alive():
-        log("ГЕНЕРАЦИЯ: смена модели %s -> %s — перезапускаю генератор "
-            "начисто" % (last, fam))
-        comfy_stop()
-    if not comfy_alive():
-        if llm_health():
-            _gen_hold_brain()
-        if not comfy_start():
-            return False, "генератор не поднялся (comfyui.log)"
-    _gen_fam_mark(fam)
-    return True, ""
-
-
-def gen_switch(mode, prompt=""):
-    """Включить режим генерации (мозг выгружен, генератор поднят).
-    -> текст для Шефа."""
-    if gen_busy_held():
-        return "⏳ Дай закончить текущую генерацию — и переключусь."
-    if gen_mode_get() == mode and comfy_alive():
-        return ("📷 Уже в режиме ФОТО — пиши, что нарисовать."
-                if mode == "photo" else
-                "🎬 Уже в режиме ВИДЕО — пиши, что показать.")
-    _gen_hold_brain()
-    gen_mode_set(mode)
-    ok = comfy_start()
-    journal("Режим генерации «%s»: %s"
-            % (mode, "включён" if ok else "генератор НЕ поднялся"))
-    if not ok:
-        gen_mode_set("off")
-        _gen_release_brain()
-        threading.Thread(target=llm_start, daemon=True).start()
-        return ("⚠️ Не смог поднять генератор — возвращаю мозг. "
-                "Лог: D:\\Jarvis\\comfyui_rocm\\comfyui.log")
-    _okm, _mname, _mpct = _gen_models_state(
-        GEN_REQ["photo"]["flux"] if mode == "photo" else GEN_REQ["video"])
-    _warn = ""
-    if not _okm:
-        _st = ("докачивается, %.0f%%" % _mpct) if _mpct > 0 \
-            else "ещё не скачана"
-        _warn = ("\n\n⬇️ Модель «%s» %s — первые задания могут подождать."
-                 % (_mname, _st))
-    if mode == "photo":
-        return ("📷 *Режим ФОТО* — мозг спит, генератор в видеокарте.\n\n"
-                "Пиши что нарисовать — обычным языком, можно по-русски.\n"
-                "• по умолчанию — FLUX (качественнее, ~1 мин)\n"
-                "• «быстро: <описание>» — RealVisXL (~20 с, только "
-                "английский — русские описания автоматом через FLUX)\n\n"
-                "«верни основную» — обратно мозг." + _warn)
-    return ("🎬 *Режим ВИДЕО* — мозг спит, генератор в видеокарте.\n\n"
-            "Пиши, что показать в ролике (5 секунд 480p — это несколько "
-            "минут работы).\n\n«верни основную» — обратно мозг." + _warn)
-
-
-def gen_back():
-    """Выключить режим генерации, вернуть мозг. -> текст для Шефа."""
-    if gen_busy_held():
-        return "⏳ Дай доделать текущую генерацию — минута."
-    comfy_stop()
-    gen_mode_set("off")
-    try:                       # v3.11.2: семейство моделей обнуляется
-        os.remove(GEN_LASTF)
-    except OSError:
-        pass
-    _gen_release_brain()
-    ok = llm_start()
-    journal("Режим генерации выключен, мозг %s"
-            % ("на месте" if ok else "НЕ поднялся"))
-    return ("🧠 Мозг на месте, генератор выключен." if ok else
-            "⚠️ Генератор выключен, но мозг не завёлся — глянь llama.log.")
-
-
-def gen_deliver(mode, prompt, chat_id):
-    """Фоновая генерация + доставка Шефу в Telegram (фото/файлом).
-    v3.11.2: замок генерации общий с веб-чатом (файл data/GEN.BUSY —
-    раньше у каждого процесса было своё состояние и «иии» из веб-чата
-    лезло мимо «уже делаю»); генератор поднимается/перезапускается
-    внутри gen_run (gen_ensure), включая самовосстановление после
-    нативного сбоя посреди задачи."""
-    if not gen_busy_trylock():
-        return send("⏳ Уже делаю предыдущую — дождись.", chat_id)
-    GEN_PROC["busy"] = True
-    t0 = time.time()
-    try:
-        path, err = gen_run(mode, prompt)
-        if not path:
-            return send("⚠️ Не получилось: %s" % err, chat_id)
-        took = time.time() - t0
-        if mode == "photo":
-            send_photo(path, "🎨 %.0f с | %s%s" % (took, prompt[:150],
-                                                    GEN_NOTE["txt"]),
-                       chat_id)
-        else:
-            send_document(path, "🎬 %.0f с | %s" % (took, prompt[:120]),
-                          chat_id)
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-    finally:
-        GEN_PROC["busy"] = False
-        gen_busy_unlock()
+# Приказ Шефа 07.11: «оставляй только текстовую модель как изначально
+# задумывалось, всё остальное — картинки, видео, кузнецов — удаляй».
+# Генерация изображений (ComfyUI/FLUX/RealVisXL) и промпт-кузнец
+# (Qwen2.5-3B на CPU) вырезаны полностью. Явные команды генерации
+# получают честный отказ — вместо молчания или случайной картинки.
+GEN_GONE_RE = re.compile(
+    r"верни\s+(основн|мозг)|вернись\s+к\s+основн|"
+    r"(выключи|отключи|заверши)\s+(фото|видео|генератор|режим)|"
+    r"переключ\w*\s+на\s+(фото|картинк|видео)|"
+    r"режим\s+(фото|видео)|(включи|запусти)\s+(фото|видео)|"
+    r"(фото|видео)\s*[-—]?\s*режим|"
+    r"(сделай|сгенерируй|создай|нарисуй)\s+видео|видеоролик|"
+    r"^\s*быстро[!:]\s*(нарисуй|сгенерируй|создай|сделай)|"
+    r"^\s*нарисуй\b|"
+    r"^\s*(сгенерируй|создай|сделай)\s+(мне\s+)?(фото|картинк\w*|изображение)",
+    re.IGNORECASE)
+GEN_GONE_MSG = ("🎨 Генерация картинок и видео удалена (07.11, приказ Шефа — "
+                "«только текстовая модель, как изначально задумано»). Я "
+                "снова чистый текстовый мозг: разговариваю, думаю, ищу в "
+                "интернете, читаю страницы, работаю с файлами и экраном. "
+                "Нарисовать не могу — но могу найти референсы в сети или "
+                "описать идею словами.")
 
 
 def brain_reply(text, mode="fast"):
@@ -3849,9 +3363,7 @@ def brain_reply(text, mode="fast"):
 
 # ---------------------------------------------------------------- обработка
 
-HELP = ("🤖 *ДЖАРВИС v3.10 — УМНЫЙ РЕЖИМ + СТАРШИЕ БРАТЬЯ*\n\n"
-        "Мозг — Qwen3.8-27B локально. С каждой задачей я становлюсь "
-        "умнее: пишу себе скиллы и веду память.\n\n"
+HELP = ("🤖 *ДЖАРВИС v3.13 — ТЕКСТОВЫЙ МОЗГ*\n\n"
         "Мозг — Qwen3.8-27B прямо на твоей видеокарте, без облака. Пиши "
         "обычным языком — я сам пойму, что сделать.\n\n"
         "*Действия:*\n"
@@ -3872,15 +3384,10 @@ HELP = ("🤖 *ДЖАРВИС v3.10 — УМНЫЙ РЕЖИМ + СТАРШИЕ �
         "если у меня есть его ключ).\n\n"
         "*Старшие братья:* «спроси у старших» — облачный мозг (второе "
         "мнение), работает даже когда я сплю из-за игры.\n\n"
-        "*Генерация фото/видео (без цензуры, локально):*\n"
-        "«переключись на фото» / «переключись на видео» — меня умею и "
-        "не только думать: выгружаю мозг, поднимаю генератор.\n"
-        "В режиме: любое сообщение = описание кадра.\n"
-        "«нарисуй …» / «сделай видео …» — сработают и сразу, без "
-        "переключения. «быстро: …» — ускоренное фото.\n"
-        "«верни основную» — вернуть мозг.\n\n"
         "*Интернет:* «что нового в мире», «курс биткоина», «погода в Москве» — "
-        "найду свежее в сети.\n\n"
+        "найду свежее в сети. «найди на странице/сайте …» — читаю текст "
+        "страницы (из ссылки или прямо из браузера) и выписываю точные "
+        "строки, а не «что вижу на картинке».\n\n"
         "Или просто поговори со мной 😊")
 
 def handle(text, chat_id):
@@ -3918,36 +3425,9 @@ def handle(text, chat_id):
     if t.startswith("больш"):
         return send(cmd_bigfolders(), chat_id)
 
-    # ---- v3.11.0 (Task 129): генерация фото/видео без цензуры ----
-    # (до power-команд: «выключи фото» содержит «выкл»)
-    _gr = gen_route(text)
-    if _gr:
-        if _gr["do"] == "back":
-            return send(gen_back(), chat_id)
-        if _gr["do"] == "switch":
-            send("🔄 Выгружаю мозг, поднимаю генератор (до минуты)...",
-                 chat_id)
-            send(gen_switch(_gr["mode"]), chat_id)
-            if _gr.get("prompt"):
-                threading.Thread(target=gen_deliver,
-                                 args=(_gr["mode"], _gr["prompt"],
-                                       chat_id),
-                                 daemon=True).start()
-            return
-        # _gr["do"] == "gen": текущий режим генерации
-        if _gr["mode"] == "photo":
-            try:
-                tg("sendChatAction", {"chat_id": chat_id or CHAT,
-                                      "action": "upload_photo"})
-            except Exception:
-                pass
-        else:
-            send("🎬 Делаю видео — это несколько минут. Отдам файлом.",
-                 chat_id)
-        threading.Thread(target=gen_deliver,
-                         args=(_gr["mode"], _gr["prompt"], chat_id),
-                         daemon=True).start()
-        return
+    # ---- v3.13.0 (Task 131): генерация удалена — честный отказ ----
+    if GEN_GONE_RE.search(text):
+        return send(GEN_GONE_MSG, chat_id)
 
     if "выкл" in t or "shutdown" in t:
         return send(power_confirm("off"), chat_id)
@@ -4470,12 +3950,41 @@ def main():
     log("TG-канал: %s" % ("через прокси MSK + автофолбэк на прямое"
                             if TG_OPENER else "напрямую (плавающая сеть)"))
     hello = "--hello" in sys.argv
-    log("=== ДЖАРВИС старт (v3.11.3 ГЕНЕРАЦИЯ — САМОВОССТАНОВЛЕНИЕ ГЕНЕРАТОРА + ЧИСТЫЙ ХОЛОДНЫЙ СТАРТ (Task 129.3, 07.11, доклад Шефа «⚠️ Не получилось: генератор не поднят», серия 16:15-16:23): живой сбой — ComfyUI упал нативно (access violation в GGUF-unpatch при выгрузке модели прошлого семейства: после видео Wan фото FLUX просило место под VAE), после чего задача 8 минут ждала труп и генератор никто не поднимал; теперь: 1) генератор умер СЕРЕДИНА задачи — сам перезапускаю и повторяю задачу, Шеф всё равно получает результат (+~минута); 2) смена модели (видео↔фото↔быстро) = перезапуск генератора начисто — грабли выгрузки чужой GGUF больше не встречаются; 3) общий файловый замок генерации у Telegram и веб-чата — «⏳ уже делаю» честно в обоих каналах, веб тоже поднимает генератор; 4) полумёртвые процессы ComfyUI добиваются перед стартом; 5) ХОЛОДНЫЙ СТАРТ починен: cmd больше не наследует хэндл comfyui.log — раньше «echo >> лог» в bat получало «файл занят» и генератор умирал с code=1 (16:42-17:11: Шеф просил фото/видео трижды — «генератор не поднялся»); + v3.11.1 ГЕНЕРАЦИЯ — ПОНЯТНЫЕ ОШИБКИ + КОНТРОЛЬ ДОКАЧКИ (Task 129.2, 07.11, доклад Шефа «не получается сгенерировать фото»): сбой 15:15 был из-за молча повреждённого файла t5xxl (два параллельных curl писали в один файл, размер совпал, содержимое — нет); теперь: 1) при ошибке генерации Шеф видит конкретную причину (узел + суть из ComfyUI, а не «смотри логи»); 2) перед генерацией проверяю файлы моделей — «ещё докачивается, N%» вместо загадочного сбоя; 3) «статус» показывает прогресс докачки; сам t5xxl перезакачан и проверен генерацией; вдогонку живыми тестами пойманы и поправлены имена входов нод новой сборки ComfyUI (ckpt_name у RealVisXL, video у SaveVideo) — «быстро:» и видео тоже проверены; + v3.11.0 ГЕНЕРАЦИЯ ФОТО/ВИДЕО БЕЗ ЦЕНЗУРЫ (Task 129, 07.11, приказ Шефа «мне нужна модель ии которая генерирует фото и видео и без цензуры»): рядом с мозгом Qwen на той же видеокарте работает генератор ComfyUI (ROCm/RDNA4): «переключись на фото»/«переключись на видео» — выгружаю мозг, поднимаю генератор (FLUX.1-dev Q4_K_S — фото-флагман; RealVisXL V5 — по слову «быстро»; Wan 2.2 TI2V-5B — видео); «верни основную» — мозг назад; в режиме генерации любое сообщение = описание; «нарисуй …»/«сделай видео …» — авто-переключение из обычного режима; фото приходит в Telegram, файл — в веб-чат; всё локально и приватно, без внешних цензоров; + v3.10.1 СТАРШИЙ БРАТ-ПОМОЩНИК (Task 128, 07.11): авто-сложные вопросы (эвристика, без слова «подумай») при наличии cloud_api_key уходят МОЩНОМУ облачному брату (GLM-5.3 на z.ai / Mistral Large 123B — в разы умнее локальных 27B), провал или нет ключа = локальное думание как раньше; слово «подумай» — локальные размышления, как приказано в Варианте А; бесплатный брат Pollinations gpt-oss-20b (без ключа) остаётся на «спроси у старших», его интервал ~30 с и обработка 402 больше НЕ тормозят платных братьев; разведка Task 128: Groq/OpenRouter/Gemini/Cerebras из РФ закрыты 403 (даже через наш WARP — его выход тоже Москва), DDG duckchat закрыл безликий доступ JS-челленджем; из РФ доступны GLM/Mistral/DeepSeek/Qwen — ждут только ключ в config.json; v3.10.0 УМНЫЙ РЕЖИМ + СТАРШИЕ БРАТЬЯ (Task 127, 07.11, приказ Шефа «Вариант А + API + старшие братья»): авто-маршрут fast/think/cloud — сложные вопросы (почему/сравни/объясни/придумай, длинные >250 знаков) и слово «подумай» = размышления Qwen (заметно умнее, 10-30 с), простые — мгновенно как раньше; «спроси у старших» = бесплатный облачный мозг (Pollinations, без ключа, интервал ~30 с между запросами), работает даже когда локальный спит из-за игры; провал старших = авто-фолбэк на глубокое локальное думание; v3.9.2 АНТИ-ЗАТУХАНИЕ (Task 125, 06.11, живой сбой 13:23: «Шеф, я вижу WizTree» -> «Шеф, я» -> «Ше…», генерация 6 токенов и EOS): обрывки ответов больше НЕ пишутся в history (модель копировала собственные обрывки — ответы самозатухали), короткий обрывок = один перезапрос «ответь полно» (short-guard); v3.9.1 ГОРЯЧИЙ ФИКС-500 (Task 125, 06.11, скрин Шефа «ответы обрываются + HTTP 500»): llm_chat при повторе обрыва размышлений больше НЕ дописывает system-сообщение в конец массива — шаблон Qwen требует system только первым, llama-server поднимал 500 «System message must be at the beginning»; запрет думания теперь дописывается в первое system, max_tokens повтора 1200; v3.9.0 НАДЁЖНОСТЬ (Task 124, приказ Шефа 06.11 «делай все пункты кроме 7»): ротация логов jarvis.log/llama.log ~3 МБ с сохранением хвоста — логи больше не растут вечно; ФОЛБЭК СВЯЗИ: прокси Telegram молчит 3 раза подряд — автоуход на прямое соединение, прямое плавает 6 раз — возврат на прокси; ПАМЯТЬ ГЛУБЖЕ: окно истории 16 -> 32 сообщения + жёсткий бюджет 28К символов (контекст 12288 защищён) + дневник diary.jsonl для вытесненных обменов (инструмент «дневник»); САМОПРОВЕРКА ежедневно в 12:00: стражи честности/мозг/зрение/поиск/файлы/связь — FAIL приходит Шефу в Telegram; v3.8.6 ФАНТОМ-РЕЗУЛЬТАТ: описание результата/проверки инструмента («инструмент вернул „НЕ подтвердилось“», «клик в (X,Y) не закрыл диалог», «курсор реально в (X,Y)») при НУЛЕ вызовов в ходе = выдумка — живой тест 02.11 19:47 поймал два таких ответа за 3-4 с; v3.8.5 ЧЕСТНЫЕ РУКИ-ТРОС: «передвинул/кликнул/напечатал/закрыл» без вызова инструмента рук = перезапрос — живой тест 02.11 поймал фантомное «курсор в (2500,1200), проверено» за 3 с без единого вызова, теперь это ловится уровнем кода; v3.8.4 АВТОФОКУС ПЕЧАТИ: без каретки печатать сам кликает в центр окна и повторяет проверку — у мозга стало на 2 шага меньше, цепочка не рвётся; v3.8.3 БЕЗ РАЦИИ: push-to-talk (ptt.py) удалён по приказу Шефа — Шеф не играет, пока мозг на видеокарте; голос — кнопка 🎤 в веб-чате; v3.8.1 СВЯЗЬ: Telegram через прокси MSK — прямые соединения с ПК2 плавали; v3.8.0 ТОРРЕНТЫ: uTorrent под управлением — список/удаление с верификацией, данные только по путям из базы; v3.7.0 ЧЕСТНЫЕ РУКИ: мышь/окна с самопроверкой — "
+    log("=== ДЖАРВИС старт (v3.13.0 ТОЛЬКО ТЕКСТ — ГЕНЕРАЦИЯ ВЫРЕЗАНА "
+        "(Task 131, 07.11, приказ Шефа «хватит экспериментов — оставляй "
+        "только текстовую модель как изначально задумывалось, всё "
+        "остальное — картинки, видео, кузнецов — удаляй»): генерация "
+        "фото ComfyUI/FLUX/RealVisXL вырезана полностью (папка "
+        "comfyui_rocm ~28,5 ГБ удалена с диска), промпт-кузнец "
+        "Qwen2.5-3B на CPU удалён (модель стёрта; в ночь 07.11 он "
+        "съел RAM — мозг не смог подняться после генерации), ген-"
+        "команды честно отвечают «удалено»; сохранено всё текстовое: "
+        "умный режим, старшие братья, найти_на_странице, инструменты, "
+        "зрение, голос, файлы; + история: v3.12.2 ПОИСК НА СТРАНИЦЕ "
+        "(Task 130, 07.11, доклад Шефа «научи искать в браузере на "
+        "странице нужную информацию, он просто говорит что видит на "
+        "картинке»): новый инструмент «найти_на_странице» — читаю ТЕКСТ "
+        "страницы (по ссылке или прямо из открытого браузера) и выписываю "
+        "ТОЧНЫЕ строки по запросу; промпт-кузнец теперь переносит ВСЕ "
+        "детали заказа (живой сбой: «лошадь чёрную, с крыльями в море» "
+        "-> просто «A horse» — фикс «не те картинки»); 3-й переводчик "
+        "заказа — старший брат в облаке; веб-чат честно отказывает на "
+        "видео; + v3.12.1 ТОЛЬКО ФОТО — ВИДЕО УДАЛЕНО (Task 129.5, 07.11, приказ Шефа «удаляй ии для генерации видео, оставляй только картинки»): видео-генератор Wan 2.2 вырезан полностью — модели удалены с диска (−12.3 ГБ), команды про видео честно отвечают «удалено по приказу», фото-конвейер прежний: FLUX (флагман) + RealVisXL («быстро») + промпт-кузнец-переводчик с контекстом; + v3.12.0 СВЯЗАННЫЕ МОЗГИ — ГЕНЕРАТОР ПОНИМАЕТ ЗАКАЗЫ (Task 129.4, 07.11, доклад Шефа «генерируют не те картинки, не то видео; можно ли связать все мозги с общим контекстом»): корень — генераторы (FLUX/RealVisXL/Wan) обучены на АНГЛИЙСКИХ описаниях, а им отдавали сырой русский текст («закат картинку» -> случайное видео), внутренние записки («Шеф прислал фото… посмотри зрением») уходили прямо в промпт, а вопросы Шефа («ты кто ты вообще?») превращались в картинки; теперь между Шефом и генератором всегда стоит связной: 1) ПРОМПТ-КУЗНЕЦ Qwen2.5-3B на CPU (порт 1235, ~2 ГБ RAM, VRAM не трогает, живёт всегда) — заказ -> точный английский промпт с сохранением задумки; 2) КОНТЕКСТ: кузнец видит последние сообщения диалога + последнюю генерацию («ещё раз, но ночью» работает, seed сохраняется) + профиль Шефа; 3) если большой мозг ещё жив (обычный режим) — промпт формулирует ОН, целиком зная диалог; 4) вопросы/болтовня отсеиваются (NOT_A_REQUEST) — честный ответ «мозг спит», а не случайная картинка; 5) фото в режиме ВИДЕО = стартовый кадр ролика (Wan I2V), подпись = что делать в кадре; фото в режиме ФОТО с подписью = заказ; 6) голос в режиме генерации = заказ; 7) «запомни как я выгляжу: …» — профиль для «нарисуй меня»; 8) к подписи генерации добавляю английский промпт — видно, что понял; 9) кузнеца не трогают выгрузки мозга/генератора (CPU + фильтр --port 1234 у убийц llama-server, включая vram_ctl); + v3.11.3 ГЕНЕРАЦИЯ — САМОВОССТАНОВЛЕНИЕ ГЕНЕРАТОРА + ЧИСТЫЙ ХОЛОДНЫЙ СТАРТ (Task 129.3, 07.11, доклад Шефа «⚠️ Не получилось: генератор не поднят», серия 16:15-16:23): живой сбой — ComfyUI упал нативно (access violation в GGUF-unpatch при выгрузке модели прошлого семейства: после видео Wan фото FLUX просило место под VAE), после чего задача 8 минут ждала труп и генератор никто не поднимал; теперь: 1) генератор умер СЕРЕДИНА задачи — сам перезапускаю и повторяю задачу, Шеф всё равно получает результат (+~минута); 2) смена модели (видео↔фото↔быстро) = перезапуск генератора начисто — грабли выгрузки чужой GGUF больше не встречаются; 3) общий файловый замок генерации у Telegram и веб-чата — «⏳ уже делаю» честно в обоих каналах, веб тоже поднимает генератор; 4) полумёртвые процессы ComfyUI добиваются перед стартом; 5) ХОЛОДНЫЙ СТАРТ починен: cmd больше не наследует хэндл comfyui.log — раньше «echo >> лог» в bat получало «файл занят» и генератор умирал с code=1 (16:42-17:11: Шеф просил фото/видео трижды — «генератор не поднялся»); + v3.11.1 ГЕНЕРАЦИЯ — ПОНЯТНЫЕ ОШИБКИ + КОНТРОЛЬ ДОКАЧКИ (Task 129.2, 07.11, доклад Шефа «не получается сгенерировать фото»): сбой 15:15 был из-за молча повреждённого файла t5xxl (два параллельных curl писали в один файл, размер совпал, содержимое — нет); теперь: 1) при ошибке генерации Шеф видит конкретную причину (узел + суть из ComfyUI, а не «смотри логи»); 2) перед генерацией проверяю файлы моделей — «ещё докачивается, N%» вместо загадочного сбоя; 3) «статус» показывает прогресс докачки; сам t5xxl перезакачан и проверен генерацией; вдогонку живыми тестами пойманы и поправлены имена входов нод новой сборки ComfyUI (ckpt_name у RealVisXL, video у SaveVideo) — «быстро:» и видео тоже проверены; + v3.11.0 ГЕНЕРАЦИЯ ФОТО/ВИДЕО БЕЗ ЦЕНЗУРЫ (Task 129, 07.11, приказ Шефа «мне нужна модель ии которая генерирует фото и видео и без цензуры»): рядом с мозгом Qwen на той же видеокарте работает генератор ComfyUI (ROCm/RDNA4): «переключись на фото»/«переключись на видео» — выгружаю мозг, поднимаю генератор (FLUX.1-dev Q4_K_S — фото-флагман; RealVisXL V5 — по слову «быстро»; Wan 2.2 TI2V-5B — видео); «верни основную» — мозг назад; в режиме генерации любое сообщение = описание; «нарисуй …»/«сделай видео …» — авто-переключение из обычного режима; фото приходит в Telegram, файл — в веб-чат; всё локально и приватно, без внешних цензоров; + v3.10.1 СТАРШИЙ БРАТ-ПОМОЩНИК (Task 128, 07.11): авто-сложные вопросы (эвристика, без слова «подумай») при наличии cloud_api_key уходят МОЩНОМУ облачному брату (GLM-5.3 на z.ai / Mistral Large 123B — в разы умнее локальных 27B), провал или нет ключа = локальное думание как раньше; слово «подумай» — локальные размышления, как приказано в Варианте А; бесплатный брат Pollinations gpt-oss-20b (без ключа) остаётся на «спроси у старших», его интервал ~30 с и обработка 402 больше НЕ тормозят платных братьев; разведка Task 128: Groq/OpenRouter/Gemini/Cerebras из РФ закрыты 403 (даже через наш WARP — его выход тоже Москва), DDG duckchat закрыл безликий доступ JS-челленджем; из РФ доступны GLM/Mistral/DeepSeek/Qwen — ждут только ключ в config.json; v3.10.0 УМНЫЙ РЕЖИМ + СТАРШИЕ БРАТЬЯ (Task 127, 07.11, приказ Шефа «Вариант А + API + старшие братья»): авто-маршрут fast/think/cloud — сложные вопросы (почему/сравни/объясни/придумай, длинные >250 знаков) и слово «подумай» = размышления Qwen (заметно умнее, 10-30 с), простые — мгновенно как раньше; «спроси у старших» = бесплатный облачный мозг (Pollinations, без ключа, интервал ~30 с между запросами), работает даже когда локальный спит из-за игры; провал старших = авто-фолбэк на глубокое локальное думание; v3.9.2 АНТИ-ЗАТУХАНИЕ (Task 125, 06.11, живой сбой 13:23: «Шеф, я вижу WizTree» -> «Шеф, я» -> «Ше…», генерация 6 токенов и EOS): обрывки ответов больше НЕ пишутся в history (модель копировала собственные обрывки — ответы самозатухали), короткий обрывок = один перезапрос «ответь полно» (short-guard); v3.9.1 ГОРЯЧИЙ ФИКС-500 (Task 125, 06.11, скрин Шефа «ответы обрываются + HTTP 500»): llm_chat при повторе обрыва размышлений больше НЕ дописывает system-сообщение в конец массива — шаблон Qwen требует system только первым, llama-server поднимал 500 «System message must be at the beginning»; запрет думания теперь дописывается в первое system, max_tokens повтора 1200; v3.9.0 НАДЁЖНОСТЬ (Task 124, приказ Шефа 06.11 «делай все пункты кроме 7»): ротация логов jarvis.log/llama.log ~3 МБ с сохранением хвоста — логи больше не растут вечно; ФОЛБЭК СВЯЗИ: прокси Telegram молчит 3 раза подряд — автоуход на прямое соединение, прямое плавает 6 раз — возврат на прокси; ПАМЯТЬ ГЛУБЖЕ: окно истории 16 -> 32 сообщения + жёсткий бюджет 28К символов (контекст 12288 защищён) + дневник diary.jsonl для вытесненных обменов (инструмент «дневник»); САМОПРОВЕРКА ежедневно в 12:00: стражи честности/мозг/зрение/поиск/файлы/связь — FAIL приходит Шефу в Telegram; v3.8.6 ФАНТОМ-РЕЗУЛЬТАТ: описание результата/проверки инструмента («инструмент вернул „НЕ подтвердилось“», «клик в (X,Y) не закрыл диалог», «курсор реально в (X,Y)») при НУЛЕ вызовов в ходе = выдумка — живой тест 02.11 19:47 поймал два таких ответа за 3-4 с; v3.8.5 ЧЕСТНЫЕ РУКИ-ТРОС: «передвинул/кликнул/напечатал/закрыл» без вызова инструмента рук = перезапрос — живой тест 02.11 поймал фантомное «курсор в (2500,1200), проверено» за 3 с без единого вызова, теперь это ловится уровнем кода; v3.8.4 АВТОФОКУС ПЕЧАТИ: без каретки печатать сам кликает в центр окна и повторяет проверку — у мозга стало на 2 шага меньше, цепочка не рвётся; v3.8.3 БЕЗ РАЦИИ: push-to-talk (ptt.py) удалён по приказу Шефа — Шеф не играет, пока мозг на видеокарте; голос — кнопка 🎤 в веб-чате; v3.8.1 СВЯЗЬ: Telegram через прокси MSK — прямые соединения с ПК2 плавали; v3.8.0 ТОРРЕНТЫ: uTorrent под управлением — список/удаление с верификацией, данные только по путям из базы; v3.7.0 ЧЕСТНЫЕ РУКИ: мышь/окна с самопроверкой — "
         "«проверено» или честное «НЕ получилось»; законы З5 язык + З6 "
         "честность, языковой страж; координатный контракт — только "
         "физические пиксели скриншота; v3.6.0 РОУТЕР; v3.5.0 ЗРЕНИЕ+ДАТЧИКИ; "
         "события v3.4.0; v3.3.0 (рация — удалена в v3.8.3); v3.2.1 СВЕРКА; v3.2.0 ГЛАЗА И ГОЛОС; "
         "v3.1.0 ФАЙЛЫ; законы v3.0.1; ученик v3.0; v2.3.0 МАКС) ===")
+    journal("Джарвис v3.13.0 ТОЛЬКО ТЕКСТ (Task 131, 07.11, приказ "
+            "Шефа «хватит экспериментов — оставляй только текстовую "
+            "модель как изначально задумывалось, всё остальное — "
+            "картинки, видео, кузнецов — удаляй»): генерация фото и "
+            "видео вырезана полностью — код ComfyUI/FLUX/RealVisXL "
+            "удалён, папка comfyui_rocm (~28,5 ГБ) стёрта с диска; "
+            "промпт-кузнец Qwen2.5-3B на CPU удалён (лишняя нагрузка; "
+            "в ночь 07.11 он съел RAM — мозг не поднялся после "
+            "генерации); я снова чистый текстовый мозг: умный режим, "
+            "старшие братья, поиск по страницам, зрение, голос, файлы")
     journal("Джарвис v3.8.3 БЕЗ РАЦИИ (Task 103, 02.11): приказ Шефа — "
             "рация (push-to-talk, ptt.py) не нужна: Шеф не играет при мозге "
             "на видеокарте. Задача JarvisPTT, ptt.py и инструмент "
@@ -4536,6 +4045,32 @@ def main():
             "перезакачан заново, генерация проверена вживую; ошибки "
             "теперь приходят с конкретной причиной, а недокачанные "
             "модели честно сообщают процент готовности")
+    journal("Джарвис v3.12.2 ПОИСК НА СТРАНИЦЕ + КУЗНЕЦ-ДЕТАЛИ (Task "
+            "130, 07.11, доклад Шефа «научи искать в браузере на странице "
+            "нужную информацию, он просто говорит что видит на картинке»): "
+            "новый инструмент «найти_на_странице» — читаю ТЕКСТ страницы "
+            "(по ссылке или из открытого браузера Ctrl+A/C) и выписываю "
+            "точные строки по запросу; промпт-кузнец теперь переносит ВСЕ "
+            "детали заказа (жалоба «не те картинки»: «лошадь чёрную с "
+            "крыльями в море» превращалась в просто «A horse») + правило "
+            "деталей и примеры; 3-й переводчик заказа — старший брат в "
+            "облаке; веб-чат честно отказывает на видео")
+    journal("Джарвис v3.12.1 ТОЛЬКО ФОТО (Task 129.5, 07.11, приказ Шефа "
+            "«удаляй ии для генерации видео, оставляй только картинки»): "
+            "видео-генератор Wan 2.2 вырезан полностью — модели удалены "
+            "с диска (−12.3 ГБ), команды видео честно отвечают "
+            "«удалено», фото-конвейер сохранён целиком (FLUX + RealVisXL "
+            "«быстро» + промпт-кузнец с контекстом)")
+    journal("Джарвис v3.12.0 СВЯЗАННЫЕ МОЗГИ (Task 129.4, 07.11, доклад "
+            "Шефа «генерирует не те картинки/не то видео; свяжи все мозги "
+            "с контекстом»): у генератора появился связной — промпт-"
+            "кузнец Qwen2.5-3B на CPU (живёт всегда, VRAM не трогает): "
+            "заказ по-русски -> точный английский промпт (FLUX/Wan "
+            "русского не знали — отсюда «не то»), ссылки «меня/ещё раз» "
+            "раскрываются из диалога и профиля, вопросы больше не "
+            "превращаются в картинки, фото в режиме видео = стартовый "
+            "кадр (I2V), голос в режиме генерации = заказ, «запомни как "
+            "я выгляжу» — профиль для «нарисуй меня»")
     journal("Джарвис v3.11.0 ГЕНЕРАЦИЯ ФОТО/ВИДЕО (Task 129, 07.11): "
             "появилась вторая личность — генератор фото и видео без "
             "цензуры (ComfyUI + FLUX.1-dev + RealVisXL + Wan 2.2, всё "
@@ -4575,7 +4110,7 @@ def main():
             "«дневник»); ежедневная самопроверка в 12:00 (стражи/мозг/"
             "зрение/поиск/файлы/связь — FAIL приходит Шефу)")
     if hello:
-        send("🤖 *ДЖАРВИС v3.0 УЧЕНИК на связи!*\n\n"
+        send("🤖 *ДЖАРВИС v3.13 на связи!*\n\n"
              "Теперь я ещё и учусь: веду память и пишу себе скиллы — "
              "новые умения остаются со мной навсегда.\n"
              "Теперь я не только отвечаю — я ДЕЙСТВУЮ: чищу диск от мусора, "
