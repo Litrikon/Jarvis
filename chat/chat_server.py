@@ -512,12 +512,14 @@ class Handler(BaseHTTPRequestHandler):
                     [{"role": "user", "content": utext}])
             final = ""
             called = set()
+            _rep_key = None   # v3.14.1: страж повторов (анти-цикл)
+            _rep_cnt = 0
             retried_claim = False
             retried_file = False
             retried_plan = False
             retried_order = False
             hist_n = len(jarvis.hist_msgs(jarvis.hist_load()))
-            for _step in range(8):  # v3.8.2: 8 шагов — цепочка печать->скрин->клик->печать требовала больше
+            for _step in range(12):  # v3.14.0 (Task 132): 8 -> 12 — GUI-цепочки настроек длинные
                 buf, head, visible = [], "", None
                 ctx_retry = False
                 while True:
@@ -629,6 +631,33 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 name, args, say = tool
                 called.add(name)
+                # v3.14.1: страж повторов — как в brain_reply (Task 132)
+                _k = name + "|" + json.dumps(args, sort_keys=True,
+                                             ensure_ascii=False)
+                if _k == _rep_key:
+                    _rep_cnt += 1
+                else:
+                    _rep_key, _rep_cnt = _k, 1
+                if _rep_cnt >= 6:
+                    clog("repeat-guard: 6 одинаковых вызовов — останов")
+                    jarvis.hist_append(disp, "(застрял на повторе действия)")
+                    emit({"type": "done", "text":
+                          "⚠️ Я застрял: шесть раз подряд одно и то же "
+                          "действие не даёт результата. Остановился. "
+                          "Скажи, что делать дальше — попробую иначе."})
+                    return
+                if _rep_cnt >= 3:
+                    clog("repeat-guard: %d одинаковых — коррекция" % _rep_cnt)
+                    msgs.append({"role": "assistant", "content": ans})
+                    msgs.append({"role": "user", "content":
+                                 "Служебная проверка ЦИКЛА: ты уже %d раз "
+                                 "вызываешь тот же инструмент с теми же "
+                                 "аргументами — результат не изменится. "
+                                 "Действуй иначе: «скрин»/«область» и "
+                                 "посмотри что изменилось, смени координаты "
+                                 "или подход, либо честно ответь Шефу."
+                                 % _rep_cnt})
+                    continue
                 if say:
                     emit({"type": "say", "text": say[:300]})
                 res = jarvis.tool_exec(name, args)
@@ -642,7 +671,7 @@ class Handler(BaseHTTPRequestHandler):
                         # зрением (как в TG), а не просто показываем картинку
                         if jarvis.vision_available():
                             try:
-                                desc = jarvis.llm_vision(path)
+                                desc = jarvis.llm_vision(path, ui=True)
                             except Exception as e:
                                 jarvis.log("vision ERR: %s" % e)
                                 desc = ""
@@ -667,7 +696,8 @@ class Handler(BaseHTTPRequestHandler):
                 clog("веб-ответ сорвался (дегенеративный): %r" % final_txt[:80])
                 jarvis.hist_append(disp, "(веб: ответ сорвался)")
                 emit({"type": "error",
-                      "text": "мозг запнулся (оборванная генерация) — спроси ещё раз"})
+                      "text": "Я сделал много шагов, но не успел доделать. "
+                              "Скажи «продолжай» — доделаю."})
                 return
             emit({"type": "done", "text": final_txt})
             # v2 (Task 89): общая история + зеркало + дубль в Telegram
