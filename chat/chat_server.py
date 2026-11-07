@@ -23,7 +23,10 @@ v3.8.3 (Task 103): push-to-talk «рация» (ptt.py) удалён по при
   Шефа — /api/asr кормит только кнопку 🎤 веб-чата.
 v3.4.0 (Task 101) «СОБЫТИЯ»: GET /api/tts?text=... — озвучка ответа
   голосом Ирины (piper) для кнопки 🔊 в веб-чате.
-v3.10 (Task 128) «УМНЫЙ РЕЖИМ + СТАРШИЕ»: /api/chat теперь с тем же
+v3.11 (Task 129) «ГЕНЕРАЦИЯ ФОТО/ВИДЕО»: команды генерации как в
+  Telegram: «переключись на фото/видео», «нарисуй …», «сделай видео …»,
+  «верни основную»; фото — синхронно, видео — фоном (файл в панели и TG).
+  v3.10 (Task 128) «УМНЫЙ РЕЖИМ + СТАРШИЕ»: /api/chat теперь с тем же
   умным маршрутом, что и Telegram (jarvis.smart_mode): простое —
   мгновенно; слово «подумай»/авто-сложное — с размышлениями модели на
   первом шаге (думание Шефу не показываем); авто-сложное при наличии
@@ -31,6 +34,7 @@ v3.10 (Task 128) «УМНЫЙ РЕЖИМ + СТАРШИЕ»: /api/chat тепе�
   (jarvis.cloud_ask), отвечает даже при спящем локальном мозге (игра).
 """
 import json, os, sys, time, base64, threading, traceback
+import shutil
 import subprocess
 import urllib.parse
 import urllib.request
@@ -424,6 +428,77 @@ class Handler(BaseHTTPRequestHandler):
                 emit({"type": "done",
                       "text": "🏓 Локальный чат жив. Мозг: %s." %
                               ("на связи" if jarvis.llm_health() else "спит")})
+                return
+            # v3.11.0 (Task 129): режимы генерации — те же команды,
+            # что в Telegram («переключись на фото/видео», «нарисуй …»,
+            # «сделай видео …», «верни основную»)
+            try:
+                _gr = jarvis.gen_route(message)
+            except Exception:
+                _gr = None
+            if _gr is not None:
+                emit({"type": "waiting"})
+                if _gr["do"] == "back":
+                    _txt = jarvis.gen_back()
+                    jarvis.mirror_append("web", "jarvis", _txt[:400])
+                    emit({"type": "done", "text": _txt})
+                    return
+                if _gr["do"] == "switch":
+                    _txt = jarvis.gen_switch(_gr["mode"])
+                    jarvis.mirror_append("web", "jarvis", _txt[:400])
+                    emit({"type": "done", "text": _txt})
+                _gp = _gr.get("prompt") or ""
+                if not _gp:
+                    return
+                if _gr["mode"] == "photo":
+                    # фото — синхронно (обычно до минуты)
+                    jarvis.GEN_PROC["busy"] = True
+                    try:
+                        _path, _err = jarvis.gen_run("photo", _gp)
+                    finally:
+                        jarvis.GEN_PROC["busy"] = False
+                    if not _path:
+                        emit({"type": "done",
+                              "text": "⚠️ Не получилось: %s" % _err})
+                        return
+                    _dst = jarvis._unique_path(
+                        jarvis.FILES_DIR, os.path.basename(_path))
+                    try:
+                        shutil.copyfile(_path, _dst)
+                        os.remove(_path)
+                    except Exception:
+                        _dst = _path
+                    _txt = ("🎨 Готово (%s) — файл в панели «Файлы»: "
+                            "/api/file?p=%s"
+                            % (jarvis._fmt_size(os.path.getsize(_dst)),
+                               urllib.parse.quote(_dst)))
+                    jarvis.mirror_append("web", "jarvis", _txt[:300])
+                    emit({"type": "done", "text": _txt, "file": _dst})
+                    return
+                # видео — в фоне (несколько минут), придёт файлом в TG
+                def _vjob(_p=_gp):
+                    jarvis.GEN_PROC["busy"] = True
+                    try:
+                        _path, _err = jarvis.gen_run("video", _p)
+                    finally:
+                        jarvis.GEN_PROC["busy"] = False
+                    if not _path:
+                        jarvis.send("🎬 Видео не получилось (%s)" % _err)
+                        return
+                    _dst = jarvis._unique_path(
+                        jarvis.FILES_DIR, os.path.basename(_path))
+                    try:
+                        shutil.copyfile(_path, _dst)
+                        os.remove(_path)
+                    except Exception:
+                        _dst = _path
+                    jarvis.send_document(_dst, "🎬 Видео готово: %s"
+                                         % _p[:100])
+                threading.Thread(target=_vjob, daemon=True).start()
+                emit({"type": "done",
+                      "text": "🎬 Видео делаю в фоне (несколько минут) — "
+                              "пришлю файлом в Telegram, он же появится "
+                              "в панели «Файлы»."})
                 return
             if _want_cloud:
                 # v3.10 (Task 128): старший брат — облако, VRAM не занимает,
