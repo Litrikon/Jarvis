@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-win_ctl.py — ДЖАРВИС v3.7.3 «РУКИ-АВТОФОКУС»: окна/мышь/клавиатура
-со САМОПРОВЕРКОЙ каждого действия (Task 104).
+win_ctl.py — ДЖАРВИС v3.7.4 «ПЕЧАТЬ БЕЗ КАРЕТКИ»: окна/мышь/клавиатура
+со САМОПРОВЕРКОЙ каждого действия (Task 104; force-печать — Task 134).
+
+v3.7.4 (Task 134, 08.11.2026): force=True в type_text — WinUI-приложения
+(Unigram/UWP) не имеют классической каретки, и печать в них навсегда
+отказывала «без каретки не печатаю», хотя поле было в фокусе (живой
+тест: «Привет» в Избранное Telegram — доставлен только прямой отправкой
+символов). Теперь при подтверждённом поле можно печатать без шлюза;
+проверка смены окна и подсчёт доставленных символов остаются.
 
 v3.7.3 (Task 68, 02.11.2026, вечер-2): КРИТИЧЕСКИЙ ФИКС КЛИКОВ — у union
 _IU первое поле ki (_KI), позиционный конструктор _IU(_MI(...)) падал
@@ -576,7 +583,12 @@ TRACE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")) else None
 
 
-def type_text(text, delay=0.012):
+def type_text(text, delay=0.012, force=False):
+    """v3.7.4 (Task 134): force=True — печать БЕЗ кареточного шлюза: для
+    WinUI/UWP-приложений (Unigram, UWP-настройки), где классической Win32-
+    каретки нет в принципе и проверка GetGUIThreadInfo вечно «нет каретки».
+    Вызывать ТОЛЬКО когда поле подтверждено (клик по UIA-точке из
+    элементы_окна или кроп-зрением); проверка смены окна остаётся."""
     text = str(text)
     if not text:
         return "пустой текст"
@@ -591,7 +603,7 @@ def type_text(text, delay=0.012):
     # ничего не печатаем (З6: без каретки текст уходит «в никуда»).
     _h, _foc, car = _caret_hwnd()
     clicked = None
-    if not car and _h:
+    if not car and _h and not force:
         try:
             cr = wt.RECT()
             if u32.GetClientRect(_h, ctypes.byref(cr)):
@@ -606,7 +618,7 @@ def type_text(text, delay=0.012):
                         _h, _foc, car = _caret_hwnd()
         except Exception:
             pass
-    if not car:
+    if not car and not force:
         hint = ""
         try:
             r = wt.RECT()
@@ -673,6 +685,9 @@ def type_text(text, delay=0.012):
         return ("OK: набрал %d символов в активное окно «%s» (каретку "
                 "поставил авто-клик в %d,%d)" % (n, ttl, clicked[0],
                                                 clicked[1]))
+    if force and not car:
+        return ("OK: набрал %d символов в активное окно «%s» — без проверки "
+                "каретки (WinUI-поле, подтверждено вызывающим)" % (n, ttl))
     return "OK: набрал %d символов в активное окно «%s»" % (n, ttl)
 
 
