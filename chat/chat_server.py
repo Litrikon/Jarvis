@@ -23,6 +23,19 @@ v3.8.3 (Task 103): push-to-talk «рация» (ptt.py) удалён по при
   Шефа — /api/asr кормит только кнопку 🎤 веб-чата.
 v3.4.0 (Task 101) «СОБЫТИЯ»: GET /api/tts?text=... — озвучка ответа
   голосом Ирины (piper) для кнопки 🔊 в веб-чате.
+v3.15.0 (Task 136) «СКАЧИВАЙ И УЧИСЬ»: (1) файлы в самом чате — событие
+  {"type":"file","path","name","size"} в стриме /api/chat: когда Джарвис
+  выгружает/отправляет файл («выгрузить_файл»/«отправить_файл») или в
+  финальном ответе называет путь существующего файла из своих папок
+  (Входящие/выгрузка) — в веб-чате появляется карточка со ссылкой
+  «скачать» (/api/file?p=...); свои вложения Шеф тоже видит
+  скачиваемыми (карточка в его же пузыре); (2) самообучение — ход
+  оборачивается в jarvis.turn_begin/turn_finish (авто-уроки в
+  memory/lessons.json, они же инъектируются в промпт), инструмент
+  «запрос» (прямой HTTP к API) работает и в веб-чате.
+v3.14.5 (Task 135) «ДУМАЕТ ВСЕГДА»: думание на каждом шаге (не только
+  первый), как в Telegram; хотфикс 5b — system-сообщение только
+  первым, короткие ответы не теряются (подробности в jarvis.py).
 v3.14.3 (Task 133) «МЫШЬ-СТРАЖ»: вопрос «где сейчас мышь/курсор» без
   вызова скрин/область/мышь = перезапрос (e2e поймал выдуманные «3839, 0»
   без единого инструмента) — страж в jarvis.MOUSE_NOW_RE/MOUSE_FIX_MSG.
@@ -41,6 +54,7 @@ v3.13 (Task 131): генерация изображений удалена по 
   (jarvis.cloud_ask), отвечает даже при спящем локальном мозге (игра).
 """
 import json, os, sys, time, base64, threading, traceback
+import re
 import shutil
 import subprocess
 import urllib.parse
@@ -129,6 +143,36 @@ def _files_json():
                     pass
     out.sort(key=lambda x: -x["t"])
     return out[:60]
+
+
+# ---------------- v3.15.0 (Task 136): файлы прямо в сообщениях чата ----------------
+
+FILE_EMIT_TOOLS = ("выгрузить_файл", "сохранить_файл", "save_file", "экспорт",
+                   "выгрузить", "отправить_файл", "послать_файл", "send_file")
+_PATH_RE = re.compile(r"[A-Za-z]:\\[^\s\"«»'<>|]+")
+
+
+def _paths_from_text(t):
+    """Пути вида X:\\... из текста (результата инструмента или ответа)."""
+    out = []
+    for m in _PATH_RE.finditer(str(t or "")):
+        p = m.group(0).rstrip(".,;:!?)»]")
+        if len(p) > 4 and p not in out:
+            out.append(p)
+    return out
+
+
+def _web_allowed(p):
+    """Файл из папок Джарвиса (Входящие/выгрузка) — только их отдаём."""
+    try:
+        npth = os.path.normcase(os.path.abspath(p))
+        for rd in (jarvis.INCOMING, jarvis.FILES_DIR):
+            r = os.path.normcase(os.path.abspath(rd))
+            if npth == r or npth.startswith(r + os.sep):
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def llm_stream(messages, max_tokens=800, temperature=0.7, think=False):
@@ -413,6 +457,12 @@ class Handler(BaseHTTPRequestHandler):
         # v3 (Task 91): прямой канал ИИ-ИИ — GLM (z.ai) пишет через API как коллега
         is_glm = str(req.get("sender", "boss")).lower().strip() in ("glm", "ai")
         jarvis.mirror_append("web", "glm" if is_glm else "boss", disp)
+        # v3.15.0 (Task 136) «САМОУЧКА»: ход веб-чата тоже пишет урок-опыт
+        # (turn_begin до prompt_fill — уроки попадут в промпт этого хода;
+        # turn_finish в finally ниже — при любом исходе, даже при обрыве)
+        jarvis.turn_begin(disp or message)
+        _final_txt_holder = [""]   # то, что дойдёт до turn_finish
+        _web_files = []             # файлы этого хода для карточек «скачать»
         # v3.10 (Task 128): умный маршрут как в Telegram (коллега GLM — без)
         _mode = None if is_glm else jarvis.smart_mode(message)
         _want_cloud = _mode == "cloud" or (
@@ -716,6 +766,13 @@ class Handler(BaseHTTPRequestHandler):
                 if say:
                     emit({"type": "say", "text": say[:300]})
                 res = jarvis.tool_exec(name, args)
+                # v3.15.0: файл-инструменты — путь из результата идёт
+                # в карточки «скачать» (СОХРАНЕНО: <путь> / отправил Шефу: <путь>)
+                if name in FILE_EMIT_TOOLS:
+                    for _p in _paths_from_text(res):
+                        if _p not in _web_files and _web_allowed(_p) \
+                                and os.path.isfile(_p):
+                            _web_files.append(_p)
                 if res == "SCREENSHOT":
                     path = jarvis.take_shot()
                     if path:
@@ -757,7 +814,21 @@ class Handler(BaseHTTPRequestHandler):
                       "text": "Я сделал много шагов, но не успел доделать. "
                               "Скажи «продолжай» — доделаю."})
                 return
+            # v3.15.0: пути из финального ответа тоже становятся карточками
+            # (Джарвис обязан называть путь из ответа инструмента — ловим его)
+            for _p in _paths_from_text(final_txt):
+                if _p not in _web_files and _web_allowed(_p) \
+                        and os.path.isfile(_p):
+                    _web_files.append(_p)
+            for _p in _web_files:
+                try:
+                    _sz = os.path.getsize(_p)
+                except OSError:
+                    _sz = 0
+                emit({"type": "file", "path": _p,
+                      "name": os.path.basename(_p), "size": _sz})
             emit({"type": "done", "text": final_txt})
+            _final_txt_holder[0] = final_txt
             # v2 (Task 89): общая история + зеркало + дубль в Telegram
             jarvis.hist_append(disp, final_txt)
             jarvis.mirror_append("web", "jarvis", final_txt)
@@ -775,6 +846,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             try:
                 emit({"type": "error", "text": str(e)[:300]})
+            except Exception:
+                pass
+        finally:
+            # v3.15.0 (Task 136): конец хода — авто-урок в memory/lessons.json
+            try:
+                jarvis.turn_finish(_final_txt_holder[0])
             except Exception:
                 pass
 
@@ -806,7 +883,7 @@ def main():
             time.sleep(0.8)
             os.startfile("http://127.0.0.1:%d" % PORT)
         threading.Thread(target=_open, daemon=True).start()
-    clog("чат-сервер запущен v3.14.5 ДУМАЕТ ВСЕГДА (pid %s)"
+    clog("чат-сервер запущен v3.15.0 файлы в чате + самообучение (pid %s)"
          % os.getpid())
     while True:  # v2: serve_forever может упасть — цикл перезапускает
         try:

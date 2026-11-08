@@ -142,6 +142,16 @@
   .frow a:hover{text-decoration:underline}
   .frow .fmeta{font-size:11.5px; color:var(--dim)}
   .fempty{color:var(--dim); font-size:13px; padding:10px; text-align:center}
+  /* v3.15 (Task 136): карточки-файлы ПРЯМО в сообщениях (скачивание) */
+  .msg .fcards{display:flex; flex-direction:column; gap:6px; margin-top:8px}
+  .fcard{
+    display:flex; align-items:center; gap:9px; background:var(--panel2);
+    border:1px solid var(--line); border-radius:10px; padding:7px 10px;
+  }
+  .fcard .fico{font-size:16px; line-height:1}
+  .fcard a{color:var(--cyan); text-decoration:none; font-size:13px; word-break:break-all; flex:1}
+  .fcard a:hover{text-decoration:underline}
+  .fcard .fsz{font-size:11px; color:var(--dim); white-space:nowrap}
   @media (max-width:640px){ .msg{max-width:92%} .hint{display:none} }
 </style>
 </head>
@@ -211,9 +221,53 @@ function addImg(b64){
   chat.scrollTop = chat.scrollHeight;
 }
 
+/* ---------- v3.15 (Task 136): карточки-файлы в сообщениях — скачивание ---------- */
+
+function fileCard(fl){
+  /* fl: {path, name, size} — ссылка «скачать» через /api/file */
+  const card = document.createElement("div");
+  card.className = "fcard";
+  const ico = document.createElement("span");
+  ico.className = "fico";
+  ico.textContent = "📎";
+  const a = document.createElement("a");
+  a.href = "/api/file?p=" + encodeURIComponent(fl.path);
+  a.textContent = fl.name || String(fl.path).split("\\").pop();
+  a.title = "Скачать: " + a.textContent;
+  a.download = "";
+  const sz = document.createElement("span");
+  sz.className = "fsz";
+  sz.textContent = fl.size ? fmtSize(fl.size) : "";
+  card.appendChild(ico);
+  card.appendChild(a);
+  if (fl.size) card.appendChild(sz);
+  return card;
+}
+
+function addFilesToBubble(bubble, files){
+  if (!bubble || !files || !files.length) return;
+  const wrap = document.createElement("div");
+  wrap.className = "fcards";
+  for (const fl of files){
+    if (fl && fl.path) wrap.appendChild(fileCard(fl));
+  }
+  bubble.appendChild(wrap);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+let filesCache = [];   /* свежие файлы Джарвиса — для ссылок в истории/зеркале */
+async function cacheFiles(){
+  try{
+    const r = await fetch("/api/files");
+    const j = await r.json();
+    filesCache = j.files || [];
+  }catch(e){}
+}
+
 function renderHistory(){
   for (const m of history){
-    addMsg(m.role === "user" ? "user" : "jarvis", m.content);
+    const b = addMsg(m.role === "user" ? "user" : "jarvis", m.content);
+    addFilesToBubble(b, m.files);   /* v3.15: карточки-скачивания из истории */
   }
   if (!history.length){
     addMsg("jarvis", "Добрый день, Шеф. Джарвис на связи — мозг Qwen3.8-27B работает на вашей видеокарте. Прикрепи файл кнопкой 📎 (или перетащи, или Ctrl+V) — посмотрю и разберу. Нажми 🎤 и скажи вслух — расшифрую в текст. Чем могу помочь?");
@@ -233,11 +287,35 @@ function addMirrorMsg(m){
   const body = document.createElement("div");
   body.textContent = m.text;
   d.appendChild(body);
+  /* v3.15 (Task 136): файлы в сообщениях зеркала тоже скачиваются —
+     «📎 имя (размер)» у Шефа и пути X:\... у Джарвиса сверяем с /api/files */
+  try{
+    const fls = [];
+    if (m.who === "boss" || m.who === "glm"){
+      const re = /📎 ([^\n(]+?) \(/g;
+      let mm;
+      while ((mm = re.exec(m.text))){
+        const hit = filesCache.find(f => f.n === mm[1].trim());
+        if (hit) fls.push({path: hit.p, name: hit.n, size: hit.s});
+      }
+    } else {
+      const re = /[A-Za-z]:\\[^\s«»"']+/g;
+      let mm;
+      const seen = new Set();
+      while ((mm = re.exec(m.text))){
+        const nm = mm[0].split("\\").pop().replace(/[.,;:!?)\]]+$/, "");
+        const hit = filesCache.find(f => f.n === nm);
+        if (hit && !seen.has(hit.p)){ seen.add(hit.p); fls.push({path: hit.p, name: nm, size: hit.s}); }
+      }
+    }
+    if (fls.length) addFilesToBubble(d, fls);
+  }catch(e){}
   chat.appendChild(d);
 }
 
 async function pollMirror(){
   try{
+    if (!filesCache.length) await cacheFiles();   /* v3.15: ссылки на файлы */
     const first = (mirrorLast === null || isNaN(mirrorLast));
     const after = first ? 0 : mirrorLast;
     const r = await fetch("/api/messages?after=" + after);
@@ -514,6 +592,7 @@ async function ask(text, files, disp){
   bubble.appendChild(cursor);
   let acc = "";
   let hadError = false;
+  const turnFiles = [];   /* v3.15: файлы, которые Джарвис выложил в этом ответе */
   try{
     const resp = await fetch("/api/chat", {
       method: "POST",
@@ -540,6 +619,7 @@ async function ask(text, files, disp){
         else if (ev.type === "say"){ cursor.remove(); addMsg("say", "⚙️ " + ev.text); bubble.appendChild(cursor); }
         else if (ev.type === "tool"){ cursor.remove(); addMsg("say", "🛠 инструмент: " + ev.name); bubble.appendChild(cursor); }
         else if (ev.type === "image"){ cursor.remove(); addImg(ev.b64); bubble.appendChild(cursor); }
+        else if (ev.type === "file"){ cursor.remove(); turnFiles.push(ev); addFilesToBubble(bubble, [ev]); bubble.appendChild(cursor); }
         else if (ev.type === "waiting"){ dot.className = "dot wait"; statusEl.textContent = "загружаю мозг в видеопамять…"; }
         else if (ev.type === "done"){ acc = ev.text || acc; }
         else if (ev.type === "error"){ hadError = true; cursor.remove(); addMsg("err", "⚠️ " + ev.text); }
@@ -548,12 +628,14 @@ async function ask(text, files, disp){
   }catch(e){ hadError = true; addMsg("err", "⚠️ Связь с сервером чата оборвалась: " + e); }
   cursor.remove();
   bubble.textContent = acc || (hadError ? "" : "…");
+  addFilesToBubble(bubble, turnFiles);   /* карточки не теряются при финальном тексте */
   if (acc){
-    history.push({role:"user", content: disp || text});
-    history.push({role:"assistant", content:acc});
+    history.push({role:"user", content: disp || text, files: (files || []).map(fl => ({path: fl.path, name: fl.name, size: fl.size}))});
+    history.push({role:"assistant", content:acc, files: turnFiles.map(f => ({path: f.path, name: f.name, size: f.size}))});
     saveHist();
     speakFinal(acc);
   }
+  cacheFiles();   /* обновить кэш — новые файлы появятся и в зеркале */
   send.disabled = false;
   refreshStatus();
 }
@@ -568,7 +650,8 @@ f.addEventListener("submit", (e)=>{
   if (files.length){
     disp += (disp ? "\n" : "") + files.map(fl => "📎 " + fl.name + " (" + fmtSize(fl.size) + ")").join("\n");
   }
-  addMsg("user", disp);
+  const ub = addMsg("user", disp);
+  addFilesToBubble(ub, files);   /* v3.15: свои вложения — сразу со ссылкой «скачать» */
   q.value = ""; q.style.height = "auto";
   pending = [];
   renderChips();
@@ -587,6 +670,8 @@ document.getElementById("clear").addEventListener("click", ()=>{
 });
 renderHistory();
 refreshStatus();
+cacheFiles();
+setInterval(cacheFiles, 60000);   /* v3.15: свежие файлы для ссылок в зеркале */
 pollMirror();
 setInterval(refreshStatus, 15000);
 setInterval(pollMirror, 3000);

@@ -169,10 +169,35 @@ v3.8.2 «ПРОВЕРКА РУК» (Task 68, 02.11.2026): живой аудит 
   («действие = сразу JSON»), type_text докладывает целевое окно и смену
   окна во время набора.
 
+v3.15.0 «САМОУЧКА» (Task 136, 08.11.2026, доклад Шефа «Он что не умеет
+  делать запросы по API, научи его или пусть сам научится вообще надо
+  сделать ему самообучение, возможно при поиске в интернете или при
+  удачном опыте»): (1) НОВЫЙ ИНСТРУМЕНТ «запрос» — прямой HTTP-запрос к
+  ЛЮБОМУ API из самого Python (urllib, БЕЗ PowerShell): GET/POST/PUT/
+  DELETE, заголовки (Bearer-ключи), тело, таймаут; вернёт код + тип +
+  тело (JSON аккуратно разворачивается); адресовано живому сбою 08.11 —
+  Джарвис не смог опросить Netdata (localhost:19999) через PowerShell и
+  жаловался «PowerShell возвращает пустой ответ на все запросы»; промпт
+  теперь прямо говорит: API опрашивай «запросом», а не curl/irm в PS.
+  (2) run_ps СТАЛ ЧЕСТНЫМ: ps_run_diag — мозг видит exit-код, stderr
+  (CLIXML-шум вычищается, текст ошибок вытаскивается) и причину
+  таймаута, а не голое «(пусто)» (старый ps_run выбрасывал stderr —
+  любая ошибка PS выглядела пустотой; внутренние вызовы не тронуты —
+  их контракты по stdout сохранены). (3) САМООБУЧЕНИЕ «УРОКИ»:
+  memory/lessons.json — после КАЖДОГО хода с 2+ инструментами или со
+  сбоями автоматически пишется урок-опыт (задача → какие инструменты
+  сработали/упали → итог); в системный промпт инъектируются до 4 самых
+  РЕЛЕВАНТНЫХ уроков (совпадение слов запроса + новизна) — мозг видит
+  свой собственный удачный и неудачный опыт и не повторяет грабли;
+  поиск в интернете тоже попадает в уроки (запросы и URL видны в
+  шагах); потокобезопасно (threading.local: TG и веб-чат не путаются).
+  (4) веб-чат: файлы Джарвиса и свои вложения скачиваются прямо из
+  сообщений (chat_server v3.15, события file + карточки-ссылки).
+
 Запуск: pythonw.exe jarvis.py [--hello]
 """
 import json, os, sys, time, base64, subprocess, threading, traceback, re, shutil
-import urllib.request, urllib.parse
+import urllib.request, urllib.parse, urllib.error
 import ctypes
 try:  # v3.3.0: физические пиксели экрана — 4K@200% без виртуализации
     ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE
@@ -302,6 +327,62 @@ def ps_run(script, timeout=90):
            "-EncodedCommand", b64]
     r = subprocess.run(cmd, capture_output=True, timeout=timeout, creationflags=0x08000000)
     return r.stdout.decode("utf-8", "replace").strip()
+
+
+def _ps_clean_stderr(s):
+    """v3.15.0: из stderr PowerShell вычистить CLIXML-шум (прогресс-
+    записи «Подготовка модулей…»), но ВЫТАЩИТЬ текст настоящих ошибок
+    (в CLIXML они лежат в <S S="Error">…</S>)."""
+    s = s or ""
+    if "#< CLIXML" in s or "<Objs" in s:
+        errs = re.findall(r'<S S="Error">(.*?)</S>', s, re.S)
+        rest = [ln for ln in s.splitlines()
+                if "#< CLIXML" not in ln and "<Objs" not in ln
+                and "</Objs>" not in ln]
+        keep = [e.strip() for e in errs if e.strip()] + \
+               [r.strip() for r in rest if r.strip()]
+        s = "\n".join(keep)
+    return s.strip()[:900]
+
+
+def ps_run_diag(script, timeout=90):
+    """v3.15.0 «САМОУЧКА» (Task 136): как ps_run, но для МОЗГА — с
+    exit-кодом, stderr и честной причиной таймаута. Живой сбой 08.11:
+    любая ошибка PowerShell (например, Invoke-RestMethod к лежащему
+    порту) уходит в stderr, старый ps_run возвращал «» и мозг видел
+    «(пусто)» без причины — «PowerShell возвращает пустой ответ на все
+    запросы». Внутренние вызовы (cmd_status и др.) остаются на ps_run:
+    их контракты по stdout не меняются."""
+    script = "[Console]::OutputEncoding=[Text.Encoding]::UTF8\r\n" + script
+    b64 = base64.b64encode(script.encode("utf-16-le")).decode()
+    cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+           "-EncodedCommand", b64]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout,
+                           creationflags=0x08000000)
+    except subprocess.TimeoutExpired:
+        return ("ВЫВОД ПУСТОЙ: PowerShell не ответил за %d с (таймаут) — "
+                "команда зависла. Не повторяй её, действуй иначе (другая "
+                "команда, инструмент «запрос» для HTTP)." % timeout)
+    except FileNotFoundError:
+        return "ВЫВОД ПУСТОЙ: powershell.exe не найден (PATH сломан?)"
+    except Exception as e:
+        return "ВЫВОД ПУСТОЙ: PowerShell не запустился (%s)" % e
+    out = r.stdout.decode("utf-8", "replace").strip()
+    err = _ps_clean_stderr(r.stderr.decode("utf-8", "replace"))
+    if out and r.returncode == 0:
+        return out
+    bits = []
+    if out:
+        bits.append(out)
+    if r.returncode != 0:
+        bits.append("exit-код %d" % r.returncode)
+    if err:
+        bits.append("stderr: " + err)
+    if not bits:
+        bits.append("процесс завершился без единого байта вывода")
+    return ("ВЫВОД ПУСТОЙ/С ОШИБКОЙ — вот причина (не «пусто» магически): "
+            + " | ".join(bits))
 
 def tg(method, params=None, timeout=40):
     url = API + "/" + method
@@ -889,6 +970,82 @@ def _http_get(url, timeout=25, maxbytes=900000):
         data = r.read(maxbytes)
         ctype = r.headers.get("Content-Type", "")
     return data, ctype
+
+
+def http_api(method="GET", url="", headers=None, body="", timeout=30):
+    """v3.15.0 «САМОУЧКА» (Task 136): ПРЯМОЙ HTTP-запрос к любому API из
+    самого Python — БЕЗ PowerShell (urllib). Приказ Шефа «научи его
+    делать запросы по API»: curl/Invoke-RestMethod в PS гонять не надо —
+    их ошибки уходят в stderr и выглядят «пусто». Метод GET/POST/PUT/
+    DELETE/PATCH, заголовки dict (Bearer-ключи из памяти), тело строкой
+    (JSON определяется сам). Возврат для мозга: код + тип + тело
+    (JSON разворачивается красиво, до 2400 симв.)."""
+    u = str(url or "").strip()
+    if not u:
+        return "нет адреса (url) — например http://localhost:19999/api/v3/info"
+    if not re.match(r"^https?://", u, re.I):
+        u = "http://" + u
+    m = str(method or "GET").strip().upper()
+    if m not in ("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"):
+        return "метод не понятен: %s — используй GET/POST/PUT/DELETE" % m
+    try:
+        timeout = max(5, min(int(timeout), 120))
+    except (TypeError, ValueError):
+        timeout = 30
+    hdrs = {"User-Agent": UA, "Accept": "application/json, text/*;q=0.9, */*;q=0.5",
+            "Accept-Language": "ru,en;q=0.8"}
+    if isinstance(headers, dict):
+        for k, v in headers.items():
+            ks, vs = str(k).strip(), str(v).strip()
+            if ks and vs:
+                hdrs[ks[:60]] = vs[:600]
+    data = None
+    b = str(body or "").strip()
+    if b and m in ("POST", "PUT", "PATCH", "DELETE"):
+        data = b.encode("utf-8")
+        if not any(k.lower() == "content-type" for k in hdrs):
+            hdrs["Content-Type"] = ("application/json"
+                                     if b[:1] in "{[" else
+                                     "application/x-www-form-urlencoded")
+
+    def _body_text(raw, ctype):
+        try:
+            txt = raw.decode("utf-8", "replace")
+        except Exception:
+            txt = "(бинарные данные, %d байт)" % len(raw)
+        t = txt.strip()
+        if "json" in (ctype or "") or t[:1] in "{[":
+            try:
+                j = json.loads(t)
+                t = json.dumps(j, ensure_ascii=False, indent=1)
+            except Exception:
+                pass
+        if len(t) > 2400:
+            t = t[:2400] + "\n…(обрезано, всего %d байт)" % len(raw)
+        return t or "(пустое тело)"
+
+    try:
+        req = urllib.request.Request(u, data=data, headers=hdrs, method=m)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            code = r.status
+            ctype = r.headers.get("Content-Type", "")
+            raw = r.read(300000)
+        return "HTTP %d %s\n%s" % (code, ctype.split(";")[0], _body_text(raw, ctype))
+    except urllib.error.HTTPError as e:
+        try:
+            raw = e.read(20000)
+            ctype = e.headers.get("Content-Type", "") if e.headers else ""
+        except Exception:
+            raw, ctype = b"", ""
+        return ("HTTP %d (сервер ответил ошибкой) %s\n%s"
+                % (e.code, ctype.split(";")[0], _body_text(raw, ctype)))
+    except urllib.error.URLError as e:
+        why = getattr(e, "reason", e)
+        return ("ЗАПРОС НЕ ПРОШЁЛ (соединение): %s. Проверь адрес/порт; "
+                "для HTTP-API это правильный инструмент — просто "
+                "поправь URL или таймаут." % why)
+    except Exception as e:
+        return "ЗАПРОС НЕ ПРОШЁЛ: %s" % e
 
 
 def _ddg_unwrap(url):
@@ -2428,6 +2585,161 @@ def memory_write(text):
     except Exception as e:
         return "ошибка записи памяти: %s" % e
 
+# --------------------------------------- v3.15.0 «САМОУЧКА»: уроки-опыт
+# Приказ Шефа 08.11: «пусть сам научится вообще надо сделать ему
+# самообучение, возможно при поиске в интернете или при удачном опыте».
+# Настоящее «дообучение весов» локально нереализуемо (и опасно), поэтому
+# самообучение = НАКОПЛЕНИЕ ОПЫТА: после каждого хода с инструментами
+# пишется урок (что сработало/что упало), а в промпт инъектируются самые
+# релевантные — мозг literally учится на своих успехах и граблях.
+
+LESSONSF = os.path.join(MEMDIR, "lessons.json")
+_LESSONS_LOCK = threading.Lock()
+_TLS = threading.local()   # ход потока: TG и веб-чат не путаются
+
+# признаки неудачного результата инструмента (для урока)
+_LESSON_FAIL_MARKS = (
+    "(пусто)", "ВЫВОД ПУСТОЙ", "ОШИБКА", "ошибка", "не удалось",
+    "не получилось", "НЕ подтвердилось", "файл не найден",
+    "нет такого", "НУЖНО ПОДТВЕРЖДЕНИЕ", "ЗАКОН ШЕФА",
+    "ЗАПРОС НЕ ПРОШЁЛ", "ОТКАЗ", "ничего не найдено")
+
+
+def lessons_load():
+    """Список уроков [{ts, text}] (старые -> новые)."""
+    try:
+        with open(LESSONSF, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def lesson_append(text):
+    """Дописать урок-опыт (append-only, потолок 300 — старые срезаются)."""
+    t = str(text or "").strip().replace("\n", " ")[:600]
+    if not t:
+        return
+    try:
+        os.makedirs(MEMDIR, exist_ok=True)
+        with _LESSONS_LOCK:
+            data = lessons_load()
+            if data and data[-1].get("text", "")[:120] == t[:120]:
+                return  # дубль подряд — не пишем
+            data.append({"ts": time.strftime("%d.%m %H:%M"), "text": t})
+            with open(LESSONSF, "w", encoding="utf-8") as f:
+                json.dump(data[-300:], f, ensure_ascii=False, indent=0)
+        log("урок №%d: %s" % (len(data), t[:100]))
+    except Exception as e:
+        log("lesson_append ERR: %s" % e)
+
+
+_LESSON_STOP = frozenset(
+    "джарвис шефа шефу сделай пожалуйста можешь чтобы сейчас потом еще ещё"
+    " какие какой какая сколько будет надо дай скажи посмотр напиши".split())
+
+# инструменты, чей одиночный УСПЕХ — уже опыт (адрес API/запрос поиска,
+# который сработал — в следующий раз мозг возьмёт готовый рецепт)
+_LESSON_SOLO_OK = frozenset(
+    ("запрос", "http", "api", "запрос_к_api", "api_запрос", "интернет",
+     "web_search", "поиск", "найти_на_странице", "открыть_ссылку"))
+
+
+def lessons_pick(text, n=4):
+    """Самые релевантные уроки для запроса: совпадение слов (>=4 симв.)
+    + бонус новизне. Нет совпадений — ничего (не мусорим в промпт)."""
+    data = lessons_load()
+    if not data:
+        return []
+    words = [w for w in re.findall(r"[а-яёa-z0-9]{4,}", (text or "").lower())
+             if w not in _LESSON_STOP]
+    scored = []
+    for i, L in enumerate(data):
+        t = str(L.get("text", "")).lower()
+        score = sum(1 for w in set(words) if w in t)
+        if score > 0:
+            rec = i / max(1, len(data))      # свежие чуть важнее
+            scored.append((score + 0.3 * rec, i, L))
+    scored.sort(key=lambda x: (-x[0], -x[1]))
+    return [L["text"] for _s, _i, L in scored[:n]]
+
+
+def lessons_block():
+    """Блок уроков для системного промпта (по текущему ходу потока):
+    релевантные запросу по словам; нет совпадений — 2 свежих (опыт
+    недавнего прошлого всё равно полезен фоном)."""
+    user = getattr(_TLS, "turn_user", "")
+    data = lessons_load()
+    if not data:
+        return "(пока пусто — уроки появятся сами после первых задач " \
+               "с инструментами)"
+    texts = lessons_pick(user)
+    if not texts:
+        texts = [L.get("text", "") for L in data[-2:]]
+    by_text = {L.get("text", ""): L.get("ts", "") for L in data}
+    return "\n".join("- (%s) %s" % (by_text.get(t, ""), t)
+                     for t in texts if t)
+
+
+def turn_begin(text):
+    """v3.15.0: начало хода (вызывают brain_reply и веб-чат ДО генерации)."""
+    _TLS.turn_user = str(text or "")[:300]
+    _TLS.turn_tools = []
+
+
+def _lesson_short_args(name, args):
+    """Компактная подпись аргументов для урока (url/cmd видны целиком —
+    они самое ценное в опыте)."""
+    try:
+        if name in ("запрос", "http", "api", "запрос_к_api", "api_запрос"):
+            return "%s %s" % (str(args.get("метод") or args.get("method")
+                                      or "GET").upper(),
+                               str(args.get("url") or args.get("адрес")
+                                  or "")[:90])
+        if name == "run_ps":
+            return str(args.get("cmd") or "")[:70].replace("\n", " ")
+        return json.dumps(args, ensure_ascii=False)[:70]
+    except Exception:
+        return str(args)[:70]
+
+
+def turn_track(name, args, res):
+    """v3.15.0: каждый вызов инструмента пишется в ход потока."""
+    lst = getattr(_TLS, "turn_tools", None)
+    if lst is None:
+        return
+    rs = str(res or "")
+    failed = (not rs.strip()) or any(m in rs for m in _LESSON_FAIL_MARKS)
+    lst.append((str(name)[:20], _lesson_short_args(name, args), failed))
+
+
+def turn_finish(answer=""):
+    """v3.15.0: конец хода — САМОУЧЕНИЕ. Пишем урок, если было чему
+    учиться: 2+ инструмента (реальный опыт) или хоть один сбой (грабля).
+    Урок виден мозгу в следующих промптах (lessons_pick)."""
+    tools = getattr(_TLS, "turn_tools", None) or []
+    try:
+        if tools:
+            n_fail = sum(1 for _n, _a, f in tools if f)
+            # опыт стоит записи: 2+ инструмента, хоть один сбой (грабля)
+            # или одиночный успех «самоценного» инструмента (запрос к API /
+            # поиск в сети — их рецепт переиспользуется; приказ Шефа про
+            # «самообучение при поиске в интернете или при удачном опыте»)
+            worth = (len(tools) >= 2 or n_fail > 0
+                     or (len(tools) == 1 and not tools[0][2]
+                         and tools[0][0] in _LESSON_SOLO_OK))
+            if worth:
+                steps = "; ".join(
+                    "%s[%s]%s" % (n, a, "→сбой" if f else "→ок")
+                    for n, a, f in tools[:8])
+                task = str(getattr(_TLS, "turn_user", ""))[:110]
+                ans = str(answer or "")[:150].replace("\n", " ")
+                lesson_append("ОПЫТ «%s»: %s => %s" % (task, steps, ans))
+    finally:
+        _TLS.turn_user = ""
+        _TLS.turn_tools = []
+
+
 def skills_scan():
     """[(имя, описание)] по skills\\<имя>\\SKILL.md."""
     out = []
@@ -2538,12 +2850,14 @@ SCREEN_FACT = _screen_fact()
 
 
 def prompt_fill(t):
-    """v3.0.0: подставить дату, память и индекс скиллов в системный промпт."""
+    """v3.0.0: подставить дату, память и индекс скиллов в системный промпт.
+    v3.15.0: + уроки самообучения ({lessons}) — релевантный опыт хода."""
     mem = memory_read() or "(память пуста — заведи через «запомнить_факт»)"
     ski = skills_index() or "(скиллов нет — создай первый через «записать_скилл»)"
     return (t.replace("{date}", time.strftime("%d.%m.%Y"))
              .replace("{memory}", mem.replace("{", "(").replace("}", ")"))
              .replace("{skills}", ski.replace("{", "(").replace("}", ")"))
+             .replace("{lessons}", lessons_block().replace("{", "(").replace("}", ")"))
              .replace("{files}", FILES_DIR)
              .replace("{screen}", SCREEN_FACT))
 
@@ -2573,8 +2887,9 @@ SYSTEM = """Ты — Джарвис, ИИ-ассистент Шефа, живё�
 - торренты {"что":"список|удалить","какая":"имя раздачи или пусто=все","файлы":"да|нет"} — uTorrent: «список» покажет раздачи и пути данных; «удалить» очищает список (клиент перезапускается и стартует ПУСТЫМ — это нормальный результат). «файлы»=«да» — удалить и скачанные данные с диска (необратимо; ставь только когда Шеф ЯВНО приказал удалить вместе с файлами, иначе спроси его одним коротким вопросом).
 - run_ps {"cmd":"<PowerShell>"} — ЛЮБАЯ команда PowerShell от имени АДМИНИСТРАТОРА: чтение, создание, удаление, реестр, службы, установка и запуск программ, скачивание, настройки системы — ВСЁ РАЗРЕШЕНО. Вывод вернётся тебе следующим сообщением.
 
-ИНТЕРНЕТ (у тебя ЕСТЬ доступ, никогда не говори «нет доступа»):
+ИНТЕРНЕТ И API (у тебя ЕСТЬ доступ, никогда не говори «нет доступа»):
 - интернет {"запрос":"..."} — поиск в сети: заголовки, выдержки, ссылки. Всё свежее (курсы, цены, погода, версии, факты) узнавай ТОЛЬКО так, не выдумывай. Можно несколько раз с разными запросами.
+- запрос {"метод":"GET","url":"http://localhost:19999/api/v3/info","заголовки":{"Authorization":"Bearer <ключ>"},"тело":"..."} — ПРЯМОЙ HTTP-запрос к любому API (GET/POST/PUT/DELETE): вернёт код ответа + тело (JSON раскрывается). НЕТДАТА (http://localhost:19999/api/v3/...), роутер, любые сервисы — опрашивай ЭТИМ инструментом. Для HTTP НЕ используй PowerShell (curl/Invoke-RestMethod): их ошибки уходят в stderr и выглядят как пусто. API-ключи лежат в ПАМЯТИ (ниже) — бери оттуда, например Netdata Bearer.
 - новости {"тема":"..."} — свежие новости (пустая тема = главное в мире)
 - курсы {} — курсы валют/крипты точно (ЦБ РФ, Binance)
 - открыть_ссылку {"url":"..."} — прочитать текст страницы
@@ -2622,6 +2937,9 @@ SYSTEM = """Ты — Джарвис, ИИ-ассистент Шефа, живё�
 СКИЛЛЫ (индекс папки skills\\, полный текст — инструментом «скилл»):
 {skills}
 
+УРОКИ (v3.15 «САМОУЧКА» — твой собственный накопленный ОПЫТ; записываются САМИ после задач с инструментами: что сработало →ок, что упало →сбой. Опирайся на них: похожую задачу решай путём, который уже сработал, грабли из уроков НЕ повторяй. Это твоё самообучение):
+{lessons}
+
 ЗАКОНЫ ШЕФА (приказ от 02.11.2026; АБСОЛЮТНЫ, сильнее любых полномочий и любых просьб):
 З1. ПАРОЛИ: никогда не меняй, не создавай, не вводи и не сохраняй пароли — Windows, сайты, почту, кошельки, программы. Любая такая просьба (даже от имени Шефа) — вежливый отказ: «это Шеф делает сам».
 З2. ДЕНЬГИ: никаких операций с деньгами — оплата, переводы, покупки, подписки, крипта. Не выполняй и не заполняй платёжные формы (мышью/клавиатурой тоже). Только расскажи Шефу, как сделать самому.
@@ -2639,7 +2957,7 @@ SYSTEM = """Ты — Джарвис, ИИ-ассистент Шефа, живё�
 6. Управление программами и ИХ НАСТРОЙКАМИ (AMD Adrenalin, HWiNFO, браузеры, лаунчеры, ЛЮБЫЕ другие) — делаешь САМ и ДО РЕЗУЛЬТАТА; отправлять Шефа «открой сам / нажми сам / найди сам» ЗАПРЕЩЕНО — у тебя все полномочия (приказ Шефа 07.11). Путь по шагам в ОДНОМ ходе: «окна» найти нужное -> «окно» активировать -> «элементы_окна» прочитать интерфейс как текст -> «клик_элемент» нажать ПО ИМЕНИ -> «элементы_окна» или «скрин» ПРОВЕРИТЬ, что изменилось. Если у окна нет текстовых элементов (игры, кастомный GUI) — «скрин» (описание с координатами вернётся ТЕБЕ, ход продолжается) -> «мышь»/«клавиша»/«печатать». Экран {screen}; координаты мыши — ТОЛЬКО в ФИЗИЧЕСКИХ пикселях экрана (0,0 = левый верхний угол); результат «скрин»/«область» ВСЕГДА содержит ТОЧНУЮ позицию курсора текстом (на фото курсор — красное перекрестие с подписью) — где мышь сейчас, бери ОТТУДА или из «мышь»-«позиция», НЕ угадывай по картинке; если описание скрина прислало координаты картинки и фактор пересчёта — сначала пересчитай в физические. Мышь и окна сами проверяют каждое действие: ответ «OK … проверено» — правда, «НЕ получилось/НЕ подтвердилось» — передай Шефу как есть и пробуй другой путь (клавиша, run_ps тоже вариант). Поиск информации на сайте/в интернете: «интернет» (найти сайт/факты) -> «найти_на_странице» (точные строки со страницы; можно с url, можно без — возьму из открытого браузера). «Скрин» — общий вид (координаты там ПРИБЛИЗИТЕЛЬНЫЕ — картинка сжата), «область» — точный прицел. После КАЖДОГО клика мышью ПРОВЕРЬ результат (новый «скрин»/«область»/«элементы_окна»), прежде чем кликать дальше; никогда не повторяй один и тот же клик вслепую — если два раза не попал, меняй подход (область точнее, клавиша, run_ps). «Скрин» — для картинок, капчи и проверки результата: «что я вижу» НЕ заменяет поиск.
 7. Если действия не нужно — просто отвечай текстом без JSON.
 8. Никогда не упоминай Шефу слова «JSON» и «инструмент» — он видит только результат.
-9. Учись: после нетривиальной задачи (новое умение, ошибка и её исправление, привычка Шефа) — сразу запиши урок в память («запомнить_факт»); разобрался, как делать что-то новое, — создай скилл («записать_скилл»).
+9. Учись: после нетривиальной задачи (новое умение, ошибка и её исправление, привычка Шефа) — сразу запиши урок в память («запомнить_факт»); разобрался, как делать что-то новое, — создай скилл («записать_скилл»). Уроки-опыт (УРОКИ ниже) пишутся сами — но важный вывод всегда дублируй «запомнить_факт»: он останется навсегда, а уроки ротируются.
 10. Просьба-ДЕЙСТВИЕ = сразу инструмент-JSON в ЭТОМ ЖЕ ответе. Отвечать «сейчас сделаю», «сначала активирую, затем наберу» обычным текстом БЕЗ вызова инструмента — СТРОГО запрещено: это план, а не действие. Сначала сделай (JSON), потом докладывай результат."""
 
 DANGER_PS = ("remove-item", "rmdir", " rd ", "del ", "erase", "format", "reg add",
@@ -3162,6 +3480,18 @@ def guard_hard(cmd):
 
 
 def tool_exec(name, args):
+    """v3.15.0 «САМОУЧКА»: обёртка самообучения — каждый вызов
+    инструмента записывается в ход потока (turn_track), а в конце хода
+    (turn_finish) пишется урок-опыт. Само исполнение — в _tool_exec_core."""
+    res = _tool_exec_core(name, args)
+    try:
+        turn_track(name, args, res)
+    except Exception:
+        pass
+    return res
+
+
+def _tool_exec_core(name, args):
     try:
         if name == "статус":
             return cmd_status()
@@ -3197,6 +3527,47 @@ Get-ChildItem -LiteralPath '%s' -Recurse -Filter '%s' -EA SilentlyContinue -Erro
   Select-Object -First 15 | ForEach-Object { $_.FullName + '  ' + [math]::Round($_.Length/1MB,2) + ' МБ' }
 """ % (where.replace("'", "''"), mask.replace("'", "''")), 120)
             return out or "ничего не найдено"
+        if name in ("запрос", "http", "api", "запрос_к_api", "api_запрос"):
+            # v3.15.0 «САМОУЧКА» (Task 136, приказ Шефа «научи его делать
+            # запросы по API»): прямой HTTP из Python — БЕЗ PowerShell.
+            # Живой сбой 08.11: curl/irm в PS сыпался в stderr -> «(пусто)».
+            url = str(args.get("url") or args.get("адрес")
+                      or args.get("ссылка") or "").strip()[:500]
+            method = str(args.get("метод") or args.get("method")
+                         or "GET").strip()[:10]
+            headers = args.get("заголовки") or args.get("headers") or {}
+            if not isinstance(headers, dict):
+                headers = {}
+            body = str(args.get("тело") or args.get("body")
+                       or args.get("данные") or "")[:20000]
+            try:
+                timeout = int(args.get("таймаут") or args.get("timeout") or 30)
+            except (TypeError, ValueError):
+                timeout = 30
+            if not url:
+                return ("нет адреса: передай url (например "
+                        "http://localhost:19999/api/v3/info)")
+            # законы Шефа З1/З2 — тот же страж, что у run_ps
+            verdict = guard_hard(url + "\n" + body + "\n"
+                                 + json.dumps(headers, ensure_ascii=False))
+            if verdict == "DENY":
+                journal("ЗАКОН ШЕФА: ОТКАЗ запрос: " + url[:200])
+                return ("ЗАКОН ШЕФА (З1/З2): пароли и денежные операции мне "
+                        "запрещены насовсем — не выполняю ни при каких "
+                        "условиях. Вежливо объясни Шефу, как сделать это "
+                        "самому руками.")
+            if (method.upper() not in ("GET", "HEAD")
+                    and re.search(r"pay|bank|checkout|transfer|invoice|карт",
+                                  url.lower())):
+                # З2: запись/изменение на платёжных адресах — только с «да»
+                if str(args.get("confirm", "")).lower() \
+                        not in ("да", "yes", "ok", "ок", "подтверждаю"):
+                    return ("НУЖНО ПОДТВЕРЖДЕНИЕ ШЕФА (закон З2 — адрес похож "
+                            "на платёжный, а метод меняет данные). Спроси "
+                            "Шефа точным вопросом; после его явного «да» "
+                            "повтори с \"confirm\":\"да\".")
+            journal("запрос: %s %s" % (method.upper(), url[:200]))
+            return http_api(method, url, headers, body, timeout)
         if name == "run_ps":
             # v2.3.0 «МАКС» (приказ Шефа 31.10): цензура опасных команд СНЯТА.
             # Полные права администратора: удаление, реестр, службы, установка,
@@ -3223,7 +3594,7 @@ Get-ChildItem -LiteralPath '%s' -Recurse -Filter '%s' -EA SilentlyContinue -Erro
                         "будет удалено/изменено. После его явного «да» повтори "
                         "ТУ ЖЕ команду, добавив в args \"confirm\":\"да\". "
                         "Нет ответа или «нет» — не выполняй.")
-            out = ps_run(cmd, 180)
+            out = ps_run_diag(cmd, 180)
             journal("run_ps: " + cmd[:200].replace("\n", " "))
             return (out or "(пусто)")[:2600]
         if name in ("читать_файл", "read_file", "файл_прочитать", "прочитать_файл"):
@@ -3687,6 +4058,22 @@ GEN_GONE_MSG = ("🎨 Генерация картинок и видео удал
 
 
 def brain_reply(text, mode="think"):
+    """v3.15.0 «САМОУЧКА»: обёртка самообучения — ход начинается
+    turn_begin'ом и заканчивается turn_finish'ем: после задач с 2+
+    инструментами или со сбоями в memory/lessons.json пишется урок-опыт,
+    и мозг видит его в следующих промптах (lessons_block). Сама логика —
+    в _brain_reply_impl (без изменений)."""
+    turn_begin(text)
+    try:
+        ans = _brain_reply_impl(text, mode)
+    except Exception:
+        turn_finish("")   # сбой хода — урок без итога (опыт про сбой)
+        raise
+    turn_finish(ans)
+    return ans
+
+
+def _brain_reply_impl(text, mode="think"):
     """LLM -> (инструмент -> LLM) до 3 раз -> финальный ответ Шефу.
     v3.14.5: ДУМАЕТ ВСЕГДА (приказ Шефа 08.11) — думание на каждом
     шаге, который может стать ответом Шефу: первый заход, пасс после
@@ -4012,10 +4399,11 @@ HELP = ("🤖 *ДЖАРВИС v3.13 — ТЕКСТОВЫЙ МОЗГ*\n\n"
         "если у меня есть его ключ).\n\n"
         "*Старшие братья:* «спроси у старших» — облачный мозг (второе "
         "мнение), работает даже когда я сплю из-за игры.\n\n"
-        "*Интернет:* «что нового в мире», «курс биткоина», «погода в Москве» — "
+        "*Интернет и API:* «что нового в мире», «курс биткоина», «погода в Москве» — "
         "найду свежее в сети. «найди на странице/сайте …» — читаю текст "
         "страницы (из ссылки или прямо из браузера) и выписываю точные "
-        "строки, а не «что вижу на картинке».\n\n"
+        "строки, а не «что вижу на картинке». Любой API (Netdata-мониторинг, "
+        "роутер, сервисы) — опрошу напрямую и по делу.\n\n"
         "Или просто поговори со мной 😊")
 
 def handle(text, chat_id):
@@ -4580,7 +4968,25 @@ def main():
     log("TG-канал: %s" % ("через прокси MSK + автофолбэк на прямое"
                             if TG_OPENER else "напрямую (плавающая сеть)"))
     hello = "--hello" in sys.argv
-    log("=== ДЖАРВИС старт (v3.14.5 ДУМАЕТ ВСЕГДА (Task 135, 08.11, приказ "
+    log("=== ДЖАРВИС старт (v3.15.0 САМОУЧКА (Task 136, 08.11, доклад Шефа "
+        "«Он что не умеет делать запросы по API, научи его или пусть сам "
+        "научится вообще надо сделать ему самообучение, возможно при поиске "
+        "в интернете или при удачном опыте»): (1) НОВЫЙ ИНСТРУМЕНТ «запрос» — "
+        "прямой HTTP к любому API из самого Python (GET/POST/PUT/DELETE, "
+        "заголовки с Bearer-ключами, тело, таймаут) — Netdata/роутер/сервисы "
+        "опрашиваются БЕЗ PowerShell; (2) run_ps ЧЕСТНЫЙ: ps_run_diag — мозг "
+        "видит exit-код, stderr (CLIXML-шум вычищен) и причину таймаута, "
+        "а не «(пусто)» (живой сбой 08.11: Джарвис не смог опросить Netdata "
+        "и жаловался «PowerShell возвращает пустой ответ на все запросы» — "
+        "а PowerShell был жив, ошибки просто уходили в stderr); (3) "
+        "САМООБУЧЕНИЕ «УРОКИ»: memory/lessons.json — после каждого хода с 2+ "
+        "инструментами или со сбоями автоматически пишется урок-опыт (задача "
+        "→ какие инструменты сработали/упали → итог), в промпт инъектируются "
+        "до 4 самых релевантных уроков (совпадение слов + новизна) — мозг "
+        "учится на своём опыте и не повторяет грабли; поиск в интернете тоже "
+        "попадает в уроки (запросы и URL видны в шагах); потокобезопасно "
+        "(threading.local: TG и веб-чат не путаются); + v3.14.5 ДУМАЕТ ВСЕГДА "
+        "(Task 135, 08.11, приказ "
         "Шефа «Сделай чтобы Джарвис думал всегда! Не надо быстрых ответов, "
         "он тупит сильно, пусть думает нормально всегда!!!»): режимы «fast» "
         "и авто-«big» УДАЛЕНЫ из smart_mode — ЛЮБОЙ вопрос теперь идёт в "
