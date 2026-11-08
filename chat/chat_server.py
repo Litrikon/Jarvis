@@ -182,6 +182,12 @@ def llm_stream(messages, max_tokens=800, temperature=0.7, think=False):
                         yield tail
                 continue
             yield txt
+    # v3.14.5b (Task 135, живой сбой 08.11 19:28 «сколько яблок»):
+    # короткий ответ (<12 зн., без \n) навсегда застревал в буфере
+    # удержания — «9 яблок.» терялось, ход умирал пустым ответом.
+    # Досдаём всё, что осталось НЕ в размышлениях.
+    if _hold and not _in_think:
+        yield "".join(_hold)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -519,6 +525,7 @@ class Handler(BaseHTTPRequestHandler):
                     [{"role": "user", "content": utext}])
             final = ""
             called = set()
+            _force_nothink = False  # v3.14.5b: пустой ответ после думания
             _rep_key = None   # v3.14.1: страж повторов (анти-цикл)
             _rep_cnt = 0
             retried_claim = False
@@ -532,8 +539,12 @@ class Handler(BaseHTTPRequestHandler):
                 ctx_retry = False
                 while True:
                     try:
-                        # v3.10 (Task 128): думание — только первый шаг
-                        _think_now = (_mode in ("think", "big")) and _step == 0
+                        # v3.14.5 (Task 135): ДУМАЕТ ВСЕГДА — приказ Шефа
+                        # «Не надо быстрых ответов, пусть думает нормально
+                        # всегда»: думание на КАЖДОМ шаге, а не только на
+                        # первом (smart_mode теперь всегда отдаёт «think»);
+                        # _force_nothink — повтор после пустого думания (5b)
+                        _think_now = (_mode == "think") and not _force_nothink
                         for tok in llm_stream(
                                 msgs,
                                 max_tokens=(int(jarvis.CFG.get(
@@ -642,12 +653,36 @@ class Handler(BaseHTTPRequestHandler):
                                      "content": jarvis.HANDS_ORDER_FIX_MSG})
                         continue
                     final = ans
-                    if len(final.strip()) < 3 and _step < 2:
-                        # v2: генерация оборвалась в размышлениях — повтор
-                        msgs = msgs + [{"role": "system",
-                                        "content": "Важно: не размышляй вслух, "
-                                                   "ответь сразу готовым текстом."}]
-                        continue
+                    if len(final.strip()) < 3 and _step < 12:
+                        # v3.14.5b (Task 135, живой сбой 08.11 19:28):
+                        # «думает всегда» → иногда ВСЯ генерация уходит в
+                        # размышления и ответ пуст. Раньше сюда дописывали
+                        # system-сообщение В КОНЕЦ массива — шаблон Qwen
+                        # требует system только первым, llama-server
+                        # поднимал 500 «System message must be at the
+                        # beginning» и ход умирал без ответа. Теперь:
+                        # повтор ШАГА без думания, напоминание — в первое
+                        # system (как в jarvis.llm_chat v3.9.1); второй
+                        # пустой ответ — честное сообщение об ошибке.
+                        if not _force_nothink:
+                            _force_nothink = True
+                            clog("пустой ответ после думания — повтор без думания")
+                            if msgs and msgs[0].get("role") == "system":
+                                msgs[0] = dict(msgs[0])
+                                msgs[0]["content"] = (
+                                    (msgs[0].get("content") or "")
+                                    + "\n\nВАЖНО: не размышляй вслух и не "
+                                      "используй тег размышлений — отвечай "
+                                      "сразу готовым текстом. Коротко, "
+                                      "по-русски.")
+                            continue
+                        clog("веб-ответ сорвался (дегенеративный): %r"
+                             % final[:80])
+                        jarvis.hist_append(disp, "(веб: ответ сорвался)")
+                        emit({"type": "error",
+                              "text": "Я подумал, но ответ сорвался при "
+                                      "генерации. Переспроси — отвечу."})
+                        return
                     break
                 name, args, say = tool
                 called.add(name)
@@ -771,7 +806,7 @@ def main():
             time.sleep(0.8)
             os.startfile("http://127.0.0.1:%d" % PORT)
         threading.Thread(target=_open, daemon=True).start()
-    clog("чат-сервер запущен v3.10 умный режим + старшие братья (pid %s)"
+    clog("чат-сервер запущен v3.14.5 ДУМАЕТ ВСЕГДА (pid %s)"
          % os.getpid())
     while True:  # v2: serve_forever может упасть — цикл перезапускает
         try:
