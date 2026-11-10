@@ -61,6 +61,11 @@ v3.16 (Task 137) «ОТВЕТЬ ГОЛОСОМ» (доклад Шефа 10.11 «
   600 -> 1000 символов; /api/tts понимает &voice=денис (разовый голос);
   голоса переключаются живой правкой config.json — /api/tts перечитывает
   его по mtime (смена из Telegram-процесса доезжает без рестарта).
+v3.17 (Task 138) «SILERO»: /api/tts переведён на общий движок
+  jarvis.tts_wav — silero v5_6_ru (ксения/ксеня/евгений/айдар/байя,
+  48 кГц, автоударения/омографы, синтез быстрее realtime) с тихим
+  откатом на piper; &voice= понимает и silero-имена; установка —
+  «поставь silero» в Telegram (сам ставит torch+модель).
 
 """
 import json, os, sys, time, base64, threading, traceback
@@ -299,44 +304,38 @@ class Handler(BaseHTTPRequestHandler):
             # v3.4.0 (Task 101): озвучка ответа (piper)
             # v3.16.0 (Task 137): лимит 600 -> 1000 (разовая озвучка
             # «ответь голосом» не должна обрезаться) + выбор голоса
-            # &voice=денис + перечитывание config.json (смена основного
+            # &voice=имя + перечитывание config.json (смена основного
             # голоса из Telegram-процесса доезжает без рестарта)
+            # v3.17.0 (Task 138): общий движок jarvis.tts_wav — silero
+            # v5_6_ru (ксения/ксеня/евгений/айдар/байя, 48 кГц) с тихим
+            # откатом на piper; имя голоса понимают оба движка
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             text = (qs.get("text") or [""])[0][:1000].strip()
             if not text:
                 self._send_json({"error": "пустой текст"}, 400)
                 return
-            jarvis._cfg_sync()
-            exe = jarvis.CFG.get("piper_exe")
-            voice = jarvis.CFG.get("piper_voice")
             vname = (qs.get("voice") or [""])[0].strip().lower()
             if vname:
                 for _stem, _full in jarvis.VOICE_NAME_STEMS.items():
                     if vname.startswith(_stem):
                         vname = _full
                         break
-                voice = jarvis.voice_catalog().get(vname) or voice
-            if not (exe and voice and os.path.isfile(exe)
-                    and os.path.isfile(voice)):
-                self._send_json({"error": "piper не установлен"}, 503)
+            wav = jarvis.tts_wav(text, vname or None)
+            if not wav:
+                self._send_json({"error": "голосовой движок не ответил "
+                                 "(silero/piper недоступны)"}, 503)
                 return
-            out = os.path.join(jarvis.DATA, "web_tts.wav")
             try:
-                p = subprocess.run([exe, "--model", voice,
-                                    "--output_file", out],
-                                   input=text.encode("utf-8"),
-                                   stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL, timeout=120)
-                if p.returncode != 0 or not os.path.isfile(out) \
-                        or os.path.getsize(out) < 200:
-                    self._send_json({"error": "синтез не удался"}, 500)
-                    return
-                with open(out, "rb") as fh:
+                with open(wav, "rb") as fh:
                     b = fh.read()
-                os.remove(out)
             except Exception as e:
                 self._send_json({"error": str(e)[:200]}, 500)
                 return
+            finally:
+                try:
+                    os.remove(wav)
+                except OSError:
+                    pass
             clog("tts: %d симв -> %d Б" % (len(text), len(b)))
             self.send_response(200)
             self.send_header("Content-Type", "audio/wav")
@@ -924,8 +923,8 @@ def main():
             time.sleep(0.8)
             os.startfile("http://127.0.0.1:%d" % PORT)
         threading.Thread(target=_open, daemon=True).start()
-    clog("чат-сервер запущен v3.16 «ответь голосом» + файлы в чате + "
-         "самообучение (pid %s)" % os.getpid())
+    clog("чат-сервер запущен v3.17 «silero-голоса» + ответь голосом + "
+         "файлы в чате + самообучение (pid %s)" % os.getpid())
     while True:  # v2: serve_forever может упасть — цикл перезапускает
         try:
             srv.serve_forever(poll_interval=0.5)

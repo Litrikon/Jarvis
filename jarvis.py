@@ -213,6 +213,32 @@ v3.16.0 «ГОЛОС ДЖАРВИСА» (Task 137, 10.11.2026, доклад Ше
   (4) веб-чат: серверная страховка вырезания фразы, событие "voice" в
   стриме, лимит озвучки 600 → 1000 символов, выбор голоса в /api/tts.
 
+v3.17.0 «SILERO» (Task 138, 10.11.2026, приказ Шефа «Ставь silero
+  последней версии, почему сразу не поставил, нужно максимально
+  реалистичный голос»): движок речи piper -> SILERO v5_6_ru — последняя
+  модель 5-й линейки (models.yml silero-models, проверена в песочнице
+  10.11): автоударения, омографы, интонация вопросов и восклицаний,
+  48 кГц, синтез на CPU быстрее realtime (~0,2 с на фразу): (1) ПЯТЬ
+  ГОЛОСОВ одной моделью 141 МБ — ксения (жен., основной), ксеня и байя
+  (жен.), евгений и айдар (муж.): «ответь голосом ксении» — разово,
+  «голос евгений» — сменить основной; piper остался РЕЗЕРВОМ (денис/
+  дмитрий/руслан/ирина): имя piper-голоса или сбой silero = тихий откат
+  на piper, затем на текст — ответ Шефу не теряется; (2) УСТАНОВКА
+  ЛЮБЫМ КАНАЛОМ: «поставь silero» / «скачай голос ксения» — сам ставит
+  torch (pip, ~200 МБ), качает модель v5_6_ru.pt (141 МБ, .part-
+  страховка), правит config.json (tts_engine/silero_model/silero_voice)
+  и докладывает ГОЛОСОМ в новом тембре; + numpy в комплект установки
+  (torch без него не конвертирует тензор в wav — живые грабли 10.11
+  «Numpy is not available», тихий откат на piper); (3) ДЛИННЫЕ ОТВЕТЫ: silero не
+  принимает >~1000 симв — текст режется на предложения/запятые/слова,
+  аудио склеивается в один голос (тест: 1327 симв -> 88 с аудио за
+  2,9 с); (4) ЛЕНИВАЯ ЗАГРУЗКА: модель поднимается при первом синтезе
+  (~3 с) в каждом процессе, inference под замком (TG и веб-чат не
+  путаются), torch импортируется только при голосе — бот стартует и без
+  него; (5) /api/tts веб-чата переведён на общий jarvis.tts_wav (silero
+  + фолбэк piper), &voice= понимает silero-имена; движок/голос меняются
+  живой правкой config.json — оба процесса подхватывают по mtime.
+
 Запуск: pythonw.exe jarvis.py [--hello]
 """
 import json, os, sys, time, base64, subprocess, threading, traceback, re, shutil
@@ -438,7 +464,7 @@ def send(text, chat=None, voice=False, voice_name=None):
     """v2.3.0: до 4 попыток с паузами — сеть до Telegram плавает, ответы
     терялись (send ERR 10054 в момент, когда Шеф ждал ответ).
     v3.16.0 (Task 137) «ОТВЕТЬ ГОЛОСОМ»: voice=True — финальный ответ
-    уходит ГОЛОСОВЫМ сообщением (piper → ogg/opus → sendVoice); ответ
+    уходит ГОЛОСОВЫМ сообщением (silero/piper → ogg/opus → sendVoice); ответ
     длиннее 1000 символов: начало голосом, хвост — текстом. Любой сбой
     синтеза/конвертации/отправки = откат на обычный текст — ответ Шефа
     не теряется никогда."""
@@ -526,9 +552,17 @@ VOICE_RE = re.compile(
     r'[\s,.;:\-—()«»"\']*голосом[\s,.;:!?\-—()«»"\']*',
     re.IGNORECASE)
 
-# стем имени голоса -> каноническое имя (дениса/денис/денису -> денис)
-VOICE_NAME_STEMS = {"дени": "денис", "дмитр": "дмитрий",
+# стем имени голоса -> каноническое имя (дениса/денис/денису -> денис).
+# v3.17.0: ПОРЯДОК ВАЖЕН — «ксени» раньше «ксен» (ксению -> ксения,
+# ксеню/ксеней -> ксеня)
+VOICE_NAME_STEMS = {"ксени": "ксения", "ксен": "ксеня", "евген": "евгений",
+                    "айдар": "айдар", "бай": "байя",
+                    "дени": "денис", "дмитр": "дмитрий",
                     "руслан": "руслан", "ирин": "ирина"}
+# silero v5_6_ru: пять живых голосов из ОДНОЙ модели (имя -> speaker)
+SILERO_VOICES = {"ксения": "kseniya", "ксеня": "xenia", "евгений": "eugene",
+                 "айдар": "aidar", "байя": "baya"}
+# piper (резервный движок): имя -> slug файла голоса
 VOICE_SLUGS = {"денис": "denis", "дмитрий": "dmitri",
                "руслан": "ruslan", "ирина": "irina"}
 
@@ -541,10 +575,304 @@ VOICE_GET_RE = re.compile(
     r"^(?:скачай|скачать|загрузи|загрузить|подтяни|подтянуть)\s+голос\s+([а-яё]+)$",
     re.IGNORECASE)
 
-# откуда качаем недостающие голоса (проверено 10.11 в песочнице:
+# v3.17.0: «поставь silero» / «установи силеро» / «поставь движок silero»
+SILERO_INSTALL_RE = re.compile(
+    r"^(?:постав(?:ь|ить)?|установ(?:и|ить)?|скач(?:ай|ать)?|подтяни|"
+    r"подтянуть)\s+(?:голос\s+|движок\s+|движок\s+голоса\s+|речи\s+)?"
+    r"(?:silero|силеро|сильеро)(?:\s+.*)?$",
+    re.IGNORECASE)
+
+# откуда качаем недостающие piper-голоса (проверено 10.11 в песочнице:
 # файлы ветки v1.0.0 читаются движком piper 1.2.0 без замен)
 VOICE_HF = ("https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/"
             "ru/ru_RU/%s/medium/ru_RU-%s-medium")
+
+# ---------------- v3.17.0 (Task 138) SILERO: движок речи ----------------
+# последняя модель 5-й линейки: автоударения, омографы, интонация
+# вопросов/восклицаний; 48 кГц; синтез на CPU быстрее realtime
+SILERO_URL = "https://models.silero.ai/models/tts/ru/v5_6_ru.pt"
+SILERO_MODEL_FN = "v5_6_ru.pt"
+SILERO_MIN_BYTES = 100 * 1024 * 1024   # ~141 МБ; меньше 100 МБ = битый
+
+_SI = {"lock": threading.Lock(), "model": None, "path": None, "err": ""}
+
+
+def silero_model_target():
+    """Куда ставим/ищем модель silero: config.json -> BASE/silero/."""
+    p = str(CFG.get("silero_model") or "").strip()
+    if p:
+        return p
+    return os.path.join(BASE, "silero", SILERO_MODEL_FN)
+
+
+def silero_path():
+    """Путь к модели, если файл на месте и цел. None = не установлен."""
+    p = silero_model_target()
+    try:
+        if os.path.isfile(p) and os.path.getsize(p) >= SILERO_MIN_BYTES:
+            return p
+    except OSError:
+        pass
+    return None
+
+
+def silero_engine_on():
+    """Пробовать ли silero первым: движок не переключён на piper и модель
+    на месте (нет torch поймается при загрузке — тихий откат на piper)."""
+    if str(CFG.get("tts_engine") or "").strip().lower() == "piper":
+        return False
+    return silero_path() is not None
+
+
+def silero_ready():
+    """Полная готовность: модель + torch + numpy (для честных ответов
+    Шефу; без numpy тензор не конвертируется в wav — грабли 10.11)."""
+    if not silero_path():
+        return False
+    try:
+        import torch  # noqa: F401
+        import numpy  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _silero_load():
+    """Ленивая загрузка модели (один раз на процесс, ~3 с). None = сбой."""
+    if _SI["model"] is not None and _SI["path"] == silero_path():
+        return _SI["model"]
+    with _SI["lock"]:
+        if _SI["model"] is not None and _SI["path"] == silero_path():
+            return _SI["model"]
+        if _SI["err"] and _SI["path"] == silero_path():
+            return None   # уже пробовали и не вышло — не молотим впустую
+        try:
+            import torch
+            torch.set_num_threads(4)   # не съедаем все ядра Шефа
+            p = silero_path()
+            _SI["model"] = torch.package.PackageImporter(p) \
+                .load_pickle("tts_models", "model")
+            _SI["path"] = p
+            _SI["err"] = ""
+            log("silero: модель загружена (%.0f МБ)"
+                % (os.path.getsize(p) >> 20))
+            return _SI["model"]
+        except Exception as e:
+            _SI["err"] = str(e)[:200]
+            _SI["path"] = silero_path()
+            log("silero load ERR: %s" % _SI["err"])
+            return None
+
+
+def _tts_chunks(text, limit=550):
+    """v3.17.0: silero не принимает длинный текст (~1000+ симв) — режем
+    на предложения, затем запятые, затем слова; аудио склеиваем кусками."""
+    sents = [s.strip() for s in re.split(r'(?<=[.!?…])\s+', str(text).strip())
+             if s.strip()]
+    pieces = []
+    for s in sents:
+        if len(s) <= limit:
+            pieces.append(s)
+            continue
+        for c in re.split(r'(?<=[,;:])\s+', s):
+            if len(c) <= limit:
+                pieces.append(c)
+                continue
+            cur = ""
+            for w in c.split(" "):
+                if len(cur) + len(w) + 1 > limit:
+                    if cur:
+                        pieces.append(cur.strip())
+                    cur = w
+                else:
+                    cur = (cur + " " + w).strip()
+            if cur:
+                pieces.append(cur.strip())
+    chunks, cur = [], ""
+    for p in pieces:
+        if not p:
+            continue
+        if len(cur) + len(p) + 1 <= limit:
+            cur = (cur + " " + p).strip()
+        else:
+            if cur:
+                chunks.append(cur)
+            cur = p
+    if cur:
+        chunks.append(cur)
+    return [c for c in chunks if c.strip()]
+
+
+def silero_wav(text, speaker, out=None):
+    """v3.17.0: silero -> wav 48 кГц mono 16 бит. None = не вышло
+    (вызывающий откатится на piper/текст)."""
+    m = _silero_load()
+    if not m:
+        return None
+    if out is None:
+        out = os.path.join(DATA, "voice_tts_%d.wav" % threading.get_ident())
+    try:
+        chunks = _tts_chunks(text)
+        if not chunks:
+            return None
+        with _SI["lock"]:   # inference — под одним замком на процесс
+            audios = [m.apply_tts(text=ch, speaker=speaker,
+                                  sample_rate=48000,
+                                  put_accent=True, put_yo=True)
+                      for ch in chunks]
+        import torch
+        full = torch.cat(audios) if len(audios) > 1 else audios[0]
+        import wave
+        pcm = (full.numpy().clip(-1, 1) * 32767).astype("<i2")
+        with wave.open(out, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(48000)
+            w.writeframes(pcm.tobytes())
+        return out
+    except Exception as e:
+        log("silero_wav ERR: %s" % e)
+        return None
+
+
+def silero_download_model():
+    """v3.17.0: скачать модель v5_6_ru (~141 МБ) с .part-страховкой.
+    Возврат: (ok, пояснение)."""
+    dst = silero_model_target()
+    try:
+        os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+    except OSError as e:
+        return False, str(e)[:150]
+    try:
+        if os.path.isfile(dst) and os.path.getsize(dst) >= SILERO_MIN_BYTES:
+            return True, "уже скачана"
+        log("silero: качаю модель %s" % SILERO_URL)
+        tmp = dst + ".part"
+        with urllib.request.urlopen(SILERO_URL, timeout=300) as r, \
+                open(tmp, "wb") as f:
+            total = 0
+            while True:
+                chunk = r.read(1 << 18)
+                if not chunk:
+                    break
+                f.write(chunk)
+                total += len(chunk)
+                if total % (20 << 20) < (1 << 18):
+                    log("silero: %d МБ…" % (total >> 20))
+                    journal("модель silero: %d из ~141 МБ" % (total >> 20))
+        if os.path.getsize(tmp) < SILERO_MIN_BYTES:
+            os.remove(tmp)
+            return False, "файл модели подозрительно мал"
+        os.replace(tmp, dst)
+        journal("модель silero v5_6_ru скачана из интернета (%d МБ)"
+                % (os.path.getsize(dst) >> 20))
+        return True, "готово"
+    except Exception as e:
+        log("silero download ERR: %s" % e)
+        return False, str(e)[:200]
+
+
+def silero_install_async(chat, voice_name=None):
+    """v3.17.0 (Task 138): полная установка silero в потоке — torch (pip,
+    ~200 МБ) + модель v5_6_ru (141 МБ) + config.json. По готовности
+    докладывает Шефу ГОЛОСОМ в новом тембре."""
+    def _w():
+        try:
+            # 1) torch
+            have_torch = False
+            try:
+                import torch  # noqa: F401
+                have_torch = True
+            except Exception:
+                pass
+            if not have_torch:
+                send("⬇️ Ставлю torch — нейробиблиотеку для голоса "
+                     "(~200 МБ). Самая долгая часть, до нескольких "
+                     "минут…", chat)
+                ok = False
+                for args in ([sys.executable, "-m", "pip", "install",
+                              "torch"],
+                             [sys.executable, "-m", "pip", "install",
+                              "torch", "--index-url",
+                              "https://download.pytorch.org/whl/cpu"]):
+                    try:
+                        p = subprocess.run(args, timeout=2400,
+                                           stdout=subprocess.PIPE,
+                                           stderr=subprocess.STDOUT)
+                        if p.returncode == 0:
+                            ok = True
+                            break
+                        log("pip torch: код %s" % p.returncode)
+                    except Exception as e:
+                        log("pip torch ERR: %s" % e)
+                try:
+                    import torch  # noqa: F401
+                    ok = True
+                except Exception:
+                    ok = False
+                if not ok:
+                    send("⚠️ torch не поставился (pip). Детали в jarvis.log. "
+                         "Голос остался прежним — piper.", chat)
+                    return
+                send("✅ torch установлен.", chat)
+            # 1б) numpy — torch БЕЗ него не конвертирует тензор в wav
+            # (живые грабли 10.11: «silero_wav ERR: Numpy is not
+            # available» -> тихий откат на piper); ставится один раз
+            numpy_was = True
+            try:
+                import numpy  # noqa: F401
+            except Exception:
+                numpy_was = False
+                send("⬇️ Доставляю numpy (~16 МБ) — без него torch не "
+                     "отдаёт звук…", chat)
+                try:
+                    p = subprocess.run(
+                        [sys.executable, "-m", "pip", "install", "numpy"],
+                        timeout=600, stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT)
+                    if p.returncode != 0:
+                        log("pip numpy: код %s\n%s" % (
+                            p.returncode,
+                            p.stdout.decode("utf-8", "replace")[-500:]))
+                except Exception as e:
+                    log("pip numpy ERR: %s" % e)
+                try:
+                    import numpy  # noqa: F401
+                except Exception:
+                    send("⚠️ numpy не поставился (pip). Детали в "
+                         "jarvis.log.", chat)
+                    return
+            # 2) модель
+            if not silero_path():
+                send("⬇️ Качаю модель v5_6_ru (~141 МБ)…", chat)
+            ok, info = silero_download_model()
+            if not ok:
+                send("⚠️ Модель silero не скачалась: %s. Скажи ещё раз "
+                     "«поставь silero» — попробую заново." % info, chat)
+                return
+            # 3) конфиг (живая правка; второй процесс подхватит по mtime)
+            nm = voice_name if voice_name in SILERO_VOICES else \
+                (CFG.get("silero_voice")
+                 if CFG.get("silero_voice") in SILERO_VOICES else "ксения")
+            cfg_set("tts_engine", "silero")
+            cfg_set("silero_model", silero_model_target())
+            cfg_set("silero_voice", nm)
+            _SI["err"] = ""   # разрешаем загрузку модели заново
+            _SI["path"] = None
+            journal("движок silero v5_6_ru установлен (голос: %s)" % nm)
+            send("🎙 Silero встал! Теперь я говорю голосом %s — "
+                 "слушай." % voice_display(nm), chat,
+                 voice=True, voice_name=nm)
+            if not numpy_was:
+                send("ℹ️ numpy встал только что: если голос ещё "
+                     "прежний — перезапусти меня (план задач "
+                     "JarvisAgent), после перезапуска заговорю "
+                     "новым голосом.", chat)
+        except Exception as e:
+            log("silero install ERR: %s" % e)
+            send("⚠️ Установка silero споткнулась: %s — детали в "
+                 "jarvis.log." % str(e)[:150], chat)
+    threading.Thread(target=_w, daemon=True).start()
 
 
 def _cfg_sync():
@@ -594,8 +922,8 @@ def voices_dir():
                         "voices")
 
 
-def voice_catalog():
-    """v3.16.0: {имя: путь} — все скачанные голоса в папке voices."""
+def _piper_catalog():
+    """{имя: путь} — скачанные piper-голоса в папке voices."""
     cat = {}
     try:
         d = voices_dir()
@@ -612,8 +940,27 @@ def voice_catalog():
     return cat
 
 
+def voice_catalog():
+    """v3.17.0: {имя: 'silero' | путь} — ВСЕ доступные голоса: silero
+    (модель на месте = все пять сразу) + скачанные piper."""
+    cat = {}
+    if silero_path():
+        for nm in SILERO_VOICES:
+            cat[nm] = "silero"
+    cat.update(_piper_catalog())
+    return cat
+
+
 def voice_cur_name():
-    """Имя текущего основного голоса (по пути в конфиге)."""
+    """v3.17.0: имя текущего основного голоса (по движку из конфига)."""
+    if silero_engine_on():
+        nm = str(CFG.get("silero_voice") or "").strip().lower()
+        if nm in SILERO_VOICES:
+            return nm
+        for stem, full in VOICE_NAME_STEMS.items():
+            if nm.startswith(stem) and full in SILERO_VOICES:
+                return full
+        return "ксения"
     cur = str(CFG.get("piper_voice") or "")
     m = re.match(r"ru_RU-([A-Za-z]+)-medium\.onnx$",
                  os.path.basename(cur))
@@ -636,8 +983,8 @@ def voice_split(text):
         return text, False, None
     rest = VOICE_RE.sub("\x00", text)
     name = None
-    m = re.search(r'\x00\s*(дени|дмитр|руслан|ирин)[а-яё]*'
-                  r'[\s,.;:!?\-—()«»]*', rest,
+    m = re.search(r'\x00\s*(ксени|ксен|евген|айдар|бай|дени|дмитр|'
+                  r'руслан|ирин)[а-яё]*[\s,.;:!?\-—()«»]*', rest,
                   re.IGNORECASE)
     if m:
         name = VOICE_NAME_STEMS.get(m.group(1).lower())
@@ -646,29 +993,50 @@ def voice_split(text):
     return re.sub(r"[ \t]{2,}", " ", rest).strip(), True, name
 
 
-def tts_wav(text, voice_path=None, timeout=180):
-    """v3.16.0: piper -> wav (voice_path=None = основной голос).
-    None = piper не установлен/сбой."""
-    _cfg_sync()   # голос могли сменить в другом процессе
+def tts_wav(text, voice_name=None, timeout=180):
+    """v3.17.0 (Task 138): текст -> wav. Основной движок silero v5_6_ru
+    (ксения/ксеня/евгений/айдар/байя), резерв piper (денис/дмитрий/
+    руслан/ирина). voice_name — русское имя (None = основной голос).
+    Возврат: путь к wav или None (ни один движок не ответил)."""
+    _cfg_sync()   # голос/движок могли сменить в другом процессе
+    cur = voice_cur_name()
+    name = str(voice_name or cur or "").strip().lower()
+    # 1) silero: явное silero-имя (даже при движке piper) или основной
+    #    silero-голос; нет модели/torch = тихо катимся дальше
+    if (name in SILERO_VOICES or (not voice_name and silero_engine_on())):
+        spk = SILERO_VOICES.get(name) or SILERO_VOICES.get(cur) \
+            or "kseniya"
+        wav = silero_wav(text, spk)
+        if wav:
+            return wav
+        log("tts: silero не справился — пробую piper")
+    # 2) piper (имя piper-набора или основной piper-голос)
     exe = CFG.get("piper_exe")
-    voice = voice_path or CFG.get("piper_voice")
-    if not (exe and voice and os.path.isfile(exe) and os.path.isfile(voice)):
-        log("tts: piper не установлен — голос невозможен")
-        return None
-    out = os.path.join(DATA, "voice_tts.wav")
-    try:
-        p = subprocess.run([exe, "--model", voice, "--output_file", out],
-                           input=text.encode("utf-8"),
-                           stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=timeout)
-        if p.returncode != 0 or not os.path.isfile(out) \
-                or os.path.getsize(out) < 200:
-            log("tts: синтез не удался (код %s)" % p.returncode)
-            return None
-        return out
-    except Exception as e:
-        log("tts ERR: %s" % e)
-        return None
+    voice = None
+    if voice_name and name in VOICE_SLUGS:
+        voice = _piper_catalog().get(name)
+    if not voice:
+        voice = CFG.get("piper_voice")
+    if exe and voice and os.path.isfile(exe) and os.path.isfile(voice):
+        out = os.path.join(DATA, "voice_tts_%d.wav" % threading.get_ident())
+        try:
+            p = subprocess.run([exe, "--model", voice, "--output_file", out],
+                               input=text.encode("utf-8"),
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=timeout)
+            if p.returncode == 0 and os.path.isfile(out) \
+                    and os.path.getsize(out) > 200:
+                return out
+            log("tts: piper не удался (код %s)" % p.returncode)
+        except Exception as e:
+            log("tts piper ERR: %s" % e)
+    # 3) имя не silero-голоса, но silero жив — основным silero-голосом
+    if voice_name and name not in SILERO_VOICES and silero_engine_on():
+        wav = silero_wav(text, SILERO_VOICES.get(cur) or "kseniya")
+        if wav:
+            return wav
+    log("tts: ни silero, ни piper не ответили — голос невозможен")
+    return None
 
 
 def send_voice(text, chat=None, voice_name=None):
@@ -678,8 +1046,7 @@ def send_voice(text, chat=None, voice_name=None):
     Сказанное остаётся в истории: зеркало несёт текст голосового."""
     wav = ogg = None
     try:
-        cat = voice_catalog()
-        wav = tts_wav(text, cat.get(voice_name) if voice_name else None)
+        wav = tts_wav(text, voice_name)   # v3.17.0: имя -> движок сам
         if not wav:
             return False
         ff = CFG.get("ffmpeg_exe")
@@ -718,7 +1085,7 @@ def send_voice(text, chat=None, voice_name=None):
         mirror_append("tg", "jarvis",
                       "🎙 (голосом %s): %s" % (voice_display(voice_name),
                                                text[:800]))
-        journal("голосовой ответ Шефу: %d симв (piper+opus, голос %s)"
+        journal("голосовой ответ Шефу: %d симв (opus 48k, голос %s)"
                 % (len(text), voice_display(voice_name)))
         return True
     except Exception as e:
@@ -793,30 +1160,38 @@ def voice_download_async(name, chat):
 
 
 def voices_help():
-    """v3.16.0: список голосов для команды «голоса»."""
+    """v3.17.0: список голосов для команды «голоса»."""
     _cfg_sync()
     cat = voice_catalog()
     cur = voice_cur_name()
-    lines = ["🎙 Мои голоса (движок piper, локально):"]
+    lines = ["🎙 Мои голоса (движок %s, всё локально):"
+             % ("silero v5_6 — самые натуральные" if silero_engine_on()
+                else "piper")]
     for nm in sorted(cat):
-        lines.append("%s %s" % ("★" if nm == cur else "•",
-                                voice_display(nm)))
+        lines.append("%s %s%s"
+                     % ("★" if nm == cur else "•", voice_display(nm),
+                        " (жен.)" if nm in ("ксения", "ксеня", "байя",
+                                            "ирина") else " (муж.)"))
     if not cat:
-        lines.append("(папка голосов пуста — скажи «скачай голос ирина»)")
-    can = [nm for nm in ("денис", "дмитрий", "руслан", "ирина")
-           if nm not in cat]
+        lines.append("(голосов нет — скажи «поставь silero»)")
+    if not silero_path():
+        lines.append("")
+        lines.append("⚙️ Движок silero (голоса заметно живее: ксения, "
+                     "ксеня, байя, евгений, айдар) не установлен — "
+                     "скажи «поставь silero», я всё сделаю сам.")
+    can = [nm for nm in VOICE_SLUGS if nm not in cat]
     if can:
-        lines.append("Можно скачать: " + ", ".join(voice_display(n)
-                                                   for n in can))
+        lines.append("Piper можно скачать: " + ", ".join(can))
     lines.append("")
     lines.append("«ответь голосом …» — мой ответ голосом (разово);")
-    lines.append("«ответь голосом дениса …» — разово голосом Дениса;")
-    lines.append("«голос денис» — сменить основной голос.")
+    lines.append("«ответь голосом евгения …» — разово другим голосом;")
+    lines.append("«голос ксения» — сменить основной.")
     return "\n".join(lines)
 
 
 def voice_switch_cmd(word):
-    """v3.16.0: смена основного голоса по команде Шефа.
+    """v3.16.0: смена основного голоса по команде Шефа. v3.17.0:
+    silero-имя переключает движок на silero, piper-имя — на piper.
     Возврат: (текст, имя_нового_голоса или None)."""
     _cfg_sync()
     w = str(word or "").strip().lower()
@@ -827,26 +1202,45 @@ def voice_switch_cmd(word):
             break
     cat = voice_catalog()
     if not name:
-        return ("Не понял голос «%s». Есть: %s; можно скачать: %s."
-                % (word, ", ".join(sorted(cat)) or "—",
+        return ("Не понял голос «%s». Silero: %s; piper: %s."
+                % (word, ", ".join(SILERO_VOICES),
                    ", ".join(VOICE_SLUGS)), None)
+    if name in SILERO_VOICES:
+        if not silero_path():
+            return ("Голос %s живёт в движке silero — он ещё не "
+                    "установлен. Скажи «поставь silero» — установлю сам "
+                    "(torch ~200 МБ + модель 141 МБ)."
+                    % voice_display(name), None)
+        if name == voice_cur_name() and silero_engine_on():
+            return ("Голос %s и так основной." % voice_display(name), name)
+        if not (cfg_set("tts_engine", "silero")
+                and cfg_set("silero_voice", name)):
+            return ("Не смог записать выбор в config.json — "
+                    "смотри jarvis.log.", None)
+        journal("основной голос переключён по команде Шефа (silero): %s"
+                % name)
+        return ("🎙 Основной голос теперь %s (silero). Слушаю."
+                % voice_display(name), name)
+    # piper-имя
     if not cat.get(name):
-        return ("Голос %s ещё не скачан. Скажи «скачай голос %s» — "
-                "подтяну из интернета (~63 МБ)."
+        return ("Голос %s ещё не скачан (piper). Скажи «скачай голос %s» "
+                "— подтяну из интернета (~63 МБ)."
                 % (voice_display(name), name), None)
-    if name == voice_cur_name():
+    if name == voice_cur_name() and not silero_engine_on():
         return ("Голос %s и так основной." % voice_display(name), name)
-    if not cfg_set("piper_voice", cat[name]):
+    if not (cfg_set("tts_engine", "piper")
+            and cfg_set("piper_voice", cat[name])):
         return ("Не смог записать выбор в config.json — смотри jarvis.log.",
                 None)
-    journal("основной голос переключён по команде Шефа: %s" % name)
-    return ("🎙 Основной голос теперь %s. Слушаю." % voice_display(name),
-            name)
+    journal("основной голос переключён по команде Шефа (piper): %s" % name)
+    return ("🎙 Основной голос теперь %s (piper). Слушаю."
+            % voice_display(name), name)
 
 
 def tool_voice(args):
     """v3.16.0 (Task 137): инструмент мозга «голос» — список/переключить/
-    скачать. Мозг вызовет сам, когда Шеф просит голос погромче/потеплее."""
+    скачать. v3.17.0: + установка движка silero. Мозг вызовет сам, когда
+    Шеф просит голос погромче/потеплее/поестественнее."""
     _cfg_sync()
     what = str(args.get("что") or args.get("what") or args.get("действие")
                or "").strip().lower()
@@ -859,10 +1253,29 @@ def tool_voice(args):
                 break
     cat = voice_catalog()
     cur = voice_cur_name()
-    if what in ("скачать", "download", "загрузить", "установить"):
+    if what in ("установить", "install", "движок", "silero", "силеро"):
+        if silero_ready():
+            return ("silero уже установлен и работает; голоса: %s; "
+                    "основной: %s" % (", ".join(SILERO_VOICES),
+                                      voice_display(cur)))
+        silero_install_async(CHAT, name if name in SILERO_VOICES else None)
+        return ("запустил установку silero (torch ~200 МБ + модель "
+                "141 МБ, несколько минут); по готовности сам доложу Шефу "
+                "голосом. Скажи Шефу, что ставлю")
+    if what in ("скачать", "download", "загрузить"):
+        if name in SILERO_VOICES:
+            if silero_ready():
+                return ("голоса silero уже установлены (все пять сразу: "
+                        "%s) — могу переключить основной на %s"
+                        % (", ".join(SILERO_VOICES),
+                           voice_display(name)))
+            silero_install_async(CHAT, name)
+            return ("ставлю движок silero с голосом %s (torch ~200 МБ + "
+                    "модель 141 МБ); по готовности доложу Шефу голосом"
+                    % voice_display(name))
         if not name or name not in VOICE_SLUGS:
-            return ("укажи имя голоса для скачивания: "
-                    + ", ".join(VOICE_SLUGS))
+            return ("укажи имя голоса: silero — %s; piper — %s"
+                    % (", ".join(SILERO_VOICES), ", ".join(VOICE_SLUGS)))
         if cat.get(name):
             return ("голос %s уже скачан — могу переключить"
                     % voice_display(name))
@@ -874,27 +1287,25 @@ def tool_voice(args):
             or (name and not what):
         if not name:
             return "укажи имя: " + ", ".join(sorted(cat) or VOICE_SLUGS)
-        if not cat.get(name):
-            return ("голос %s не скачан — сначала «скачать»"
-                    % voice_display(name))
-        if name != cur:
-            if not cfg_set("piper_voice", cat[name]):
-                return ("НЕ получилось записать config.json — "
-                        "скажи Шефу честно, детали в jarvis.log")
-            journal("основной голос переключён мозгом: %s" % name)
-        return ("OK: основной голос — %s (проверено, config.json "
-                "обновлён). Скажи Шефу, что голос сменился, и предложи "
-                "проверить фразой «ответь голосом»"
-                % voice_display(name))
+        msg, ok = voice_switch_cmd(name)
+        if ok:
+            return ("OK: " + msg + " Скажи Шефу, что голос сменился, "
+                    "и предложи проверить фразой «ответь голосом»")
+        return msg
     # список (по умолчанию)
-    lines = ["основной голос: %s" % voice_display(cur)]
+    lines = ["основной голос: %s (движок %s)"
+             % (voice_display(cur),
+                "silero v5_6" if silero_engine_on() else "piper")]
     for nm in sorted(cat):
         lines.append("- %s%s" % (voice_display(nm),
                                  " (основной)" if nm == cur else ""))
+    if not silero_path():
+        lines.append("silero (самые натуральные голоса: %s) не установлен "
+                     "— скажи Шефу «поставь silero»"
+                     % ", ".join(SILERO_VOICES))
     can = [nm for nm in VOICE_SLUGS if nm not in cat]
     if can:
-        lines.append("можно скачать: " + ", ".join(voice_display(n)
-                                                   for n in can))
+        lines.append("piper можно скачать: " + ", ".join(can))
     return "\n".join(lines)
 
 
@@ -3329,10 +3740,11 @@ SYSTEM = """Ты — Джарвис, ИИ-ассистент Шефа, живё�
 - спать {} — выгрузить себя из VRAM (перед игрой)
 - проснись {} — загрузить себя обратно в VRAM
 
-ГОЛОС (ты УМЕЕШЬ говорить голосом — уже работает, ничего скачивать и устанавливать не надо):
-- Шеф пишет «ответь голосом» в любом месте запроса — твой финальный ответ приходит ему ГОЛОСОМ (в Telegram — голосовое сообщение, в веб-чате — озвучка ответа). Система делает это сама ещё ДО твоего ответа: ты просто отвечаешь текстом как обычно. Можно с именем: «ответь голосом дениса» — разово другим голосом.
-- голос {"что":"список|переключить|скачать","имя":"денис"} — управление голосами (piper, локально): «список» — какие есть и какой основной; «переключить» — сменить основной голос (ирина/денис/дмитрий/руслан); «скачать» — подтянуть голос из интернета (~63 МБ), если его нет. Шеф просит «поставь/смени голос», «говори другим голосом», «голос поприятнее/поестественнее» — вызывай СРАЗУ.
-- НИКОГДА не говори «не умею голосом», «голос не установлен», «надо скачать/установить голоса» — это неправда: голос встроен и работает. Не знаешь, что предложить — вызови «голос» со «список» и предложи Шефу выбор.
+ГОЛОС (ты УМЕЕШЬ говорить голосом — уже работает):
+- Шеф пишет «ответь голосом» в любом месте запроса — твой финальный ответ приходит ему ГОЛОСОМ (в Telegram — голосовое сообщение, в веб-чате — озвучка ответа). Система делает это сама ещё ДО твоего ответа: ты просто отвечаешь текстом как обычно. Можно с именем: «ответь голосом ксении» — разово другим голосом.
+- голос {"что":"список|переключить|скачать|установить","имя":"ксения"} — управление голосами. Движок silero v5_6 (основной, самые натуральные): ксения (жен., основной), ксеня и байя (жен.), евгений и айдар (муж.); резерв piper: ирина/денис/дмитрий/руслан. Шеф просит «поставь/смени голос», «говори другим голосом», «голос поприятнее/поестественнее» — вызывай СРАЗУ.
+- «поставь silero» — если движок silero ещё не установлен (голоса пока от piper), система сама поставит библиотеку и модель (~340 МБ) и доложит голосом. Предложи Шефу так и сказать.
+- НИКОГДА не говори «не умею голосом» — голос работает всегда (silero или piper). Не знаешь, что предложить — вызови «голос» со «список» и предложи Шефу выбор.
 
 ФАЙЛЫ (читай, создавай, отправляй):
 - читать_файл {"путь":"..."} — прочитать текстовый файл (txt/md/csv/json/log/скрипты; кодировки сам). Путь пришёл вместе с файлом — бери его.
@@ -4802,7 +5214,7 @@ def _brain_reply_impl(text, mode="think"):
 
 # ---------------------------------------------------------------- обработка
 
-HELP = ("🤖 *ДЖАРВИС v3.13 — ТЕКСТОВЫЙ МОЗГ*\n\n"
+HELP = ("🤖 *ДЖАРВИС v3.17 — ТЕКСТОВЫЙ МОЗГ*\n\n"
         "Мозг — Qwen3.8-27B прямо на твоей видеокарте, без облака. Пиши "
         "обычным языком — я сам пойму, что сделать.\n\n"
         "*Действия:*\n"
@@ -4819,9 +5231,10 @@ HELP = ("🤖 *ДЖАРВИС v3.13 — ТЕКСТОВЫЙ МОЗГ*\n\n"
         "*Быстрые команды:* статус, диски, место, большие, процессы, скрин, "
         "журнал, пинг, спать, проснись, выкл, перезагрузка, помощь\n\n"
         "*Голос:* «ответь голосом» в любом месте запроса — ответ придёт "
-        "голосовым сообщением (можно с именем: «ответь голосом дениса»). "
-        "«голоса» — какие есть, «голос денис» — сменить основной, "
-        "«скачай голос руслан» — подтянуть новый.\n\n"
+        "голосовым сообщением (можно с именем: «ответь голосом ксении»). "
+        "«голоса» — какие есть, «голос евгений» — сменить основной, "
+        "«поставь silero» — самые натуральные голоса: Ксения, Ксеня, "
+        "Байя, Евгений, Айдар.\n\n"
         "*Умный режим:* простое — мгновенно; слово «подумай» — глубоко "
         "думаю сам (10-30 с); сложный вопрос — сперва спрашиваю старшего "
         "брата в облаке (если подключён — он мощнее меня; подключён, "
@@ -4838,7 +5251,7 @@ HELP = ("🤖 *ДЖАРВИС v3.13 — ТЕКСТОВЫЙ МОЗГ*\n\n"
 def handle(text, chat_id):
     # v3.16.0 (Task 137, наследие приказа Шефа 09.11) «ОТВЕТЬ ГОЛОСОМ»:
     # фраза «ответь голосом [имя]» вырезается ДО разбора команд и мозга —
-    # финальный ответ уйдёт голосовым (piper). Покрывает и расшифровки
+    # финальный ответ уйдёт голосовым (silero/piper). Покрывает и расшифровки
     # голосовых, и подписи к файлам (слова Шефа мозгу не нужны).
     _orig = text
     text, _want_voice, _vname = voice_split(text)
@@ -4887,6 +5300,18 @@ def handle(text, chat_id):
     if t in ("голоса", "голос", "какие голоса", "какие голоса есть",
              "какой голос", "какой голос сейчас", "/voices"):
         return send(voices_help(), chat_id)
+    # ---- v3.17.0 (Task 138): «поставь silero» — установка до мозга ----
+    if SILERO_INSTALL_RE.match(t):
+        if silero_ready():
+            return send("✅ Silero уже стоит и работает. Голоса: %s. "
+                        "Основной — %s."
+                        % (", ".join(voice_display(n)
+                                     for n in SILERO_VOICES),
+                           voice_display(voice_cur_name())), chat_id)
+        silero_install_async(chat_id)
+        return send("⬇️ Ставлю silero: torch (~200 МБ) + модель v5_6_ru "
+                    "(141 МБ) — несколько минут. Как встанет — доложу "
+                    "голосом в новом тембре.", chat_id)
     m = VOICE_CMD_RE.match(t)
     if m:
         _w = str(m.group(1)).strip().lower()
@@ -4902,13 +5327,26 @@ def handle(text, chat_id):
         _nm = next((_f for _s, _f in VOICE_NAME_STEMS.items()
                     if _w.startswith(_s)), None)
         if _nm:
+            if _nm in SILERO_VOICES:   # v3.17.0: silero-голоса
+                if silero_ready():
+                    return send("Голоса silero уже установлены — все пять "
+                                "сразу: %s. Основной — %s; скажи «голос "
+                                "%s»."
+                                % (", ".join(SILERO_VOICES),
+                                   voice_display(voice_cur_name()), _nm),
+                                chat_id)
+                silero_install_async(chat_id, _nm)
+                return send("⬇️ Ставлю silero с голосом %s (torch ~200 МБ "
+                            "+ модель 141 МБ) — докладу голосом."
+                            % voice_display(_nm), chat_id)
             if voice_catalog().get(_nm):
                 return send("Голос %s уже скачан — скажи «голос %s», чтобы "
                             "сделать его основным."
                             % (voice_display(_nm), _nm), chat_id)
             voice_download_async(_nm, chat_id)
-            return send("⬇️ Качаю голос %s (~63 МБ). Как будет готов — "
-                        "доложу сам, послушай." % voice_display(_nm), chat_id)
+            return send("⬇️ Качаю голос %s (~63 МБ, piper). Как будет "
+                        "готов — доложу сам, послушай."
+                        % voice_display(_nm), chat_id)
         # не имя — пусть решает мозг («скачай голос поприятнее» и т.п.)
 
     # ---- v3.13.0 (Task 131): генерация удалена — честный отказ ----
@@ -5441,7 +5879,19 @@ def main():
     log("TG-канал: %s" % ("через прокси MSK + автофолбэк на прямое"
                             if TG_OPENER else "напрямую (плавающая сеть)"))
     hello = "--hello" in sys.argv
-    log("=== ДЖАРВИС старт (v3.16.0 ГОЛОС ДЖАРВИСА (Task 137, 10.11, доклад "
+    log("=== ДЖАРВИС старт (v3.17.0 SILERO (Task 138, 10.11, приказ Шефа "
+        "«Ставь silero последней версии, нужно максимально реалистичный "
+        "голос»): движок речи silero v5_6_ru — последняя модель 5-й "
+        "линейки (автоударения, омографы, интонация вопросов; 48 кГц; "
+        "синтез быстрее realtime) — 5 голосов одной моделью 141 МБ: "
+        "ксения (основной)/ксеня/байя/евгений/айдар («ответь голосом "
+        "ксении», «голос евгений»); «поставь silero» — сам ставит "
+        "torch+модель, докладывает голосом; длинные тексты — чанки со "
+        "склейкой аудио; piper — резерв (цепочка silero -> piper -> "
+        "текст); /api/tts веб-чата на общем jarvis.tts_wav; ленивая "
+        "загрузка + замок на inference; проверено в песочнице 10.11: 5 "
+        "голосов, ssml, 1327 симв -> 88 с аудио за 2,9 с); "
+        "+ v3.16.0 ГОЛОС ДЖАРВИСА (Task 137, 10.11, доклад "
         "Шефа «Джарвис отвечает что не умеет голосом и надо скачать ещё "
         "другие голоса, более натуральные и современные»): функция «Ответь "
         "голосом» (приказ 09.11) портирована на базу v3.15.0 — фраза в любом "
@@ -5541,6 +5991,12 @@ def main():
         "физические пиксели скриншота; v3.6.0 РОУТЕР; v3.5.0 ЗРЕНИЕ+ДАТЧИКИ; "
         "события v3.4.0; v3.3.0 (рация — удалена в v3.8.3); v3.2.1 СВЕРКА; v3.2.0 ГЛАЗА И ГОЛОС; "
         "v3.1.0 ФАЙЛЫ; законы v3.0.1; ученик v3.0; v2.3.0 МАКС) ===")
+    journal("Джарвис v3.17.0 SILERO (Task 138, 10.11, приказ Шефа «Ставь "
+            "silero последней версии, нужно максимально реалистичный "
+            "голос»): движок silero v5_6_ru — 5 голосов (ксения основной/"
+            "ксеня/байя/евгений/айдар), установка «поставь silero» "
+            "(torch+модель+конфиг, доклад голосом), длинные ответы "
+            "чанками, piper — резерв, /api/tts на общем движке")
     journal("Джарвис v3.16.0 ГОЛОС ДЖАРВИСА (Task 137, 10.11, доклад Шефа "
             "«Джарвис отвечает что не умеет голосом и надо скачать ещё "
             "другие голоса, более натуральные и современные»): «ответь "
