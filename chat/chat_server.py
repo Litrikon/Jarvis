@@ -52,6 +52,16 @@ v3.13 (Task 131): генерация изображений удалена по 
   первом шаге (думание Шефу не показываем); авто-сложное при наличии
   cloud_api_key и явное «спроси у старших» — облачный старший брат
   (jarvis.cloud_ask), отвечает даже при спящем локальном мозге (игра).
+v3.16 (Task 137) «ОТВЕТЬ ГОЛОСОМ» (доклад Шефа 10.11 «Джарвис отвечает
+  что не умеет голосом и надо скачать ещё другие голоса, более
+  натуральные и современные»): фраза «ответь голосом [имя]» вырезается
+  на сервере (страховка клиента), в стрим уходит событие "voice" —
+  клиент озвучивает финальный ответ через /api/tts ДАЖЕ при выключенной
+  кнопке 🔊 (разовая команда, не переключатель); лимит озвучки
+  600 -> 1000 символов; /api/tts понимает &voice=денис (разовый голос);
+  голоса переключаются живой правкой config.json — /api/tts перечитывает
+  его по mtime (смена из Telegram-процесса доезжает без рестарта).
+
 """
 import json, os, sys, time, base64, threading, traceback
 import re
@@ -286,14 +296,26 @@ class Handler(BaseHTTPRequestHandler):
             # v3.1.1 (Task 97): список файлов для панели браузера
             self._send_json({"ok": True, "files": _files_json()})
         elif self.path.startswith("/api/tts"):
-            # v3.4.0 (Task 101): озвучка ответа голосом Ирины (piper)
+            # v3.4.0 (Task 101): озвучка ответа (piper)
+            # v3.16.0 (Task 137): лимит 600 -> 1000 (разовая озвучка
+            # «ответь голосом» не должна обрезаться) + выбор голоса
+            # &voice=денис + перечитывание config.json (смена основного
+            # голоса из Telegram-процесса доезжает без рестарта)
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            text = (qs.get("text") or [""])[0][:600].strip()
+            text = (qs.get("text") or [""])[0][:1000].strip()
             if not text:
                 self._send_json({"error": "пустой текст"}, 400)
                 return
+            jarvis._cfg_sync()
             exe = jarvis.CFG.get("piper_exe")
             voice = jarvis.CFG.get("piper_voice")
+            vname = (qs.get("voice") or [""])[0].strip().lower()
+            if vname:
+                for _stem, _full in jarvis.VOICE_NAME_STEMS.items():
+                    if vname.startswith(_stem):
+                        vname = _full
+                        break
+                voice = jarvis.voice_catalog().get(vname) or voice
             if not (exe and voice and os.path.isfile(exe)
                     and os.path.isfile(voice)):
                 self._send_json({"error": "piper не установлен"}, 503)
@@ -438,6 +460,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "bad request"}, 400)
             return
         message = str(req.get("message", "")).strip()[:4000]
+        # v3.16.0 (Task 137) «ОТВЕТЬ ГОЛОСОМ»: серверная страховка —
+        # клиент index.html вырезает фразу сам, но если regexp клиента
+        # промахнулся (экзотическая пунктуация) — режем здесь; чистый
+        # вопрос уходит мозгу, а клиент получит событие "voice" и
+        # озвучит финальный ответ даже при выключенной 🔊
+        _orig_msg = message
+        message, _want_voice, _vname = jarvis.voice_split(message)
         # v3.1.1 (Task 97): приложенные файлы (уже лежат в Входящих)
         clean = []
         for fd in (req.get("files") or [])[:5]:
@@ -449,7 +478,7 @@ class Handler(BaseHTTPRequestHandler):
                     clean.append((p, os.path.getsize(p)))
                 except OSError:
                     pass
-        disp = message
+        disp = _orig_msg   # зеркало видит исходный текст (с фразой)
         if clean:
             disp = ((message + "\n") if message else "") + "\n".join(
                 "📎 %s (%s)" % (os.path.basename(p), jarvis._fmt_size(sz))
@@ -483,9 +512,21 @@ class Handler(BaseHTTPRequestHandler):
                 return False
 
         try:
+            if _want_voice and not message.strip() and not clean:
+                # v3.16.0: сообщение состоит только из фразы
+                _txt = ("🎙 Что именно озвучить? Напиши вопрос и добавь "
+                        "в него «ответь голосом».")
+                jarvis.mirror_append("web", "jarvis", _txt[:400])
+                emit({"type": "done", "text": _txt})
+                return
             if not message and not clean:
                 emit({"type": "error", "text": "пустое сообщение"})
                 return
+            if _want_voice:
+                # v3.16.0: приказ голосом — клиент покажет пометку и
+                # озвучит финальный ответ даже при выключенной 🔊
+                emit({"type": "voice",
+                      "name": jarvis.voice_display(_vname) if _vname else None})
             if message in ("пинг", "/ping"):
                 jarvis.mirror_append("web", "jarvis", "🏓 локальный чат жив")
                 emit({"type": "done",
@@ -883,8 +924,8 @@ def main():
             time.sleep(0.8)
             os.startfile("http://127.0.0.1:%d" % PORT)
         threading.Thread(target=_open, daemon=True).start()
-    clog("чат-сервер запущен v3.15.0 файлы в чате + самообучение (pid %s)"
-         % os.getpid())
+    clog("чат-сервер запущен v3.16 «ответь голосом» + файлы в чате + "
+         "самообучение (pid %s)" % os.getpid())
     while True:  # v2: serve_forever может упасть — цикл перезапускает
         try:
             srv.serve_forever(poll_interval=0.5)

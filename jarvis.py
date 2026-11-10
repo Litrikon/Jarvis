@@ -194,6 +194,25 @@ v3.15.0 «САМОУЧКА» (Task 136, 08.11.2026, доклад Шефа «Он
   (4) веб-чат: файлы Джарвиса и свои вложения скачиваются прямо из
   сообщений (chat_server v3.15, события file + карточки-ссылки).
 
+v3.16.0 «ГОЛОС ДЖАРВИСА» (Task 137, 10.11.2026, доклад Шефа «Джарвис
+  отвечает что не умеет голосом и надо скачать ещё другие голоса, более
+  натуральные и современные»): (1) функция «Ответь голосом» (приказ Шефа
+  09.11, ранее жила только в невышедшей ветке v3.12.1) портирована на
+  базу v3.15.0 — фраза «ответь голосом» в любом месте запроса, финальный
+  ответ уходит ГОЛОСОВЫМ сообщением Telegram (piper → wav → ffmpeg opus
+  48k → sendVoice), любой сбой = откат на текст, ответ Шефу не теряется;
+  (2) МОЗГ ЗНАЕТ О ГОЛОСЕ — секция ГОЛОС в системном промпте + инструмент
+  «голос» (список/переключить/скачать): живой сбой 10.11 — на вопрос о
+  голосе мозг отвечал «не умею, надо скачать голоса» (в v3.15.0 функции
+  не было, а промпт молчал); (3) ЧЕТЫРЕ ГОЛОСА (piper medium, русские):
+  ирина (жен., текущий), денис/дмитрий/руслан (муж., новые, совместимость
+  с движком piper 1.2.0 проверена в песочнице 10.11): «ответь голосом
+  дениса» — разовый голос, «голос денис» — смена основного (живая правка
+  config.json + mtime-подхват вторым процессом), «голоса» — список,
+  «скачай голос руслан» — сам скачивает с HuggingFace (~63 МБ, поток);
+  (4) веб-чат: серверная страховка вырезания фразы, событие "voice" в
+  стриме, лимит озвучки 600 → 1000 символов, выбор голоса в /api/tts.
+
 Запуск: pythonw.exe jarvis.py [--hello]
 """
 import json, os, sys, time, base64, subprocess, threading, traceback, re, shutil
@@ -415,9 +434,22 @@ def tg(method, params=None, timeout=40):
                         "возвращаюсь на прокси" % TG_MODE["dfail"])
         raise
 
-def send(text, chat=None):
-    # v2.3.0: до 4 попыток с паузами — сеть до Telegram плавает, ответы
-    # терялись (send ERR 10054 в момент, когда Шеф ждал ответ)
+def send(text, chat=None, voice=False, voice_name=None):
+    """v2.3.0: до 4 попыток с паузами — сеть до Telegram плавает, ответы
+    терялись (send ERR 10054 в момент, когда Шеф ждал ответ).
+    v3.16.0 (Task 137) «ОТВЕТЬ ГОЛОСОМ»: voice=True — финальный ответ
+    уходит ГОЛОСОВЫМ сообщением (piper → ogg/opus → sendVoice); ответ
+    длиннее 1000 символов: начало голосом, хвост — текстом. Любой сбой
+    синтеза/конвертации/отправки = откат на обычный текст — ответ Шефа
+    не теряется никогда."""
+    if voice and text:
+        _head, _tail = text[:1000], text[1000:]
+        if send_voice(_head, chat, voice_name):
+            if not _tail:
+                return True
+            text = ("🎙 (начало — голосом %s, выше ⬆)\n\n"
+                    % voice_display(voice_name)) + _tail
+        # провал голоса — катимся обычным текстом (ниже)
     last = None
     for _try in range(4):
         try:
@@ -480,6 +512,391 @@ def send_document(path, caption="", chat=None):
     except Exception as e:
         log("send_document ERR: %s" % e)
         return None
+
+# ------------------------------------------------ v3.16.0 (Task 137) ГОЛОС
+
+# Фраза-триггер: «ответь голосом» в ЛЮБОМ месте запроса (любой вариант
+# глагола, любой регистр). Разделители вокруг фразы забираем с собой,
+# НО «?»/«!» ПЕРЕД фразой оставляем вопросу («какая погода? Ответь
+# голосом» -> «какая погода?»), а после фразы — забираем («Ответь
+# голосом!» -> пусто). После фразы может стоять ИМЯ голоса:
+# «ответь голосом дениса» -> разовый голос Денис.
+VOICE_RE = re.compile(
+    r'[\s,.;:\-—()«»"\']*(?:ответ(?:ить|ь|ьте)?|отвечай)'
+    r'[\s,.;:\-—()«»"\']*голосом[\s,.;:!?\-—()«»"\']*',
+    re.IGNORECASE)
+
+# стем имени голоса -> каноническое имя (дениса/денис/денису -> денис)
+VOICE_NAME_STEMS = {"дени": "денис", "дмитр": "дмитрий",
+                    "руслан": "руслан", "ирин": "ирина"}
+VOICE_SLUGS = {"денис": "denis", "дмитрий": "dmitri",
+               "руслан": "ruslan", "ирина": "irina"}
+
+# «голос денис» / «поставь голос дениса» / «переключи голос на дениса»
+VOICE_CMD_RE = re.compile(
+    r"^(?:поставь|поставить|переключи|переключить|смени|сменить|включи|"
+    r"включить|установи|установить|сделай)?\s*голос(?:\s+на)?\s+([а-яё]+)$",
+    re.IGNORECASE)
+VOICE_GET_RE = re.compile(
+    r"^(?:скачай|скачать|загрузи|загрузить|подтяни|подтянуть)\s+голос\s+([а-яё]+)$",
+    re.IGNORECASE)
+
+# откуда качаем недостающие голоса (проверено 10.11 в песочнице:
+# файлы ветки v1.0.0 читаются движком piper 1.2.0 без замен)
+VOICE_HF = ("https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/"
+            "ru/ru_RU/%s/medium/ru_RU-%s-medium")
+
+
+def _cfg_sync():
+    """v3.16.0: подхват правок config.json из ДРУГОГО процесса (TG и веб-чат
+    живут раздельно; смена голоса в одном должна дойти до второго —
+    сверяем mtime и перечитываем)."""
+    global CFG
+    try:
+        m = os.path.getmtime(CFGF)
+        if m == CFG.get("_mtime"):
+            return
+        with open(CFGF, encoding="utf-8-sig") as f:
+            fresh = json.load(f)
+        if isinstance(fresh, dict):
+            CFG["_mtime"] = m
+            for k, v in fresh.items():
+                CFG[k] = v
+    except Exception:
+        pass
+
+
+def cfg_set(key, value):
+    """v3.16.0: живая правка config.json (чтение-модификация-запись);
+    второй процесс подхватит через _cfg_sync по mtime."""
+    try:
+        with open(CFGF, encoding="utf-8-sig") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return False
+        data[key] = value
+        with open(CFGF, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        CFG.pop("_mtime", None)
+        _cfg_sync()
+        return True
+    except Exception as e:
+        log("cfg_set ERR: %s" % e)
+        return False
+
+
+def voices_dir():
+    """Папка голосов piper (рядом с текущим голосом)."""
+    v = str(CFG.get("piper_voice") or "")
+    if v:
+        return os.path.dirname(v)
+    return os.path.join(os.path.dirname(str(CFG.get("piper_exe") or "")),
+                        "voices")
+
+
+def voice_catalog():
+    """v3.16.0: {имя: путь} — все скачанные голоса в папке voices."""
+    cat = {}
+    try:
+        d = voices_dir()
+        if os.path.isdir(d):
+            for fn in os.listdir(d):
+                m = re.match(r"ru_RU-([A-Za-z]+)-medium\.onnx$", fn)
+                if m:
+                    slug = m.group(1).lower()
+                    nm = next((k for k, s in VOICE_SLUGS.items()
+                               if s == slug), slug)
+                    cat[nm] = os.path.join(d, fn)
+    except Exception:
+        pass
+    return cat
+
+
+def voice_cur_name():
+    """Имя текущего основного голоса (по пути в конфиге)."""
+    cur = str(CFG.get("piper_voice") or "")
+    m = re.match(r"ru_RU-([A-Za-z]+)-medium\.onnx$",
+                 os.path.basename(cur))
+    if m:
+        slug = m.group(1).lower()
+        return next((k for k, s in VOICE_SLUGS.items() if s == slug), slug)
+    return "ирина"
+
+
+def voice_display(name):
+    """«денис» -> «Денис»; None -> имя текущего."""
+    return str(name or voice_cur_name()).capitalize()
+
+
+def voice_split(text):
+    """v3.16.0 (Task 137): «ответь голосом [имя]» в любом месте запроса —
+    вырезаем фразу вместе с разделителями. Возврат: (чистый_текст,
+    был_приказ_голосом, имя_голоса_или_None)."""
+    if not text or not VOICE_RE.search(text):
+        return text, False, None
+    rest = VOICE_RE.sub("\x00", text)
+    name = None
+    m = re.search(r'\x00\s*(дени|дмитр|руслан|ирин)[а-яё]*'
+                  r'[\s,.;:!?\-—()«»]*', rest,
+                  re.IGNORECASE)
+    if m:
+        name = VOICE_NAME_STEMS.get(m.group(1).lower())
+        rest = rest[:m.start()] + rest[m.end():]
+    rest = rest.replace("\x00", " ")
+    return re.sub(r"[ \t]{2,}", " ", rest).strip(), True, name
+
+
+def tts_wav(text, voice_path=None, timeout=180):
+    """v3.16.0: piper -> wav (voice_path=None = основной голос).
+    None = piper не установлен/сбой."""
+    _cfg_sync()   # голос могли сменить в другом процессе
+    exe = CFG.get("piper_exe")
+    voice = voice_path or CFG.get("piper_voice")
+    if not (exe and voice and os.path.isfile(exe) and os.path.isfile(voice)):
+        log("tts: piper не установлен — голос невозможен")
+        return None
+    out = os.path.join(DATA, "voice_tts.wav")
+    try:
+        p = subprocess.run([exe, "--model", voice, "--output_file", out],
+                           input=text.encode("utf-8"),
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=timeout)
+        if p.returncode != 0 or not os.path.isfile(out) \
+                or os.path.getsize(out) < 200:
+            log("tts: синтез не удался (код %s)" % p.returncode)
+            return None
+        return out
+    except Exception as e:
+        log("tts ERR: %s" % e)
+        return None
+
+
+def send_voice(text, chat=None, voice_name=None):
+    """v3.16.0 (Task 137): голосовое сообщение Telegram.
+    piper -> wav -> ffmpeg (libopus 48k) -> sendVoice.
+    Успех = True; любой сбой = False (send откатится на текст).
+    Сказанное остаётся в истории: зеркало несёт текст голосового."""
+    wav = ogg = None
+    try:
+        cat = voice_catalog()
+        wav = tts_wav(text, cat.get(voice_name) if voice_name else None)
+        if not wav:
+            return False
+        ff = CFG.get("ffmpeg_exe")
+        if not (ff and os.path.isfile(ff)):
+            log("send_voice: ffmpeg не найден — откат на текст")
+            return False
+        ogg = wav[:-4] + ".ogg"
+        p = subprocess.run([ff, "-y", "-i", wav, "-c:a", "libopus",
+                            "-b:a", "48k", "-ar", "48000", ogg],
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=120)
+        if p.returncode != 0 or not os.path.isfile(ogg) \
+                or os.path.getsize(ogg) < 200:
+            log("send_voice: ffmpeg не сделал ogg (код %s) — откат"
+                % p.returncode)
+            return False
+        with open(ogg, "rb") as fh:
+            content = fh.read()
+        boundary = "----JarvisBnd7MA4YWxk"
+        body = ("--%s\r\nContent-Disposition: form-data; "
+                "name=\"chat_id\"\r\n\r\n%s\r\n"
+                % (boundary, chat or CHAT)).encode("utf-8")
+        body += ("--%s\r\nContent-Disposition: form-data; "
+                 "name=\"voice\"; filename=\"voice.ogg\"\r\n"
+                 "Content-Type: audio/ogg\r\n\r\n"
+                 % boundary).encode() + content + b"\r\n"
+        body += ("--%s--\r\n" % boundary).encode()
+        req = urllib.request.Request(API + "/sendVoice", data=body,
+                headers={"Content-Type": "multipart/form-data; boundary=%s"
+                         % boundary})
+        with _tg_opener().open(req, timeout=90) as resp:
+            r = json.loads(resp.read().decode())
+        if not r.get("ok"):
+            log("send_voice: Telegram отказал: %s" % str(r)[:200])
+            return False
+        mirror_append("tg", "jarvis",
+                      "🎙 (голосом %s): %s" % (voice_display(voice_name),
+                                               text[:800]))
+        journal("голосовой ответ Шефу: %d симв (piper+opus, голос %s)"
+                % (len(text), voice_display(voice_name)))
+        return True
+    except Exception as e:
+        log("send_voice ERR: %s" % e)
+        return False
+    finally:
+        for _p in (wav, ogg):   # временные файлы — в любом исходе
+            if _p:
+                try:
+                    os.remove(_p)
+                except OSError:
+                    pass
+
+
+def voice_download(name):
+    """v3.16.0: скачать голос с HuggingFace в папку voices
+    (~63 МБ onnx + json). Возврат: (ok, пояснение)."""
+    slug = VOICE_SLUGS.get(name)
+    if not slug:
+        return False, "неизвестный голос «%s»" % name
+    d = voices_dir()
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError as e:
+        return False, str(e)[:150]
+    onnx = os.path.join(d, "ru_RU-%s-medium.onnx" % slug)
+    js = onnx + ".json"
+    try:
+        for url, dst in ((VOICE_HF % (slug, slug), onnx),
+                         ((VOICE_HF % (slug, slug)) + ".json", js)):
+            if os.path.isfile(dst) and os.path.getsize(dst) > 1000:
+                continue
+            log("голос %s: качаю %s" % (name, url))
+            tmp = dst + ".part"
+            with urllib.request.urlopen(url, timeout=120) as r, \
+                    open(tmp, "wb") as f:
+                total = 0
+                while True:
+                    chunk = r.read(1 << 18)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    total += len(chunk)
+                    if total % (10 << 20) < (1 << 18):
+                        log("голос %s: %d МБ…" % (name, total >> 20))
+            if os.path.getsize(tmp) < 50000:
+                os.remove(tmp)
+                return False, "файл голоса подозрительно мал"
+            os.replace(tmp, dst)
+        journal("голос «%s» скачан из интернета" % name)
+        return True, "готово"
+    except Exception as e:
+        log("voice_download ERR: %s" % e)
+        return False, str(e)[:200]
+
+
+def voice_download_async(name, chat):
+    """Скачивание голоса в потоке — бот не замирает; по готовности
+    голос сам доложивает Шефу (голосовым сообщением в новом голосе)."""
+    def _w():
+        ok, info = voice_download(name)
+        if ok:
+            cfg_set("piper_voice", voice_catalog().get(name)
+                    or CFG.get("piper_voice"))
+            send("🎙 Голос %s скачан и включён. Слушаю."
+                 % voice_display(name), chat, voice=True, voice_name=name)
+        else:
+            send("⚠️ Не вышло скачать голос %s: %s"
+                 % (voice_display(name), info), chat)
+    threading.Thread(target=_w, daemon=True).start()
+    return None
+
+
+def voices_help():
+    """v3.16.0: список голосов для команды «голоса»."""
+    _cfg_sync()
+    cat = voice_catalog()
+    cur = voice_cur_name()
+    lines = ["🎙 Мои голоса (движок piper, локально):"]
+    for nm in sorted(cat):
+        lines.append("%s %s" % ("★" if nm == cur else "•",
+                                voice_display(nm)))
+    if not cat:
+        lines.append("(папка голосов пуста — скажи «скачай голос ирина»)")
+    can = [nm for nm in ("денис", "дмитрий", "руслан", "ирина")
+           if nm not in cat]
+    if can:
+        lines.append("Можно скачать: " + ", ".join(voice_display(n)
+                                                   for n in can))
+    lines.append("")
+    lines.append("«ответь голосом …» — мой ответ голосом (разово);")
+    lines.append("«ответь голосом дениса …» — разово голосом Дениса;")
+    lines.append("«голос денис» — сменить основной голос.")
+    return "\n".join(lines)
+
+
+def voice_switch_cmd(word):
+    """v3.16.0: смена основного голоса по команде Шефа.
+    Возврат: (текст, имя_нового_голоса или None)."""
+    _cfg_sync()
+    w = str(word or "").strip().lower()
+    name = None
+    for stem, full in VOICE_NAME_STEMS.items():
+        if w.startswith(stem):
+            name = full
+            break
+    cat = voice_catalog()
+    if not name:
+        return ("Не понял голос «%s». Есть: %s; можно скачать: %s."
+                % (word, ", ".join(sorted(cat)) or "—",
+                   ", ".join(VOICE_SLUGS)), None)
+    if not cat.get(name):
+        return ("Голос %s ещё не скачан. Скажи «скачай голос %s» — "
+                "подтяну из интернета (~63 МБ)."
+                % (voice_display(name), name), None)
+    if name == voice_cur_name():
+        return ("Голос %s и так основной." % voice_display(name), name)
+    if not cfg_set("piper_voice", cat[name]):
+        return ("Не смог записать выбор в config.json — смотри jarvis.log.",
+                None)
+    journal("основной голос переключён по команде Шефа: %s" % name)
+    return ("🎙 Основной голос теперь %s. Слушаю." % voice_display(name),
+            name)
+
+
+def tool_voice(args):
+    """v3.16.0 (Task 137): инструмент мозга «голос» — список/переключить/
+    скачать. Мозг вызовет сам, когда Шеф просит голос погромче/потеплее."""
+    _cfg_sync()
+    what = str(args.get("что") or args.get("what") or args.get("действие")
+               or "").strip().lower()
+    name = str(args.get("имя") or args.get("name") or args.get("голос")
+               or "").strip().lower()
+    if name:
+        for stem, full in VOICE_NAME_STEMS.items():
+            if name.startswith(stem):
+                name = full
+                break
+    cat = voice_catalog()
+    cur = voice_cur_name()
+    if what in ("скачать", "download", "загрузить", "установить"):
+        if not name or name not in VOICE_SLUGS:
+            return ("укажи имя голоса для скачивания: "
+                    + ", ".join(VOICE_SLUGS))
+        if cat.get(name):
+            return ("голос %s уже скачан — могу переключить"
+                    % voice_display(name))
+        voice_download_async(name, CHAT)
+        return ("скачиваю голос %s (~63 МБ из интернета, пару минут); "
+                "по готовности сам доложу Шефу голосовым сообщением"
+                % voice_display(name))
+    if what in ("переключить", "поставить", "сменить", "включить", "switch") \
+            or (name and not what):
+        if not name:
+            return "укажи имя: " + ", ".join(sorted(cat) or VOICE_SLUGS)
+        if not cat.get(name):
+            return ("голос %s не скачан — сначала «скачать»"
+                    % voice_display(name))
+        if name != cur:
+            if not cfg_set("piper_voice", cat[name]):
+                return ("НЕ получилось записать config.json — "
+                        "скажи Шефу честно, детали в jarvis.log")
+            journal("основной голос переключён мозгом: %s" % name)
+        return ("OK: основной голос — %s (проверено, config.json "
+                "обновлён). Скажи Шефу, что голос сменился, и предложи "
+                "проверить фразой «ответь голосом»"
+                % voice_display(name))
+    # список (по умолчанию)
+    lines = ["основной голос: %s" % voice_display(cur)]
+    for nm in sorted(cat):
+        lines.append("- %s%s" % (voice_display(nm),
+                                 " (основной)" if nm == cur else ""))
+    can = [nm for nm in VOICE_SLUGS if nm not in cat]
+    if can:
+        lines.append("можно скачать: " + ", ".join(voice_display(n)
+                                                   for n in can))
+    return "\n".join(lines)
+
 
 def typing(chat=None):
     try:
@@ -2912,6 +3329,11 @@ SYSTEM = """Ты — Джарвис, ИИ-ассистент Шефа, живё�
 - спать {} — выгрузить себя из VRAM (перед игрой)
 - проснись {} — загрузить себя обратно в VRAM
 
+ГОЛОС (ты УМЕЕШЬ говорить голосом — уже работает, ничего скачивать и устанавливать не надо):
+- Шеф пишет «ответь голосом» в любом месте запроса — твой финальный ответ приходит ему ГОЛОСОМ (в Telegram — голосовое сообщение, в веб-чате — озвучка ответа). Система делает это сама ещё ДО твоего ответа: ты просто отвечаешь текстом как обычно. Можно с именем: «ответь голосом дениса» — разово другим голосом.
+- голос {"что":"список|переключить|скачать","имя":"денис"} — управление голосами (piper, локально): «список» — какие есть и какой основной; «переключить» — сменить основной голос (ирина/денис/дмитрий/руслан); «скачать» — подтянуть голос из интернета (~63 МБ), если его нет. Шеф просит «поставь/смени голос», «говори другим голосом», «голос поприятнее/поестественнее» — вызывай СРАЗУ.
+- НИКОГДА не говори «не умею голосом», «голос не установлен», «надо скачать/установить голоса» — это неправда: голос встроен и работает. Не знаешь, что предложить — вызови «голос» со «список» и предложи Шефу выбор.
+
 ФАЙЛЫ (читай, создавай, отправляй):
 - читать_файл {"путь":"..."} — прочитать текстовый файл (txt/md/csv/json/log/скрипты; кодировки сам). Путь пришёл вместе с файлом — бери его.
 - мои_файлы {"сколько":"10"} — последние полученные и выгруженные файлы с полными путями.
@@ -3503,6 +3925,9 @@ def _tool_exec_core(name, args):
             return cmd_processes()
         if name == "журнал":
             return cmd_journal()
+        if name in ("голос", "голоса", "озвучка", "tts"):
+            # v3.16.0 (Task 137): голоса — список/переключить/скачать
+            return tool_voice(args)
         if name == "датчики":
             return cmd_sensors()
         if name == "роутер":
@@ -4393,6 +4818,10 @@ HELP = ("🤖 *ДЖАРВИС v3.13 — ТЕКСТОВЫЙ МОЗГ*\n\n"
         "после. Ярлыки на рабочем столе: «Освободить видеокарту» / «Вернуть мозг».\n\n"
         "*Быстрые команды:* статус, диски, место, большие, процессы, скрин, "
         "журнал, пинг, спать, проснись, выкл, перезагрузка, помощь\n\n"
+        "*Голос:* «ответь голосом» в любом месте запроса — ответ придёт "
+        "голосовым сообщением (можно с именем: «ответь голосом дениса»). "
+        "«голоса» — какие есть, «голос денис» — сменить основной, "
+        "«скачай голос руслан» — подтянуть новый.\n\n"
         "*Умный режим:* простое — мгновенно; слово «подумай» — глубоко "
         "думаю сам (10-30 с); сложный вопрос — сперва спрашиваю старшего "
         "брата в облаке (если подключён — он мощнее меня; подключён, "
@@ -4407,9 +4836,21 @@ HELP = ("🤖 *ДЖАРВИС v3.13 — ТЕКСТОВЫЙ МОЗГ*\n\n"
         "Или просто поговори со мной 😊")
 
 def handle(text, chat_id):
+    # v3.16.0 (Task 137, наследие приказа Шефа 09.11) «ОТВЕТЬ ГОЛОСОМ»:
+    # фраза «ответь голосом [имя]» вырезается ДО разбора команд и мозга —
+    # финальный ответ уйдёт голосовым (piper). Покрывает и расшифровки
+    # голосовых, и подписи к файлам (слова Шефа мозгу не нужны).
+    _orig = text
+    text, _want_voice, _vname = voice_split(text)
+    if _want_voice and not text.strip():
+        return send("🎙 Слушаю! Что озвучить? Повтори вопрос и добавь "
+                    "в него «ответь голосом».", chat_id)
     t = text.strip().lower()
-    log("cmd: " + t[:80])
-    mirror_append("tg", "boss", text)
+    log("cmd: " + t[:80] + (" [голосом%s]"
+                            % (" " + _vname if _vname else "")
+                            if _want_voice else ""))
+    # зеркало видит исходный текст (с фразой) — честная запись сказанного
+    mirror_append("tg", "boss", _orig)
     if PENDING["action"] and time.time() - PENDING["ts"] < 120:
         if t in ("да", "yes", "ок", "ok", "подтверждаю", "confirm"):
             return send(power_do(PENDING["action"]), chat_id)
@@ -4419,27 +4860,56 @@ def handle(text, chat_id):
         PENDING["action"] = None
     # ---- точные быстрые команды (всё остальное решает мозг) ----
     if t in ("/start", "/help") or t in ("помощь", "хелп", "help", "начало"):
-        return send(HELP, chat_id)
+        return send(HELP, chat_id, voice=_want_voice)
     if t in ("статус", "/status", "стат"):
-        return send(cmd_status(), chat_id)
+        return send(cmd_status(), chat_id, voice=_want_voice)
     if t in ("диски", "/disks", "smart", "смарт"):
-        return send(cmd_disks(), chat_id)
+        return send(cmd_disks(), chat_id, voice=_want_voice)
     if t in ("место", "/space", "свободное место"):
-        return send(cmd_space(), chat_id)
+        return send(cmd_space(), chat_id, voice=_want_voice)
     if t in ("процессы", "/ps", "проц"):
-        return send(cmd_processes(), chat_id)
+        return send(cmd_processes(), chat_id, voice=_want_voice)
     if t in ("журнал", "лог"):
-        return send(cmd_journal(), chat_id)
+        return send(cmd_journal(), chat_id, voice=_want_voice)
     if t in ("пинг", "/ping", "живой"):
         return send("🏓 Джарвис жив. Аптайм процесса: %s" %
-                    time.strftime("%H:%M:%S", time.gmtime(time.time() - BIRTH)), chat_id)
+                    time.strftime("%H:%M:%S", time.gmtime(time.time() - BIRTH)),
+                    chat_id, voice=_want_voice)
     if t.startswith("скрин") or t == "/shot":
         r = cmd_shot()
         if r:
-            send(r, chat_id)
+            send(r, chat_id, voice=_want_voice)
         return
     if t.startswith("больш"):
-        return send(cmd_bigfolders(), chat_id)
+        return send(cmd_bigfolders(), chat_id, voice=_want_voice)
+
+    # ---- v3.16.0 (Task 137): голоса — команды до мозга ----
+    if t in ("голоса", "голос", "какие голоса", "какие голоса есть",
+             "какой голос", "какой голос сейчас", "/voices"):
+        return send(voices_help(), chat_id)
+    m = VOICE_CMD_RE.match(t)
+    if m:
+        _w = str(m.group(1)).strip().lower()
+        _nm = next((_f for _s, _f in VOICE_NAME_STEMS.items()
+                    if _w.startswith(_s)), None)
+        if _nm:   # слово — имя голоса: команда наша
+            _msg, _ok = voice_switch_cmd(_nm)
+            return send(_msg, chat_id, voice=bool(_ok), voice_name=_ok)
+        # не имя («поприятнее» и т.п.) — решает мозг (инструмент «голос»)
+    m = VOICE_GET_RE.match(t)
+    if m:
+        _w = str(m.group(1)).strip().lower()
+        _nm = next((_f for _s, _f in VOICE_NAME_STEMS.items()
+                    if _w.startswith(_s)), None)
+        if _nm:
+            if voice_catalog().get(_nm):
+                return send("Голос %s уже скачан — скажи «голос %s», чтобы "
+                            "сделать его основным."
+                            % (voice_display(_nm), _nm), chat_id)
+            voice_download_async(_nm, chat_id)
+            return send("⬇️ Качаю голос %s (~63 МБ). Как будет готов — "
+                        "доложу сам, послушай." % voice_display(_nm), chat_id)
+        # не имя — пусть решает мозг («скачай голос поприятнее» и т.п.)
 
     # ---- v3.13.0 (Task 131): генерация удалена — честный отказ ----
     if GEN_GONE_RE.search(text):
@@ -4484,9 +4954,11 @@ def handle(text, chat_id):
             if c_ans:
                 hist_append(text, "[старшие, мозг спал] " + c_ans[:900])
                 return send("🛰 (локальный мозг спит — игра? Старшие "
-                            "ответили так:)\n\n" + _strip_md(c_ans), chat_id)
+                            "ответили так:)\n\n" + _strip_md(c_ans),
+                            chat_id, voice=_want_voice, voice_name=_vname)
             return send("😴 Мозг спит, а старшие не на связи (%s). "
-                        "«проснись» — подниму локальный." % c_err[:60], chat_id)
+                        "«проснись» — подниму локальный." % c_err[:60],
+                        chat_id, voice=_want_voice, voice_name=_vname)
         why = " — идёт игра, сам вернусь после её закрытия" if LLM_PROC.get("reason") == "game" else ""
         return send("😴 Мозг спит — видеопамять свободна%s. Быстрые команды работают. "
                     "«проснись» — загружу обратно." % why, chat_id)
@@ -4496,7 +4968,8 @@ def handle(text, chat_id):
     try:
         ans = brain_reply(text.strip(), _mode)
         if ans:
-            send(ans, chat_id)
+            # v3.16.0: голосом по фразе (имя — разовый голос, иначе основной)
+            send(ans, chat_id, voice=_want_voice, voice_name=_vname)
     except Exception:
         log("brain ERR:\n" + traceback.format_exc())
         send("⚠️ Мозг споткнулся — записал в лог.", chat_id)
@@ -4968,7 +5441,24 @@ def main():
     log("TG-канал: %s" % ("через прокси MSK + автофолбэк на прямое"
                             if TG_OPENER else "напрямую (плавающая сеть)"))
     hello = "--hello" in sys.argv
-    log("=== ДЖАРВИС старт (v3.15.0 САМОУЧКА (Task 136, 08.11, доклад Шефа "
+    log("=== ДЖАРВИС старт (v3.16.0 ГОЛОС ДЖАРВИСА (Task 137, 10.11, доклад "
+        "Шефа «Джарвис отвечает что не умеет голосом и надо скачать ещё "
+        "другие голоса, более натуральные и современные»): функция «Ответь "
+        "голосом» (приказ 09.11) портирована на базу v3.15.0 — фраза в любом "
+        "месте запроса, финальный ответ голосовым сообщением Telegram "
+        "(piper → wav → ffmpeg opus 48k → sendVoice), сбой любого звена = "
+        "откат на текст, ответы длиннее 1000 символов = начало голосом + "
+        "хвост текстом; МОЗГ ЗНАЕТ о голосе (секция ГОЛОС в промпте + "
+        "инструмент «голос»: список/переключить/скачать) — «не умею "
+        "голосом, скачай голоса» больше не отвечает; 4 голоса piper "
+        "medium: ирина/денис/дмитрий/руслан («ответь голосом дениса» — "
+        "разово, «голос денис» — сменить основной живой правкой "
+        "config.json с mtime-подхватом вторым процессом, «голоса» — "
+        "список, «скачай голос …» — сам тянет с HuggingFace; "
+        "совместимость новых голосов с движком piper 1.2.0 проверена в "
+        "песочнице 10.11); веб-чат: фраза режется и сервером, ответ "
+        "озвучивается даже при выключенной 🔊, лимит /api/tts 600 → 1000, "
+        "выбор голоса параметром; + v3.15.0 САМОУЧКА (Task 136, 08.11, доклад Шефа "
         "«Он что не умеет делать запросы по API, научи его или пусть сам "
         "научится вообще надо сделать ему самообучение, возможно при поиске "
         "в интернете или при удачном опыте»): (1) НОВЫЙ ИНСТРУМЕНТ «запрос» — "
@@ -5051,6 +5541,15 @@ def main():
         "физические пиксели скриншота; v3.6.0 РОУТЕР; v3.5.0 ЗРЕНИЕ+ДАТЧИКИ; "
         "события v3.4.0; v3.3.0 (рация — удалена в v3.8.3); v3.2.1 СВЕРКА; v3.2.0 ГЛАЗА И ГОЛОС; "
         "v3.1.0 ФАЙЛЫ; законы v3.0.1; ученик v3.0; v2.3.0 МАКС) ===")
+    journal("Джарвис v3.16.0 ГОЛОС ДЖАРВИСА (Task 137, 10.11, доклад Шефа "
+            "«Джарвис отвечает что не умеет голосом и надо скачать ещё "
+            "другие голоса, более натуральные и современные»): «ответь "
+            "голосом [имя]» озвучивает финальный ответ (Telegram — "
+            "sendVoice piper+opus; веб-чат — /api/tts даже при выключенной "
+            "🔊); мозг теперь ЗНАЕТ о голосе (промпт + инструмент «голос»: "
+            "список/переключить/скачать); голоса: ирина (основной) + "
+            "денис/дмитрий/руслан; смена основного — живая правка "
+            "config.json, оба процесса подхватывают по mtime")
     journal("Джарвис v3.14.4 РУКИ ОБУЧЕНЫ (Task 134, 08.11, приказ Шефа "
             "«научи его движению мыши, нажатию кнопок и вводу текста»): "
             "«печатать» умеет обходить кареточный шлюз для WinUI-приложений "

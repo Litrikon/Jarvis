@@ -168,7 +168,7 @@
 </header>
 <div id="chat"></div>
 <div id="chips"></div>
-<div class="hint">Enter — отправить · Shift+Enter — новая строка · файлы: 📎, перетаскиванием или Ctrl+V · голос: 🎤 (Esc — отмена) · озвучка: 🔊</div>
+<div class="hint">Enter — отправить · Shift+Enter — новая строка · файлы: 📎, перетаскиванием или Ctrl+V · голос: 🎤 (Esc — отмена) · озвучка: 🔊 или «ответь голосом» в запросе (можно с именем: «ответь голосом дениса»)</div>
 <form id="f">
   <button id="attach" type="button" title="Прикрепить файлы">📎</button>
   <button id="mic" type="button" title="Голосовой ввод">🎤</button>
@@ -496,13 +496,17 @@ function stopRec(cancel){
 
 micBtn.addEventListener("click", micToggle);
 
-/* ---------- v3.4.0 (Task 101): озвучка ответов 🔊 (Ирина, piper) ---------- */
+/* ---------- озвучка: 🔊 (постоянно) + «ответь голосом» (разово) ----------
+   v3.4.0 (Task 101): кнопка 🔊 (piper). v3.16 (Task 137): фраза
+   «ответь голосом [имя]» в любом месте запроса — ответ озвучивается
+   РАЗОВО даже при выключенной 🔊; лимит 600 -> 1000 символов;
+   &voice=имя — разовый голос (денис/дмитрий/руслан/ирина). */
 let ttsOn = localStorage.getItem("tts") === "1";
 const speakBtn = document.getElementById("speak");
 function ttsPaint(){
   speakBtn.textContent = ttsOn ? "🔊" : "🔇";
-  speakBtn.title = ttsOn ? "Озвучка ответов включена (голос Ирины) — выключить"
-                        : "Озвучка ответов голосом Ирины — включить";
+  speakBtn.title = ttsOn ? "Озвучка всех ответов — выключить"
+                        : "Озвучка всех ответов — включить";
 }
 function ttsToggle(){
   ttsOn = !ttsOn;
@@ -512,12 +516,35 @@ function ttsToggle(){
 }
 async function speakFinal(text){
   if (!ttsOn || !text) return;
+  await speakForced(text, null);
+}
+async function speakForced(text, voice){   /* v3.16: разовая озвучка «ответь голосом» */
+  if (!text) return;
   try {
-    const r = await fetch("/api/tts?text=" + encodeURIComponent(text.slice(0, 600)));
+    let u = "/api/tts?text=" + encodeURIComponent(text.slice(0, 1000));
+    if (voice) u += "&voice=" + encodeURIComponent(voice);
+    const r = await fetch(u);
     if (!r.ok) return;
     const b = await r.blob();
     new Audio(URL.createObjectURL(b)).play();
   } catch(e) {}
+}
+/* v3.16 (Task 137): «ответь голосом [имя]» — вырезаем ДО отправки
+   (синхронно с jarvis.voice_split: «?»/«!» перед фразой остаются вопросу;
+   сервер — страховка, если клиентский regexp промахнулся) */
+const VOICE_RE = /[\s,.;:\-—()«»"']*(?:ответ(?:ить|ь|ьте)?|отвечай)[\s,.;:\-—()«»"']*голосом[\s,.;:!?\-—()«»"']*/gi;
+const VOICE_STEMS = {"дени": "денис", "дмитр": "дмитрий", "руслан": "руслан", "ирин": "ирина"};
+function voiceSplit(t){
+  if (!t || !VOICE_RE.test(t)) return [t, false, null];
+  let rest = t.replace(VOICE_RE, "\x00");
+  let name = null;
+  const m = rest.match(/[\x00]\s*(дени|дмитр|руслан|ирин)[а-яё]*[\s,.;:!?\-—()«»]*/i);
+  if (m){
+    name = VOICE_STEMS[m[1].toLowerCase()] || null;
+    rest = rest.slice(0, m.index) + rest.slice(m.index + m[0].length);
+  }
+  rest = rest.replace(/\x00/g, " ").replace(/[ \t]{2,}/g, " ").trim();
+  return [rest, true, name];
 }
 speakBtn.addEventListener("click", ttsToggle);
 ttsPaint();
@@ -586,6 +613,17 @@ document.getElementById("fclose").addEventListener("click", () =>
 
 async function ask(text, files, disp){
   send.disabled = true;
+  /* v3.16 (Task 137): «ответь голосом [имя]» — вырезаем до отправки,
+     ответ озвучим разово (даже при выключенной 🔊) */
+  let wantVoice = false, vName = null;
+  [text, wantVoice, vName] = voiceSplit(text);
+  if (wantVoice && !text && !(files || []).length){
+    addMsg("say", "🎙 Что именно озвучить? Напиши вопрос и добавь в него «ответь голосом».");
+    send.disabled = false;
+    return;
+  }
+  if (wantVoice)
+    addMsg("say", "🔊 Озвучу ответ голосом " + ((vName || "основным")[0].toUpperCase() + (vName || "основным").slice(1)));
   const bubble = addMsg("jarvis", "");
   const cursor = document.createElement("span");
   cursor.className = "typing-cursor";
@@ -620,6 +658,7 @@ async function ask(text, files, disp){
         else if (ev.type === "tool"){ cursor.remove(); addMsg("say", "🛠 инструмент: " + ev.name); bubble.appendChild(cursor); }
         else if (ev.type === "image"){ cursor.remove(); addImg(ev.b64); bubble.appendChild(cursor); }
         else if (ev.type === "file"){ cursor.remove(); turnFiles.push(ev); addFilesToBubble(bubble, [ev]); bubble.appendChild(cursor); }
+        else if (ev.type === "voice"){ wantVoice = true; if (ev.name) vName = ev.name.toLowerCase(); }  /* v3.16: сервер подтвердил приказ голосом */
         else if (ev.type === "waiting"){ dot.className = "dot wait"; statusEl.textContent = "загружаю мозг в видеопамять…"; }
         else if (ev.type === "done"){ acc = ev.text || acc; }
         else if (ev.type === "error"){ hadError = true; cursor.remove(); addMsg("err", "⚠️ " + ev.text); }
@@ -633,7 +672,8 @@ async function ask(text, files, disp){
     history.push({role:"user", content: disp || text, files: (files || []).map(fl => ({path: fl.path, name: fl.name, size: fl.size}))});
     history.push({role:"assistant", content:acc, files: turnFiles.map(f => ({path: f.path, name: f.name, size: f.size}))});
     saveHist();
-    speakFinal(acc);
+    if (wantVoice) speakForced(acc, vName);   /* v3.16: разовая озвучка приказом */
+    else speakFinal(acc);
   }
   cacheFiles();   /* обновить кэш — новые файлы появятся и в зеркале */
   send.disabled = false;
