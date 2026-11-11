@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ДЖАРВИС v2.2 — персональный агент на ПК2 (ПК2).
+ДЖАРВИС — персональный агент на ПК2 (Windows).
 Фаза 1: Telegram-пульт + мониторинг (сохранена полностью).
 Фаза 2: МОЗГ — Qwen3.8-27B локально через llama-server (ROCm/HIP на RX 9070 XT):
   - свободное общение в Telegram: ЛЮБАЯ фраза идёт мозгу (не только ключевые слова)
@@ -271,9 +271,17 @@ v3.17.2 «САМОПРОВЕРКА ЖДЁТ МОЗГ» (Task 144, 11.11.2026, п
   честный SKIP (ждать нечего); не поднялся за окно — тревога
   настоящая, Шефу приходит по делу.
 
+v3.17.3 «ГИГИЕНА ПУБЛИЧНОГО РЕПО» (Task 146, 11.11.2026, доклад Шефа
+  «копия на Гитхабе публичная, проверь чтобы никаких моих данных там
+  не было»): аудит публичного гита (анонимный клон, HEAD + вся история
+  коммитов, 22 паттерна) — кредитенциалов нет нигде; из кода убраны
+  хардкоды имени ПК и пользователя Windows (socket.gethostname() и
+  %USERNAME% из ОС в рантайме), история гита переписана без этих
+  следов.
+
 Запуск: pythonw.exe jarvis.py [--hello]
 """
-import json, os, sys, time, base64, subprocess, threading, traceback, re, shutil
+import json, os, sys, time, base64, subprocess, threading, traceback, re, shutil, socket
 import urllib.request, urllib.parse, urllib.error
 import ctypes
 try:  # v3.3.0: физические пиксели экрана — 4K@200% без виртуализации
@@ -283,6 +291,9 @@ except Exception:
         ctypes.windll.user32.SetProcessDPIAware()
     except Exception:
         pass
+
+HOSTNAME = socket.gethostname()  # v3.17.3: имя ПК из ОС — хардкода (и в гите) нет
+WIN_USER = os.environ.get("USERNAME") or "user"  # v3.17.3: пользователь Windows из ОС
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(BASE, "data")
@@ -328,9 +339,9 @@ LLM_URL = CFG.get("llm_url", "http://127.0.0.1:1234")
 MODEL_ID = CFG.get("model_id", "qwen3.8-27b")
 LLAMA_EXE = CFG.get("llama_exe", r"D:\Jarvis\llama\llama-server.exe")
 MODEL_PATH = CFG.get("model_path",
-    r"C:\Users\USER\.cache\lm-studio\models\unsloth\Qwen3.8-27B-GGUF\Qwen3.8-27B-UD-Q3_K_XL.gguf")
+    r"D:\Jarvis\models\Qwen3.8-27B-GGUF\Qwen3.8-27B-UD-Q3_K_XL.gguf")
 MMPROJ = CFG.get("mmproj_path",
-    r"C:\Users\USER\.cache\lm-studio\models\unsloth\Qwen3.8-27B-GGUF\mmproj-F16.gguf")
+    r"D:\Jarvis\models\Qwen3.8-27B-GGUF\mmproj-F16.gguf")
 LLAMA_EXE_CPU = CFG.get("llama_exe_cpu", r"D:\Jarvis\llama_cpu\llama-server.exe")
 
 # v3.2.0 «ГОЛОС»: локальный whisper.cpp (CPU) + ffmpeg для конвертации
@@ -2545,7 +2556,7 @@ foreach($p in $top){ "top=$($p.Name) $([int]($p.WorkingSet64/1MB))MB" }
             k, v = ln.split("=", 1)
             d[k.strip()] = v.strip()
     disks = [ln for ln in lines if ln.startswith("disk ")]
-    txt = "🤖 *Статус ПК2*\n"
+    txt = "🤖 *Статус %s*\n" % HOSTNAME
     txt += "⏱ Аптайм: %s\n" % d.get("uptime", "?")
     txt += "🧠 CPU: %s%%   RAM: %s\n" % (d.get("cpu", "?"), d.get("ram", "?"))
     txt += "🎮 GPU: %s\n" % d.get("gpu", "?")
@@ -2847,7 +2858,7 @@ def cmd_sensors():
             return None
         return max(c, key=lambda r: r["value"]) if biggest else c[0]
 
-    L = ["🌡 *Датчики ПК2 (HWiNFO)*", ""]
+    L = ["🌡 *Датчики %s (HWiNFO)*" % HOSTNAME, ""]
     # --- GPU ---
     parts = []
     for pat, nm in ((r"GPU Temperature|GPU Tctl|GPU Die", "GPU"),
@@ -3215,7 +3226,7 @@ def cmd_shot():
     if take_shot():
         # v3.14.2: курсор дорисован на фото + координаты в подписи
         _c = SHOT_CURSOR
-        send_photo(SHOT, caption=("📸 Экран ПК2, "
+        send_photo(SHOT, caption=("📸 Экран %s, " % HOSTNAME
                     + time.strftime("%d.%m %H:%M")
                     + ((" | 🖱 мышь: %d, %d" % (_c["x"], _c["y"]))
                        if _c else "")))
@@ -3287,12 +3298,12 @@ APPS = {
     "кристал": r"C:\Program Files\CrystalDiskInfo\DiskInfo64.exe",
     "occt": r"E:\Downloads\OCCT.exe",
     "оккт": r"E:\Downloads\OCCT.exe",
-    "utorrent": r"C:\Users\USER\AppData\Roaming\utorrent\uTorrent.exe",
-    "юторрент": r"C:\Users\USER\AppData\Roaming\utorrent\uTorrent.exe",
+    "utorrent": r"C:\Users\%s\AppData\Roaming\utorrent\uTorrent.exe" % WIN_USER,
+    "юторрент": r"C:\Users\%s\AppData\Roaming\utorrent\uTorrent.exe" % WIN_USER,
     "rdr2": r"F:\games\Red Dead Redemption 2\Launcher.exe",
     "red dead": r"F:\games\Red Dead Redemption 2\Launcher.exe",
-    "vkplay": r"C:\Users\USER\AppData\Local\GameCenter\GameCenter.exe",
-    "vk play": r"C:\Users\USER\AppData\Local\GameCenter\GameCenter.exe",
+    "vkplay": r"C:\Users\%s\AppData\Local\GameCenter\GameCenter.exe" % WIN_USER,
+    "vk play": r"C:\Users\%s\AppData\Local\GameCenter\GameCenter.exe" % WIN_USER,
     "блокнот": "notepad.exe",
     "notepad": "notepad.exe",
     "проводник": "explorer.exe",
@@ -3504,7 +3515,7 @@ $ErrorActionPreference='SilentlyContinue'
 function DirSize($p){ (Get-ChildItem -LiteralPath $p -Recurse -File -Force -EA SilentlyContinue | Measure-Object Length -Sum).Sum }
 "=== Папки пользователя на C: ==="
 foreach($d in @('Downloads','Desktop','Documents','Videos','Pictures','Music','.cache','OneDrive')){
-  $p = "C:\Users\USER\" + $d
+  $p = "C:\Users\$env:USERNAME\" + $d
   $lbl = $d
   if($d -eq '.cache'){ $lbl = '.cache (модели ИИ — мозг Джарвиса, НЕ переносить)' }
   if(Test-Path -LiteralPath $p){
@@ -3561,7 +3572,7 @@ def cmd_move(src, dst):
     src = os.path.normpath((src or "").strip().strip('"'))
     dst = os.path.normpath((dst or "").strip().strip('"'))
     slow = src.lower().rstrip("\\")
-    for _brain in (r"d:\jarvis", r"c:\users\USER\.cache"):
+    for _brain in (r"d:\jarvis", r"c:\users\%s\.cache" % WIN_USER.lower()):
         if slow == _brain or slow.startswith(_brain + "\\"):
             return ("ОТКАЗ: %s — это мой мозг/память, не переношу без явного "
                     "повторного приказа Шефа (риск потерять себя)." % src)
@@ -3601,7 +3612,7 @@ GAME_ROOTS = [p.lower() for p in CFG.get("game_paths", [
     r"D:\SteamLibrary\steamapps\common",
     r"F:\SteamLibrary\steamapps\common",
     r"F:\games",
-    r"C:\Users\USER\AppData\Local\GameCenter",
+    r"C:\Users\%s\AppData\Local\GameCenter" % WIN_USER,
 ])]
 GAME_EXCLUDE = set(CFG.get("game_exes_exclude", [])) | {
     "steam.exe", "steamwebhelper.exe", "gamecenter.exe", "epicgameslauncher.exe",
@@ -4013,12 +4024,14 @@ def prompt_fill(t):
              .replace("{skills}", ski.replace("{", "(").replace("}", ")"))
              .replace("{lessons}", lessons_block().replace("{", "(").replace("}", ")"))
              .replace("{files}", FILES_DIR)
-             .replace("{screen}", SCREEN_FACT))
+             .replace("{screen}", SCREEN_FACT)
+             .replace("{hostname}", HOSTNAME)  # v3.17.3: из ОС, не хардкод
+             .replace("{username}", WIN_USER))
 
 
 # ---------------------------------------------------------------- мозг: протокол инструментов
 
-SYSTEM = """Ты — Джарвис, ИИ-ассистент Шефа, живёшь на его ПК ПК2 (Windows 11, Ryzen, Radeon RX 9070 XT 16 ГБ, 32 ГБ ОЗУ, пользователь USER) и общаешься с ним в Telegram.
+SYSTEM = """Ты — Джарвис, ИИ-ассистент Шефа, живёшь на его ПК {hostname} (Windows 11, Ryzen, Radeon RX 9070 XT 16 ГБ, 32 ГБ ОЗУ, пользователь {username}) и общаешься с ним в Telegram.
 
 Стиль: по-русски, коротко, по делу, дружелюбно, допустим лёгкий юмор. Ты — дворецкий-технарь по имени Джарвис, а не «языковая модель». Пиши простым текстом БЕЗ markdown (без **, ##, `) — Telegram его не отображает.
 
@@ -5160,7 +5173,7 @@ def cloud_ask(text, hist, msgs=None, temperature=0.6, max_tokens=None):
                               CFG.get("cloud_max_tokens", 1200) or 1200)}
     headers = {"Content-Type": "application/json"}
     if "pollinations" in url:
-        body["referrer"] = "jarvis-pc2-ПК2"
+        body["referrer"] = "jarvis-pc2"  # v3.17.3: без имени ПК
     if key:
         headers["Authorization"] = "Bearer " + key
     _poll = "pollinations" in url  # v3.10.1: лимиты бесплатного тарифа
@@ -5463,7 +5476,7 @@ def _brain_reply_impl(text, mode="think"):
                 log("vision ERR: %s" % e)
                 desc = ""
             _cur = SHOT_CURSOR  # v3.14.2: где мышь — точные пиксели из ОС
-            send_photo(path, caption=("📸 Экран ПК2, "
+            send_photo(path, caption=("📸 Экран %s, " % HOSTNAME
                         + time.strftime("%d.%m %H:%M")
                         + ((" | 🖱 мышь: %d, %d" % (_cur["x"], _cur["y"]))
                            if _cur else "")))
@@ -6248,7 +6261,13 @@ def main():
     log("TG-канал: %s" % ("через прокси MSK + автофолбэк на прямое"
                             if TG_OPENER else "напрямую (плавающая сеть)"))
     hello = "--hello" in sys.argv
-    log("=== ДЖАРВИС старт (v3.17.2 САМОПРОВЕРКА ЖДЁТ МОЗГ (Task 144, 11.11, "
+    log("=== ДЖАРВИС старт (v3.17.3 ГИГИЕНА ПУБЛИЧНОГО РЕПО (Task 146, 11.11, "
+        "доклад Шефа «копия на Гитхабе публичная, проверь чтобы никаких "
+        "моих данных там не было»): полный аудит гита (анонимный клон, "
+        "HEAD + вся история коммитов) — кредитенциалов нет; хардкоды "
+        "имени ПК и пользователя заменены на socket.gethostname() и "
+        "%USERNAME% из ОС, история гита переписана; "
+        "+ v3.17.2 САМОПРОВЕРКА ЖДЁТ МОЗГ (Task 144, 11.11, "
         "приказ Шефа « чини»: после каждой перезагрузки Шефу прилетала "
         "ЛОЖНАЯ тревога «🔬 Самопроверка нашла проблемы: мозг» — selftest "
         "на старте проверял мозг раньше, чем его поднимал вотчдог (живой "
