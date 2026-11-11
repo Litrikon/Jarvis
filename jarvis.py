@@ -279,6 +279,17 @@ v3.17.3 «ГИГИЕНА ПУБЛИЧНОГО РЕПО» (Task 146, 11.11.2026, 
   %USERNAME% из ОС в рантайме), история гита переписана без этих
   следов.
 
+v3.18.0 «ГЛАЗА-КАМЕРА» (Task 147, 11.11.2026, приказ Шефа «научи
+  Джарвиса запускать камеру и понимать что там»): у ПК есть веб-камера
+  (Creative VF0540) — теперь это глаза Джарвиса. «камера» / «что в
+  камере» / «посмотри камерой» / «сделай фото»: снимок
+  (opencv-python-headless, DirectShow, прогрев 25 кадров — старому
+  сенсору нужно время на экспозицию) -> зрение мозга (mmproj) -> фото
+  Шефу в Telegram + описание по-русски; инструмент «камера» доступен и
+  мозгу в многошаговых задачах ({"вопрос":"..."} — точный вопрос
+  зрению). Мозг спит (игра) — честно отправлю просто фото без описания.
+  Камера занята/отключена — честная ошибка, без фантазий.
+
 Запуск: pythonw.exe jarvis.py [--hello]
 """
 import json, os, sys, time, base64, subprocess, threading, traceback, re, shutil, socket
@@ -333,7 +344,11 @@ TG_MODE = {"direct": False, "pfail": 0, "dfail": 0}
 def _tg_opener():
     if TG_OPENER and not TG_MODE["direct"]:
         return TG_OPENER
-    return urllib.request
+    # v3.18.1: раньше возвращали сам МОДУЛЬ urllib.request — у него нет
+    # метода .open() (есть urlopen) → AttributeError в каждом прямом
+    # запросе; «фолбэк на прямое соединение» не работал НИ РАЗУ, а 11.11
+    # 16:02 превратился в цикл ошибок. Возвращаем честный opener.
+    return urllib.request.build_opener()
 
 LLM_URL = CFG.get("llm_url", "http://127.0.0.1:1234")
 MODEL_ID = CFG.get("model_id", "qwen3.8-27b")
@@ -1658,8 +1673,18 @@ def http_json(url, payload, timeout=180):
     data = json.dumps(payload).encode()
     req = urllib.request.Request(url, data=data,
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        # v3.18.1: тело ошибки — в исключение. Раньше llama-server
+        # возвращал голый «HTTP Error 400: Bad Request» без причины
+        # (переполнение контекста), и в логе было нечего смотреть.
+        try:
+            detail = e.read().decode("utf-8", "replace")[:400]
+        except Exception:
+            detail = ""
+        raise RuntimeError("HTTP %s: %s" % (e.code, detail or str(e.reason))) from None
 
 def llm_health(timeout=4):
     try:
@@ -1905,7 +1930,23 @@ def llm_chat(messages, max_tokens=None, temperature=0.7, think=False):
         body = {"model": MODEL_ID, "messages": msgs, "max_tokens": max_tokens,
                 "temperature": temperature, "top_p": 0.8,
                 "chat_template_kwargs": {"enable_thinking": _think}}
-        r = http_json(LLM_URL + "/v1/chat/completions", body, timeout=420)
+        try:
+            r = http_json(LLM_URL + "/v1/chat/completions", body, timeout=420)
+        except RuntimeError as e:
+            # v3.18.1: 400 «превышен размер контекста» — раньше ход умирал
+            # ЦЕЛИКОМ без ответа Шефу («мозг споткнулся»; живые сбои 11.11
+            # 15:13-15:35 в теме прошивки роутера). Теперь: история режется
+            # до последних 4 сообщений — и один повтор.
+            if (_attempt == 1 and "HTTP 400" in str(e)
+                    and "context" in str(e).lower()):
+                log("llm_chat: 400 переполнение контекста — аварийная обрезка "
+                    "истории, повтор без думания (%s)" % str(e)[:150])
+                head = [msgs[0]] if (msgs and msgs[0].get("role") == "system") else []
+                msgs = head + msgs[-4:]
+                _think = False
+                max_tokens = min(max_tokens, 800)
+                continue
+            raise
         msg = r["choices"][0]["message"]
         raw = msg.get("content") or ""
         if not raw.strip():
@@ -2375,28 +2416,202 @@ def web_search(query, n=6):
     return text
 
 
+CHROME_EXE = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+
+
 def open_url(url):
-    """Прочитать страницу по ссылке, вернуть текст без HTML."""
+    """v3.19.0 «ССЫЛКИ ШЕФА» (Task 151): открыть ссылку и изучить страницу.
+    Путь 1 — быстрый HTTP-текст (обычные сайты). Путь 2 — сайт закрыт от
+    роботов (Ozon, Wildberries, банки: 403/антибот/пустой JS-каркас) —
+    открываю ТОЧНО эту ссылку в Chrome на экране Шефа, жду загрузку и
+    возвращаю РЕАЛЬНЫЙ адрес вкладки + текст страницы. Живой сбой 11.11
+    19:28: Шеф поделился карточкой Ozon — старая версия брала только HTTP,
+    Ozon робота не пускал, мозг подменял ссылку поиском и открыл «штаны
+    в белорусских рублях» с выдуманной ценой."""
+    url = str(url or "").strip()
+    if not url:
+        return "нет ссылки"
     if not url.startswith("http"):
         url = "https://" + url
+    title, text, blocked = "", "", True
     try:
-        data, ctype = _http_get(url, timeout=30)
+        data, ctype = _http_get(url, timeout=20)
+        enc = "utf-8"
+        m = re.search(r"charset=([\w-]+)", ctype or "", re.I)
+        if m:
+            enc = m.group(1)
+        html = data.decode(enc, "replace")
+        mt = re.search(r"(?is)<title[^>]*>(.*?)</title>", html)
+        title = re.sub(r"\s+", " ", mt.group(1)).strip() if mt else ""
+        body = re.sub(r"(?is)<(script|style|noscript|svg|head|nav|footer)"
+                      r"[^>]*>.*?</\1>", " ", html)
+        text = re.sub(r"\s+", " ",
+                      re.sub(r"(?s)<[^>]+>", " ", body)).strip()
+        low = (title + " " + text[:3000]).lower()
+        blocked = (len(text) < 250
+                   or any(s in low for s in (
+                       "antibot", "challenge-platform", "доступ ограничен",
+                       "доступ запрещен", "доступ запрещён", "каптч",
+                       "captcha", "robot check", "press & hold")))
+    except Exception:
+        blocked = True
+    if text and not blocked:
+        return ("Заголовок: %s\n\n" % title[:200]) + text[:6000]
+    # сайт не отдал текст роботу — открываю в браузере Шефа
+    return _browser_open_read(url)
+
+
+def _browser_find_chrome_title():
+    """v3.19.0: заголовок окна Chrome (не «Новая вкладка») — понять, что
+    страница догрузилась. Активное окно приоритетнее."""
+    import win_ctl
+    wins = win_ctl.windows_list(60)
+    if not isinstance(wins, str):
+        return ""
+    best = ""
+    for ln in wins.split("\n"):
+        low = ln.lower()
+        if "chrome" not in low or "«" not in ln:
+            continue
+        t = ln.split("«")[1].split("»")[0].strip()
+        if not t:
+            continue
+        tl = t.lower()
+        if "новая вкладка" in tl or "new tab" in tl:
+            continue
+        best = t
+        if "[АКТИВНО]" in ln:
+            break
+    return best
+
+
+def _browser_url():
+    """v3.19.0: РЕАЛЬНЫЙ адрес активной вкладки Chrome: активирую окно,
+    Ctrl+L (выделит адресную строку) -> Ctrl+C -> Esc -> буфер обмена."""
+    import win_ctl
+    title = _browser_find_chrome_title()
+    if not title:
+        return ""
+    r = win_ctl.window_action("activate", title)
+    if "OK" not in str(r):
+        return ""
+    time.sleep(0.7)
+    try:
+        win_ctl.key_combo("ctrl+l")
+        time.sleep(0.35)
+        win_ctl.key_combo("ctrl+c")
+        time.sleep(0.45)
+        win_ctl.key_combo("esc")
+    except Exception:
+        pass
+    u = ps_run("Get-Clipboard -Raw -ErrorAction SilentlyContinue", 60)
+    return (u or "").strip()
+
+
+def _chrome_page_text(not_url=""):
+    """v3.19.2: текст активной вкладки Chrome НАДЁЖНО: фокус-танец
+    (Ctrl+F/Esc из полей), Ctrl+A с паузой, Ctrl+C с ДЛИННОЙ паузой
+    (тяжёлые страницы кладут выделение в буфер асинхронно — на Ozon
+    0.6 с не хватило, буфер оставался со старым содержимым), ретрай,
+    защита «в буфере остался URL». Живой замер 11.11 20:04: было
+    214 симв. -> теперь ждём по-настоящему."""
+    import win_ctl
+    title = _browser_find_chrome_title()
+    if not title:
+        return ""
+    r = win_ctl.window_action("activate", title)
+    if "OK" not in str(r):
+        return ""
+    txt = ""
+    for attempt in range(2):
+        time.sleep(0.8 if attempt else 0.5)
+        try:
+            win_ctl.key_combo("ctrl+f")   # фокус из полей ввода
+            time.sleep(0.25)
+            win_ctl.key_combo("esc")      # закрыть поиск — фокус на страницу
+            time.sleep(0.25)
+        except Exception:
+            pass
+        win_ctl.key_combo("ctrl+a")
+        time.sleep(0.8 if attempt else 0.6)
+        win_ctl.key_combo("ctrl+c")
+        time.sleep(2.5 if attempt else 1.5)
+        try:
+            win_ctl.key_combo("esc")      # снять выделение
+        except Exception:
+            pass
+        txt = (ps_run("Get-Clipboard -Raw -ErrorAction SilentlyContinue", 60)
+               or "").strip()
+        if len(txt) >= 600 and txt != (not_url or "").strip():
+            break
+        # в буфере мусор/URL — вторая попытка с бОльшими паузами
+    return txt
+
+
+def _browser_open_read(url):
+    """v3.19.1 (хотфикс Task 151): открыть ТОЧНУЮ ссылку в браузере и
+    прочитать страницу. В v3.19.0 Start-Process chrome.exe молча не
+    поднимал браузер (e2e 11.11 19:56: открыть_ссылку честно признал
+    провал, но мозг без текста ушёл описывать рабочий стол с датчиками).
+    Теперь: (1) запуск через обработчик URL — тот же путь, что у
+    «запустить» (урок №14), с КОНТРОЛЕМ процесса Chrome; (2) запасной
+    запуск явным chrome.exe; (3) каждый шаг логируется; (4) фейл = честный
+    отказ с запретом выдумывать содержимое."""
+    url = str(url or "").strip()
+    if not url:
+        return "нет ссылки"
+    arg = url.replace('"', "")
+    _ps_check = ('\nStart-Sleep 3\n'
+                 '$c = Get-Process chrome -ErrorAction SilentlyContinue\n'
+                 'if ($c) { "CHROME_OK " + $c.Count } else { "CHROME_NONE" }')
+    # 1) обработчик URL (проверенный путь) + контроль процесса
+    try:
+        r1 = ps_run('Start-Process "%s"' % arg + _ps_check, 40)
     except Exception as e:
-        return "не смог открыть: %s" % e
-    enc = "utf-8"
-    m = re.search(r"charset=([\w-]+)", ctype or "", re.I)
-    if m:
-        enc = m.group(1)
-    html = data.decode(enc, "replace")
-    mt = re.search(r"(?is)<title[^>]*>(.*?)</title>", html)
-    title = re.sub(r"\s+", " ", mt.group(1)).strip() if mt else ""
-    html = re.sub(r"(?is)<(script|style|noscript|svg|head|nav|footer)[^>]*>.*?</\1>",
-                  " ", html)
-    text = re.sub(r"(?s)<[^>]+>", " ", html)
-    text = re.sub(r"\s+", " ", text).strip()
-    if not text:
-        return "страница пустая или не текстовая"
-    return ("Заголовок: %s\n\n" % title[:200]) + text[:6000]
+        r1 = "ERR %s" % e
+    log("browser-open: url-handler -> %s" % (r1 or "")[:80])
+    launched = "CHROME_OK" in (r1 or "")
+    # 2) запас: явный exe
+    if not launched:
+        try:
+            r2 = ps_run('Start-Process "%s" -ArgumentList "%s"' % (CHROME_EXE, arg)
+                        + _ps_check, 40)
+        except Exception as e:
+            r2 = "ERR %s" % e
+        log("browser-open: chrome.exe -> %s" % (r2 or "")[:80])
+        launched = "CHROME_OK" in (r2 or "")
+    if not launched:
+        return ("не смог открыть браузер (Chrome не запустился). НЕ "
+                "выдумывай содержимое страницы: честно скажи Шефу, что "
+                "сайт не открылся, и предложи ему открыть ссылку руками.")
+    # 3) ждём загрузку: заголовок окна Chrome перестаёт быть «Новая вкладка»
+    title = ""
+    for i in range(24):
+        time.sleep(1)
+        t = _browser_find_chrome_title()
+        if t and t != title:
+            title = t
+        if title and i >= 6:
+            break
+    time.sleep(3.0)          # JS-рендер: цены подгружаются позже текста
+    real_url = _browser_url()
+    txt = _chrome_page_text(not_url=real_url)
+    log("browser-open: title=%r url=%r текст=%d симв."
+        % (title[:60], (real_url or "")[:80], len(txt or "")))
+    if not txt:
+        return ("не смог прочитать текст страницы (капча или медленная "
+                "загрузка; окно: %s). Если на «скрине» видно окно браузера "
+                "с этой страницей — работай по нему; если страницы на "
+                "экране НЕТ — честно скажи Шефу, что она не открылась. "
+                "НЕ описывай рабочий стол вместо страницы (закон З6)."
+                % (title or "Chrome"))
+    head = ("САЙТ ЗАКРЫТ ОТ РОБОТОВ — открыл ссылку в браузере на экране.\n"
+            "Запрошено: %s\nРеальный адрес вкладки: %s\nОкно: %s\n\n"
+            "Текст страницы:\n" % (url, real_url or "?", title or "?"))
+    tail = ("\n\nНужны детали (цена, размер, наличие) — "
+            "«найти_на_странице» БЕЗ url (прочитаю из открытого браузера); "
+            "фото для Шефа — «скрин».")
+    return head + txt[:6000] + tail
 
 
 def _browser_page_text():
@@ -3237,6 +3452,71 @@ def cmd_shot():
                 "даже от меня. Разблокируй — и «скрин» сразу заработает.")
     return "⚠️ Скриншот не получился (ошибка захвата — детали в jarvis.log)"
 
+
+def cam_shot():
+    """v3.18.0 «ГЛАЗА-КАМЕРА» (Task 147): снимок с веб-камеры ПК.
+    Прогрев 25 кадров (старым сенсорам нужна экспозиция), перебор
+    индексов/бэкендов, честный None при неудаче — фантом запрещён."""
+    try:
+        import cv2  # opencv-python-headless (ставится отдельно)
+    except ImportError:
+        log("cam_shot: cv2 не установлен (pip install opencv-python-headless)")
+        return None
+    try:
+        for idx in (0, 1):
+            for backend in (cv2.CAP_DSHOW, cv2.CAP_ANY):
+                cap = cv2.VideoCapture(idx, backend)
+                if not cap.isOpened():
+                    cap.release()
+                    continue
+                ok, frame = False, None
+                for _ in range(25):          # прогрев экспозиции/баланса
+                    ok, frame = cap.read()
+                    time.sleep(0.1)
+                cap.release()
+                if ok and frame is not None and frame.shape[0] > 0:
+                    p = os.path.join(DATA, "cam_%s.jpg"
+                                     % time.strftime("%Y%m%d_%H%M%S"))
+                    cv2.imwrite(p, frame, [cv2.IMWRITE_JPEG_QUALITY, 88])
+                    if os.path.exists(p) and os.path.getsize(p) > 3000:
+                        return p
+        return None
+    except Exception:
+        log("cam_shot ERR:\n" + traceback.format_exc())
+        return None
+
+
+def cmd_camera(question=None):
+    """v3.18.0: камера -> фото Шефу + описание зрением (если мозг с
+    mmproj не спит). Возвращает текст для быстрой команды/инструмента."""
+    path = cam_shot()
+    if not path:
+        return ("📷 Камера: кадр не получился — камера занята другим "
+                "приложением, отключена или opencv не установлен "
+                "(pip install opencv-python-headless).")
+    desc = ""
+    if vision_available():
+        try:
+            desc = llm_vision(path, question=(str(question or "").strip() or
+                          "Опиши по-русски, что видит веб-камера ПК: кто "
+                          "или что в кадре, что вокруг, что происходит. "
+                          "Кратко, 3-6 предложений."))
+        except Exception as e:
+            log("camera vision ERR: %s" % e)
+            desc = ""
+    send_photo(path, caption=("📷 Камера, " + time.strftime("%d.%m %H:%M")))
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    journal("Камера: снимок отправлен%s"
+            % (", зрение описало" if desc else ", зрение не загружено"))
+    if desc:
+        return "📷 Фото отправил. Что видит камера:\n" + desc
+    return ("📷 Фото отправил. Зрение не загружено (мозг спит?) — "
+            "опишу, когда проснётся: «проснись».")
+
+
 def cmd_journal():
     out = ps_run(r"""
 [Console]::OutputEncoding=[Text.Encoding]::UTF8
@@ -3842,7 +4122,10 @@ def lessons_block():
     if not texts:
         texts = [L.get("text", "") for L in data[-2:]]
     by_text = {L.get("text", ""): L.get("ts", "") for L in data}
-    return "\n".join("- (%s) %s" % (by_text.get(t, ""), t)
+    # v3.18.1: уроки с полным JSON поиска раздували системный промпт —
+    # в промпте каждый урок урезаем до 500 симв. (полный текст остаётся
+    # в memory/lessons.json и в инструментах памяти)
+    return "\n".join("- (%s) %s" % (by_text.get(t, ""), str(t)[:500])
                      for t in texts if t)
 
 
@@ -4059,7 +4342,7 @@ SYSTEM = """Ты — Джарвис, ИИ-ассистент Шефа, живё�
 - запрос {"метод":"GET","url":"http://localhost:19999/api/v3/info","заголовки":{"Authorization":"Bearer <ключ>"},"тело":"..."} — ПРЯМОЙ HTTP-запрос к любому API (GET/POST/PUT/DELETE): вернёт код ответа + тело (JSON раскрывается). НЕТДАТА (http://localhost:19999/api/v3/...), роутер, любые сервисы — опрашивай ЭТИМ инструментом. Для HTTP НЕ используй PowerShell (curl/Invoke-RestMethod): их ошибки уходят в stderr и выглядят как пусто. API-ключи лежат в ПАМЯТИ (ниже) — бери оттуда, например Netdata Bearer.
 - новости {"тема":"..."} — свежие новости (пустая тема = главное в мире)
 - курсы {} — курсы валют/крипты точно (ЦБ РФ, Binance)
-- открыть_ссылку {"url":"..."} — прочитать текст страницы
+- открыть_ссылку {"url":"..."} — открыть ссылку и изучить страницу: сначала быстрый текст по HTTP; сайт закрыт от роботов (Ozon, Wildberries, банки) — сам откроет ЕЁ в Chrome на экране, дождётся загрузки и вернёт РЕАЛЬНЫЙ адрес + текст страницы (цены там же). Шеф прислал ссылку — работай ТОЛЬКО с ней
 - найти_на_странице {"что":"...","url":"..."} — найти НУЖНУЮ информацию на странице: читаю ТЕКСТ (по ссылке ИЛИ из открытого браузера) и выписываю ТОЧНЫЕ строки (название/размер/цена/сиды/дата/ссылка). Шеф просит «найди на странице/на сайте …» — это ЗНАЧИТ этот инструмент, а НЕ «скрин»: описание картинки ≠ поиск. Для поиска ПО САЙТУ открой его поисковый URL (rutracker.org/forum/tracker.php?nm=запрос, rutor.info/search/0/1/000/0/запрос) и снова найти_на_странице.
 
 ДЕЙСТВИЯ (Шеф просит действия — ДЕЙСТВУЙ сразу):
@@ -4089,6 +4372,7 @@ SYSTEM = """Ты — Джарвис, ИИ-ассистент Шефа, живё�
 - читать_файл {"путь":"..."} — прочитать текстовый файл (txt/md/csv/json/log/скрипты; кодировки сам). Путь пришёл вместе с файлом — бери его.
 - мои_файлы {"сколько":"10"} — последние полученные и выгруженные файлы с полными путями.
 - посмотреть_файл {"путь":"...","вопрос":"что именно узнать"} — картинка зрением. Без «вопрос» — общее описание; с «вопрос» — точный ответ по нему: выписать настройки (параметр=значение), прочитать текст с картинки, найти отличие. Сверяешь настройки со скриншота — сначала подгрузи скилл «настройки_скриншота».
+- камера {"вопрос":"что именно узнать"} — ВЕБ-КАМЕРА ПК: живой снимок зрением, фото уйдёт Шефу, тебе вернётся описание. «включи камеру», «что в камере», «посмотри камерой», «сделай фото» — вызывай СРАЗУ; «вопрос» — точный запрос зрению («есть ли кто в комнате», «что за предмет на столе»).
 - расшифровать_файл {"путь":"..."} — аудио/видео -> текст (голосовые, mp3, mp4): локальный whisper, русский. Путь уже в сообщении — вызывай сразу и отвечай по расшифрованному тексту.
 - выгрузить_файл {"имя":"отчёт.txt","содержимое":"..."} — сохранить текстовый файл в папку выгрузки и назвать Шефу полный путь ИЗ ОТВЕТА инструмента. Пока инструмент не вызван — файла НЕ СУЩЕСТВУЕТ, «сохраню на словах» запрещено.
 - отправить_файл {"путь":"..."} — отправить Шефу файл в Telegram (любой, до ~50 МБ).
@@ -4131,7 +4415,8 @@ SYSTEM = """Ты — Джарвис, ИИ-ассистент Шефа, живё�
 7. Если действия не нужно — просто отвечай текстом без JSON.
 8. Никогда не упоминай Шефу слова «JSON» и «инструмент» — он видит только результат.
 9. Учись: после нетривиальной задачи (новое умение, ошибка и её исправление, привычка Шефа) — сразу запиши урок в память («запомнить_факт»); разобрался, как делать что-то новое, — создай скилл («записать_скилл»). Уроки-опыт (УРОКИ ниже) пишутся сами — но важный вывод всегда дублируй «запомнить_факт»: он останется навсегда, а уроки ротируются.
-10. Просьба-ДЕЙСТВИЕ = сразу инструмент-JSON в ЭТОМ ЖЕ ответе. Отвечать «сейчас сделаю», «сначала активирую, затем наберу» обычным текстом БЕЗ вызова инструмента — СТРОГО запрещено: это план, а не действие. Сначала сделай (JSON), потом докладывай результат."""
+10. Просьба-ДЕЙСТВИЕ = сразу инструмент-JSON в ЭТОМ ЖЕ ответе. Отвечать «сейчас сделаю», «сначала активирую, затем наберу» обычным текстом БЕЗ вызова инструмента — СТРОГО запрещено: это план, а не действие. Сначала сделай (JSON), потом докладывай результат.
+11. ССЫЛКА ОТ ШЕФА: сообщение содержит ссылку (http/https/www) — это приказ открыть ИМЕННО эту страницу и доложить по существу: что за товар/статья, название, цена, ключевые детали. ЗАПРЕЩЕНО подменять ссылку поиском, «похожей» страницей или выдумывать содержимое (живой провал 11.11: вместо чехла открыл штаны и назвал чужую цену). Порядок: «открыть_ссылку» с ЭТИМ адресом -> нужна конкретная цифра/строка — «найти_на_странице» без url (прочитаю из открытого браузера) -> фото по просьбе Шефа — «скрин»."""
 
 DANGER_PS = ("remove-item", "rmdir", " rd ", "del ", "erase", "format", "reg add",
              "reg delete", "reg import", "net stop", "net user", "stop-process",
@@ -4581,6 +4866,23 @@ MOUSE_FIX_MSG = ("Служебная проверка: Шеф спросил, Г
                  "текстом вместе с описанием экрана. Потом ответь Шефу "
                  "строго по факту.")
 
+# v3.19.0 (Task 151): ссылка-страж — Шеф прислал ССЫЛКУ (http/https/www),
+# а мозг ответил текстом без единого инструмента. Живой сбой 11.11 19:28:
+# Шеф поделился карточкой Ozon — Джарвис полез поиском, открыл «штаны в
+# белорусских рублях» и назвал чужую цену.
+LINK_MSG_RE = re.compile(r"(?:https?://|www\.)[^\s|»«\]\)\}<>]+", re.I)
+LINK_TOOLS = {"открыть_ссылку", "найти_на_странице", "запустить", "скрин",
+              "область", "запрос", "интернет", "run_ps"}
+LINK_FIX_MSG = ("Служебная проверка: Шеф прислал тебе ССЫЛКУ %s — но ты "
+                "ответил, не открыв её. Содержимое страницы НЕВОЗМОЖНО "
+                "знать «из головы» (закон З6: честность). Открой ИМЕННО "
+                "эту ссылку: {\"tool\":\"открыть_ссылку\",\"args\":"
+                "{\"url\":\"%s\"}} — инструмент сам откроет её (даже "
+                "сайты с антиботом, как Ozon) и вернёт текст страницы. "
+                "Потом доложи Шефу по существу: что за страница, главные "
+                "данные (название, цена, детали). НЕ подменяй ссылку "
+                "поиском или «похожей» страницей.")
+
 
 def claim_without_tool(ans, called):
     """None — всё честно. Иначе — СТРОКА-исправление: ответ заявил
@@ -4694,6 +4996,9 @@ def _tool_exec_core(name, args):
                                     or args.get("files") or ""))
         if name == "скрин":
             return "SCREENSHOT"
+        if name in ("камера", "camera"):   # v3.18.0: глаза-камера
+            return cmd_camera(str(args.get("вопрос") or args.get("question")
+                                  or "").strip() or None)
         if name == "найти":
             mask = str(args.get("mask", "*"))[:80]
             where = str(args.get("where", "D:\\"))[:150]
@@ -5304,7 +5609,10 @@ def _brain_reply_impl(text, mode="think"):
         v3.8.4: переполнение = HTTP 400 и обрыв). Режу ТОЛЬКО старую
         историю (msgs[1:1+_hist_len]), текущий обмен не трогаю."""
         nonlocal _hist_len
-        while (sum(len(m.get("content", "")) for m in ms) > 28000
+        # v3.18.1: 28К -> 15К символов: русский текст даёт ~2-2.5 символа
+        # на токен, 28К символов сами по себе = 11-14К токенов и переливают
+        # контекст 12288 ещё до системного промпта (живые 400-е 11.11).
+        while (sum(len(m.get("content", "")) for m in ms) > 15000
                and _hist_len > 0):
             ms.pop(1)
             _hist_len -= 1
@@ -5323,6 +5631,7 @@ def _brain_reply_impl(text, mode="think"):
     retried_order = False
     retried_short = False
     retried_mouse = False   # v3.14.3: мышь-страж
+    retried_link = False    # v3.19.0: ссылка-страж
     _order = bool(HANDS_ORDER_VERB_RE.search(text)
                   and HANDS_ORDER_CTX_RE.search(text))
     has_file = bool(FILE_MSG_RE.search(text) or FILE_PATH_RE.search(text))
@@ -5352,6 +5661,19 @@ def _brain_reply_impl(text, mode="think"):
                 log("mouse-guard: «где мышь» без инструмента — перезапрос")
                 msgs.append({"role": "assistant", "content": ans})
                 msgs.append({"role": "user", "content": MOUSE_FIX_MSG})
+                ans = llm_chat(_fit(msgs))
+                continue
+            # v3.19.0 (Task 151): ссылка-страж — Шеф прислал ссылку,
+            # а мозг отвечает «из головы» без единого инструмента
+            _links_in_msg = LINK_MSG_RE.findall(text)
+            if (_links_in_msg and not (called & LINK_TOOLS)
+                    and not retried_link):
+                retried_link = True
+                _lnk = _links_in_msg[0][:300]
+                log("link-guard: ссылка без открытия — перезапрос")
+                msgs.append({"role": "assistant", "content": ans})
+                msgs.append({"role": "user", "content":
+                             LINK_FIX_MSG % (_lnk, _lnk)})
                 ans = llm_chat(_fit(msgs))
                 continue
             # v3.1.0: трос — «сохранил/создал» без вызова = ложь (Task 96)
@@ -5553,7 +5875,7 @@ def _brain_reply_impl(text, mode="think"):
 
 # ---------------------------------------------------------------- обработка
 
-HELP = ("🤖 *ДЖАРВИС v3.17 — ТЕКСТОВЫЙ МОЗГ*\n\n"
+HELP = ("🤖 *ДЖАРВИС v3.18 — ТЕКСТОВЫЙ МОЗГ*\n\n"
         "Мозг — Qwen3.8-27B прямо на твоей видеокарте, без облака. Пиши "
         "обычным языком — я сам пойму, что сделать.\n\n"
         "*Действия:*\n"
@@ -5568,7 +5890,7 @@ HELP = ("🤖 *ДЖАРВИС v3.17 — ТЕКСТОВЫЙ МОЗГ*\n\n"
         "Запускаешь игру — я САМ выгружаюсь из видеопамяти и возвращаюсь "
         "после. Ярлыки на рабочем столе: «Освободить видеокарту» / «Вернуть мозг».\n\n"
         "*Быстрые команды:* статус, диски, место, большие, процессы, скрин, "
-        "журнал, пинг, спать, проснись, выкл, перезагрузка, помощь\n\n"
+        "камера, журнал, пинг, спать, проснись, выкл, перезагрузка, помощь\n\n"
         "*Голос:* «ответь голосом» в любом месте запроса — ответ придёт "
         "голосовым сообщением (можно с именем: «ответь голосом ксении»). "
         "«голоса» — какие есть, «голос евгений» — сменить основной, "
@@ -5629,6 +5951,11 @@ def handle(text, chat_id):
                     chat_id, voice=_want_voice)
     if t.startswith("скрин") or t == "/shot":
         r = cmd_shot()
+        if r:
+            send(r, chat_id, voice=_want_voice)
+        return
+    if t.startswith("камер") or t == "/cam":   # v3.18.0: глаза-камера
+        r = cmd_camera()
         if r:
             send(r, chat_id, voice=_want_voice)
         return
@@ -6261,7 +6588,48 @@ def main():
     log("TG-канал: %s" % ("через прокси MSK + автофолбэк на прямое"
                             if TG_OPENER else "напрямую (плавающая сеть)"))
     hello = "--hello" in sys.argv
-    log("=== ДЖАРВИС старт (v3.17.3 ГИГИЕНА ПУБЛИЧНОГО РЕПО (Task 146, 11.11, "
+    log("=== ДЖАРВИС старт (v3.19.2 ССЫЛКИ ШЕФА — НАДЁЖНЫЙ ТЕКСТ СТРАНИЦЫ "
+        "(Task 151, хотфикс-2 11.11: e2e показал текст=214 симв. — Ctrl+C "
+        "не успевал положить выделение тяжёлой страницы в буфер, мозг "
+        "уходил в медленный визуальный путь; теперь _chrome_page_text: "
+        "фокус-танец + Ctrl+A/Ctrl+C с длинными паузами + ретрай + "
+        "проверка «не URL ли в буфере»); "
+        "+ v3.19.1 ССЫЛКИ ШЕФА — ХОТФИКС ЗАПУСКА БРАУЗЕРА "
+        "(Task 151, хотфикс 11.11: в v3.19.0 Start-Process chrome молча не "
+        "поднимал браузер — e2e: открыть_ссылку честно признал провал, но "
+        "мозг без текста ушёл описывать рабочий стол; теперь запуск через "
+        "обработчик URL (путь «запустить», урок №14) с контролем процесса "
+        "Chrome + запасной явный chrome.exe + лог каждого шага + честный "
+        "фейл «сайт не открылся» с запретом выдумывать); "
+        "+ v3.19.0 ССЫЛКИ ШЕФА (Task 151, 11.11, доклад "
+        "Шефа «Джарвис не умеет переходить по ссылкам… научи его открывать "
+        "ссылки»): (1) «открыть_ссылку» переписан: сначала быстрый HTTP-"
+        "текст, сайт закрыт от роботов (Ozon/маркетплейсы/банки: 403, "
+        "антибот, пустой JS-каркас) -> сам открывает ТОЧНУЮ ссылку в "
+        "Chrome, ждёт загрузку, возвращает РЕАЛЬНЫЙ адрес вкладки "
+        "(Ctrl+L/Ctrl+C) + текст страницы (Ctrl+A/Ctrl+C) — подменять "
+        "ссылку поиском больше нечем и незачем; (2) ПРАВИЛО 11: ссылка от "
+        "Шефа = приказ открыть ИМЕННО её и доложить по существу (живой "
+        "сбой 11.11 19:28: карточка чехла Ozon -> «штаны в белорусских "
+        "рублях» и выдуманная цена); (3) ссылка-страж: ссылка в сообщении "
+        "+ ответ без единого инструмента = один перезапрос с рецептом "
+        "(как мышь-страж); "
+        "+ v3.18.1 СВЯЗЬ+КОНТЕКСТ-ФИКС (Task 149, 11.11, "
+        "доклад Шефа «Джарвис с ума сходит, посмотри его логи и переписку»: "
+        "(1) фолбэк ТГ на прямое соединение не работал НИ РАЗУ — _tg_opener "
+        "возвращал сам модуль urllib.request без метода .open → AttributeError "
+        "циклом (живой сбой 16:02-16:04); теперь честный build_opener; "
+        "(2) HTTP 400 мозга = ПЕРЕПОЛНЕНИЕ КОНТЕКСТА 12288: бюджет истории "
+        "28К симв. русского ≈ 11-14К токенов переливал его сам по себе "
+        "(живые сбои 15:13-15:35 — «споткнулся» без ответа): бюджет 15К "
+        "симв., уроки в промпте урезаны до 500 симв., на 400 — аварийная "
+        "обрезка истории + повтор, тело ошибки пишется в лог; "
+        "+ v3.18.0 ГЛАЗА-КАМЕРА (Task 147, 11.11, приказ "
+        "Шефа «научи Джарвиса запускать камеру и понимать что там»): "
+        "веб-камера ПК — снимок (opencv, прогрев экспозиции) -> зрение "
+        "(mmproj) -> фото Шефу + описание; команды «камера»/«что в камере»/"
+        "«сделай фото», инструмент для мозга; "
+        "+ v3.17.3 ГИГИЕНА ПУБЛИЧНОГО РЕПО (Task 146, 11.11, "
         "доклад Шефа «копия на Гитхабе публичная, проверь чтобы никаких "
         "моих данных там не было»): полный аудит гита (анонимный клон, "
         "HEAD + вся история коммитов) — кредитенциалов нет; хардкоды "
