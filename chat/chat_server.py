@@ -191,10 +191,17 @@ def _web_allowed(p):
 
 
 def llm_stream(messages, max_tokens=800, temperature=0.7, think=False):
-    """v3.10 (Task 128): think=True — включаю размышления модели (умный
+    """v3.25.1 (Task 165): сообщения пакуются jarvis._pack_for_ctx —
+    как в llm_chat. Раньше веб-чат отправлял их как есть (только
+    аварийный сброс истории на 400): раздутая история + системный
+    промпт 8К токенов гарантированно ловили 400 уже на 3-4 шаге
+    инструмента. Упаковщик держит контекст 12288 и НЕ выбрасывает
+    вопрос Шефа (глюк v3.20.0 — см. jarvis._pack_for_ctx).
+    v3.10 (Task 128): think=True — включаю размышления модели (умный
     режим). reasoning_content сервера не читаем (не показываем); если
     <think> идёт прямо в content — придерживаем поток до </think>."""
-    body = {"model": jarvis.MODEL_ID, "messages": messages,
+    body = {"model": jarvis.MODEL_ID,
+            "messages": jarvis._pack_for_ctx(list(messages), max_tokens),
             "max_tokens": max_tokens, "temperature": temperature, "top_p": 0.8,
             "chat_template_kwargs": {"enable_thinking": bool(think)},
             "stream": True}
@@ -611,9 +618,11 @@ class Handler(BaseHTTPRequestHandler):
                          "\n(Служебное напоминание: это свежий вопрос — узнай "
                          "актуальные данные инструментом «новости», «курсы» или "
                          "«интернет».)")
-            # v2 (Task 89): единая история с Telegram (history.json)
+            # v2 (Task 89): единая история с Telegram (history.json);
+            # v3.25.1 (Task 165): вопрос помечен "_q" — упаковщик
+            # jarvis._pack_for_ctx не выбросит его из контекста
             msgs = ([sysmsg] + jarvis.hist_msgs(jarvis.hist_load()) +
-                    [{"role": "user", "content": utext}])
+                    [{"role": "user", "content": utext, "_q": 1}])
             final = ""
             called = set()
             _force_nothink = False  # v3.14.5b: пустой ответ после думания
