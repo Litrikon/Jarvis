@@ -494,7 +494,7 @@ class Handler(BaseHTTPRequestHandler):
         # v3.10 (Task 128): умный маршрут как в Telegram (коллега GLM — без)
         _mode = None if is_glm else jarvis.smart_mode(message)
         _want_cloud = _mode == "cloud" or (
-            _mode == "big" and (jarvis.CFG.get("cloud_api_key") or "").strip())
+            _mode == "big" and jarvis._cloud_ready())  # v3.21.0: и GigaChat
 
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
@@ -552,9 +552,10 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as e:
                     c_ans, c_err = None, str(e)
                 if c_ans:
-                    txt = "🛰 %s\n\n%s" % (
-                        "Сложный вопрос — спросил у старшего брата:"
-                        if _mode == "big" else "Спросил у старших братьев:",
+                    txt = "🛰 %s%s\n\n%s" % (
+                        "Сложный вопрос — спросил у старшего брата"
+                        if _mode == "big" else "Спросил у старших",
+                        jarvis._bro_src() + ":",   # v3.21.0: кто ответил
                         jarvis._strip_md(c_ans))
                     jarvis.hist_append(
                         disp, ("[старший брат] " if _mode == "big"

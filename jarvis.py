@@ -6,7 +6,7 @@
 Фаза 2: МОЗГ — Qwen3.8-27B локально через llama-server (ROCm/HIP на RX 9070 XT):
   - свободное общение в Telegram: ЛЮБАЯ фраза идёт мозгу (не только ключевые слова)
   - инструменты по решению LLM (JSON-протокол), до 4 подряд
-  - ИНТЕРНЕТ: поиск (DuckDuckGo) и чтение страниц
+  - ИНТЕРНЕТ: поиск (Bing RU -> DDG резерв) и чтение страниц
   - зрение: описание скриншотов (mmproj)
   - ДЕЙСТВИЯ: очистка диска от мусора, анализ «что можно перенести», перенос
     папок на другие диски, запуск/закрытие программ
@@ -294,6 +294,7 @@ v3.18.0 «ГЛАЗА-КАМЕРА» (Task 147, 11.11.2026, приказ Шефа
 """
 import json, os, sys, time, base64, subprocess, threading, traceback, re, shutil, socket
 import urllib.request, urllib.parse, urllib.error
+import ssl, uuid   # v3.21.0: GigaChat (TLS Минцифры + RqUID OAuth)
 import ctypes
 try:  # v3.3.0: физические пиксели экрана — 4K@200% без виртуализации
     ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE
@@ -1910,6 +1911,48 @@ def _strip_think(t):
             t = t.split(THINK_OPEN)[0]
     return t.strip()
 
+def _cap_content(m, cap=2200):
+    """v3.20.0: укоротить ОДНО сообщение (голова+хвост), не теряя конца."""
+    c = m.get("content")
+    if isinstance(c, str) and len(c) > cap:
+        return dict(m, content=(c[:int(cap * 0.6)] +
+                   "\n…[середина урезана, чтобы влезть в мозг]…\n" +
+                   c[-int(cap * 0.3):]))
+    return m
+
+
+def _pack_for_ctx(msgs, max_tokens):
+    """v3.20.0 (Task 152): упаковка диалога в контекст 12288 ДО отправки.
+    Замер 12.11 через /tokenize: системный промпт = 8015 токенов, русский
+    ~2.9 симв./токен — на историю+текущий ход остаётся всего ~2-3К
+    токенов, а результат инструмента до 6К симв.: каждый многошаговый
+    ход гарантированно ловил HTTP 400 и «аварийную обрезку» (живой сбой
+    11.11 20:46-21:07: восемь 400-х подряд, 8 минут, финал —
+    «дегенеративный ответ»). Теперь: (1) бюджет считается от РЕАЛЬНОГО
+    размера системного промпта; (2) срезаются старые сообщения;
+    (3) длинные режутся посередине (голова+хвост)."""
+    sysmsg = [m for m in msgs if m.get("role") == "system"]
+    rest = [m for m in msgs if m.get("role") != "system"]
+
+    def _mlen(m):
+        c = m.get("content")
+        return len(c) if isinstance(c, str) else 2500  # картинка ~тоже токены
+
+    sys_tok = sum(_mlen(m) for m in sysmsg) / 2.9
+    budget = int(max(2500, (12288 - sys_tok - max_tokens - 400) * 2.9))
+    # (1) длинные сообщения укорачиваю от старых к новым (голова+хвост)
+    for i in range(len(rest)):
+        if sum(_mlen(m) for m in rest) <= budget:
+            break
+        rest[i] = _cap_content(rest[i], 2200)
+    # (2) всё ещё не влезли — срезаю старые ШАГИ хода; первое сообщение
+    # (в brain_reply это вопрос Шефа) и два последних (свежий результат)
+    # не трогаю НИКОГДА — потерять вопрос = мозг отвечает непонятно чему
+    while (len(rest) > 3 and sum(_mlen(m) for m in rest) > budget):
+        rest.pop(1)
+    return sysmsg + rest
+
+
 def llm_chat(messages, max_tokens=None, temperature=0.7, think=False):
     """v2.2.3: если генерация оборвалась внутри блока размышлений (незакрытый
     тег) — повторяем запрос с запретом думать. Раньше это резало ответы
@@ -1927,7 +1970,9 @@ def llm_chat(messages, max_tokens=None, temperature=0.7, think=False):
     txt = ""
     _think = bool(think)
     for _attempt in (1, 2):
-        body = {"model": MODEL_ID, "messages": msgs, "max_tokens": max_tokens,
+        body = {"model": MODEL_ID,
+                "messages": _pack_for_ctx(msgs, max_tokens),
+                "max_tokens": max_tokens,
                 "temperature": temperature, "top_p": 0.8,
                 "chat_template_kwargs": {"enable_thinking": _think}}
         try:
@@ -2333,10 +2378,10 @@ def news_search(topic="", n=8):
     items = []
     try:
         items = _rss_items("https://www.bing.com/search?q=" + q +
-                           "&format=rss", n)
+                           "&format=rss&mkt=ru-RU", n)   # v3.22.3: русская выдача
     except Exception:
         pass
-    if not items:
+    if not items or _results_junky(items):   # v3.22.4: соцсетевой мусор — в web_search
         try:
             return web_search(topic + " последние новости", n)
         except Exception as e:
@@ -2347,11 +2392,138 @@ def news_search(topic="", n=8):
 
 
 def _search_bing(query, n):
+    # v3.22.3 (Task 160): +mkt=ru-RU — русская выдача вместо англ. по умолч.
+    # Живая разведка 12.11: DDG html/lite отдают капчу с утятами (202
+    # «Unfortunately, bots use DuckDuckGo too»), Google — JS-заглушку,
+    # Яндекс — SmartCaptcha, Startpage/Mojeek/SearXNG — челленджи, Brave —
+    # 429. Bing ЕДИНСТВЕННЫЙ крупный движок, отвечающий обычному HTTP-клиенту
+    # без браузера/капчи. v3.23.0: при живых API-ключах (Яндекс/Tavily)
+    # Bing — запасной после них; DDG в резерве (может очнуться после паузы).
+    # Серия 4 запросов подряд — без 429.
     return _rss_items("https://www.bing.com/search?q=" +
-                      urllib.parse.quote_plus(query) + "&format=rss", n)
+                      urllib.parse.quote_plus(query) +
+                      "&format=rss&mkt=ru-RU", n)
+
+
+def _bing_unwrap(u):
+    """v3.22.4 (Task 160): ссылки выдачи Bing идут через редирект
+    bing.com/ck/a?...&u=a1<base64url-настоящий-URL> — разворачиваем
+    в прямой URL (иначе детектор мусора видит только bing.com)."""
+    m = re.search(r"[?&]u=a1([A-Za-z0-9_-]+)", u)
+    if m:
+        b = m.group(1)
+        b += "=" * (-len(b) % 4)
+        try:
+            dec = base64.urlsafe_b64decode(b).decode("utf-8", "replace")
+            if dec.startswith("http"):
+                return dec
+        except Exception:
+            pass
+    return u
+
+
+def _search_bing_html(query, n):
+    """v3.22.3 (Task 160): Bing HTML-выдача (mkt=ru-RU) — запасной про-
+    вайдер к RSS: те же результаты, но с полноценными сниппетами <p>;
+    парсинг блоков class="b_algo" (живой замер 12.11: 10 блоков на запрос)."""
+    q = urllib.parse.quote_plus(query)
+    data, _ = _http_get("https://www.bing.com/search?q=%s&mkt=ru-RU&count=10"
+                        % q)
+    html = data.decode("utf-8", "replace")
+    out = []
+    for chunk in html.split('class="b_algo"')[1:n + 3]:
+        ml = re.search(r'(?s)<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+                       chunk)
+        if not ml:
+            continue
+        ms = re.search(r"(?s)<p[^>]*>(.*?)</p>", chunk)
+        _u = _bing_unwrap(_xml_unescape(ml.group(1)))
+        if not _u.startswith("http"):
+            continue          # v3.22.3: мусорные /redirect-ссылки мимо
+        out.append((_u,
+                    re.sub(r"<[^>]+>", "", ml.group(2)).strip(),
+                    re.sub(r"<[^>]+>", " ", ms.group(1)).strip()[:220]
+                    if ms else ""))
+        if len(out) >= n:
+            break
+    return out
 
 
 _SEARCH_CACHE = {}
+
+# v3.24.0 (Task 162): OPENSERP — СВОЙ ПОИСКОВЫЙ СЕРВЕР БЕЗ КЛЮЧЕЙ.
+# Шеф предложил karust/openserp (GitHub) и SearXNG. Разведка живьём
+# 12.11: SearXNG на нашем MSK упирается в ту же стену — движки видят
+# IP датацентра (Google — JS-заглушка, Яндекс — капча-302, DDG —
+# 202-капча; там и RAM всего 956 МБ). OpenSerp решает обе проблемы:
+# ставим его ПРЯМО НА ПК2 (v0.8.19, windows-amd64, D:\Jarvis\openserp,
+# служба OpenSerpSvc в Task Scheduler, localhost:7000) — настоящий
+# Chromium рендерит страницу выдачи (JS исполняется, ответ-боксы
+# видны) + ЖИЛОЙ IP Шефа, который движки не капчят. Живые замеры
+# 12.11: google 5 органик за 5.8 с (JS-заглушка побеждена!), ddg —
+# 1.7 с чисто, bing — работает, yandex — 429 (лимит, не блок).
+# Ключей и оплаты нет вообще. API: GET /{engine}/search?text=…&lang=RU
+# &limit=N -> JSON results[] (title/url/snippet/type organic).
+# Порядок движков внутри OpenSerp: google -> duckduckgo -> bing
+# (яндекс пропускаем — 429 до вечера; соцсетевой мусор Bing ловит
+# _results_junky, но у OpenSerp выдача чище за счёт рендера).
+OPENSERP_URL = (CFG.get("openserp_url") or
+                "http://127.0.0.1:7000").strip().rstrip("/")
+
+
+def _search_openserp(query, n, engine="google"):
+    """v3.24.0 (Task 162): поиск через локальный OpenSerp (Chromium на
+    ПК2). Возврат [(url, title, snippet)], как у остальных провайдеров.
+    Ошибки (служба лежит/движок капчанул) всплывают наверх -> следующий
+    провайдер цепочки.
+    Хотфикс 16:20: Google A/B-тестами подмешивает результаты со
+    ссылками через свой шифрованный редирект google.ru/goto?…url=
+    <protobuf> — разворачивать нельзя (там шифр, resolve_urls у
+    OpenSerp их тоже не чинит, живая проверка), кликнуть Шефу тоже
+    плохо. Такие результаты ПРОПУСКАЕМ; лимит запроса чуть выше,
+    чтобы после фильтра оставалось достаточно."""
+    url = ("%s/%s/search?text=%s&lang=RU&limit=%d"
+           % (OPENSERP_URL, engine,
+              urllib.parse.quote_plus(query[:400]), max(n + 3, 6)))
+    req = urllib.request.Request(url, headers={"User-Agent": UA,
+                                               "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=45) as r:
+        j = json.loads(r.read(3000000).decode("utf-8", "replace"))
+    out = []
+    for it in j.get("results") or []:
+        if it.get("type") and it.get("type") != "organic":
+            continue          # v3.24.0: рекламу мимо
+        u = (it.get("url") or "").strip()
+        if not u.startswith("http"):
+            continue
+        if re.search(r"google\.(?:ru|com)/goto\?", u):
+            continue          # хотфикс 16:20: шифрованный редирект мимо
+        out.append((u[:600],
+                    (it.get("title") or "").strip()[:140],
+                    (it.get("snippet") or "").strip()[:220].replace("\n", " ")))
+        if len(out) >= n:
+            break
+    return out
+
+
+# v3.22.4 (Task 160): СОЦСЕТЕВОЙ МУСОР — живой кейс 12.11: Bing
+# RSS/HTML на запросы «рецепт борща…» упорно отдаёт ОДНИ И ТЕ ЖЕ
+# Threads-профили (@bre_engt и др.), а те же слова в другом порядке
+# («борщ рецепт») — нормальные кулинарные сайты. Если ВЕСЬ топ —
+# соцсети, считаем выдачу мусорной и пробуем следующего провайдера,
+# затем перекладину слов (первое слово в конец).
+# v3.24.0 (Task 162): + instagram (живой кейс: OpenSerp-Google отдал
+# instagram.com/popular топ-1 по «рецепт борща классический»).
+_SOCIAL_JUNK_RE = re.compile(
+    r"threads\.(?:com|net)|reddit\.com|facebook\.com|twitter\.com|"
+    r"(?<![\w.])x\.com|tiktok\.com|pinterest\.\w+|quora\.com|"
+    r"instagram\.com", re.I)
+
+
+def _results_junky(results):
+    """v3.22.4: весь топ-4 — соцсети => выдача-филлер, а не ответ."""
+    top = [u for u, t, s in (results or [])[:4]]
+    return bool(top) and all(_SOCIAL_JUNK_RE.search(u) for u in top)
 
 
 def get_rates():
@@ -2387,21 +2559,45 @@ def get_rates():
 
 
 def web_search(query, n=6):
-    """Поиск: DuckDuckGo -> Bing -> DDG lite (+кэш 5 мин)."""
+    """Поиск: OpenSerp-Google -> OpenSerp-DDG -> OpenSerp-Bing ->
+    Bing RSS (ru) -> Bing HTML (ru) -> DDG (+кэш 5 мин).
+    v3.24.0 (Task 162): ПЕРВЫМ — свой сервер OpenSerp на ПК2: Chromium
+    рендерит выдачу, поэтому Google отвечает результатами (JS-заглушка
+    больше не помеха), IP жилой — без капч, ключей и оплаты. Если служба
+    лежит или движок капчанул — старая цепочка v3.22.4 как запас.
+    v3.22.3 (Task 160): Bing первым — единственный без капчи для HTTP-
+    клиента (см. коммент к _search_bing); DDG в резерве — раньше он был
+    первым и каждый раз спотыкался о капчу-202, зря тратя ~10 сек.
+    v3.22.4 (Task 160): соцсетевой мусор (все топ-ссылки — соцсети)
+    приравнен к провалу — пробуем следующего провайдера; не помогло —
+    одна перекладина слов («рецепт борща» -> «борщ рецепт»: чинит
+    Threads-филлер Bing'а, проверено живьём 12.11)."""
     key = query.strip().lower()
     now = time.time()
     if key in _SEARCH_CACHE and now - _SEARCH_CACHE[key][0] < 300:
         return _SEARCH_CACHE[key][1]
-    q = urllib.parse.quote_plus(query)
-    results = []
-    err = ""
-    for fn in (lambda: _search_ddg("https://html.duckduckgo.com/html/?q=" + q, n),
-               lambda: _search_bing(query, n),
-               lambda: _search_ddg("https://lite.duckduckgo.com/lite/?q=" + q, n)):
-        try:
-            results = fn()
-        except Exception as e:
-            err = str(e)
+    words = query.split()
+    rot = " ".join(words[1:] + words[:1]) if len(words) > 1 else query
+    attempts = [query] + ([rot] if rot.strip().lower() != key else [])
+    results, err = [], ""
+    for qry in attempts:
+        q = urllib.parse.quote_plus(qry)
+        for fn in (lambda: _search_openserp(qry, n, "google"),
+                   lambda: _search_openserp(qry, n, "duckduckgo"),
+                   lambda: _search_openserp(qry, n, "bing"),
+                   lambda: _search_bing(qry, n),
+                   lambda: _search_bing_html(qry, n),
+                   lambda: _search_ddg("https://html.duckduckgo.com/html/?q=" + q, n),
+                   lambda: _search_ddg("https://lite.duckduckgo.com/lite/?q=" + q, n)):
+            try:
+                res = fn()
+            except Exception as e:
+                res, err = [], str(e)
+            if res and not _results_junky(res):
+                results = res
+                break
+            if res:
+                err = "выдача-мусор (соцсети)"
         if results:
             break
     if not results:
@@ -2434,6 +2630,7 @@ def open_url(url):
     if not url.startswith("http"):
         url = "https://" + url
     title, text, blocked = "", "", True
+    _geo = False
     try:
         data, ctype = _http_get(url, timeout=20)
         enc = "utf-8"
@@ -2453,12 +2650,65 @@ def open_url(url):
                        "antibot", "challenge-platform", "доступ ограничен",
                        "доступ запрещен", "доступ запрещён", "каптч",
                        "captcha", "robot check", "press & hold")))
-    except Exception:
+    except Exception as e:
         blocked = True
+        # v3.20.0 (Task 152): 451 = сайт юридически закрыт для российских
+        # IP (живой случай 11.11 21:00: debilizator.tv — «Деилизатоп»
+        # Шефа). Chrome с НАШЕГО IP получит ту же заглушку — в браузер
+        # НЕ ходим, домен помечаем как закрытый.
+        _geo = (getattr(e, "code", None) == 451 or " 451" in str(e))
+    if _geo:
+        return ("САЙТ ЗАКРЫТ ДЛЯ РОССИЙСКИХ IP (HTTP 451): %s\n"
+                "Это НЕ капча и НЕ антибот — обычный браузер с нашего IP "
+                "получит ту же заглушку, открывать в Chrome бессмысленно. "
+                "Этот домен больше НЕ открывай и содержимое НЕ выдумывай "
+                "(З6). Вернись к результатам «интернет» и открой ДРУГУЮ "
+                "ссылку (другой домен). Для телепрограмм надёжны: сайт "
+                "самого канала (Первый — https://www.1tv.ru/schedule), "
+                "tv.mail.ru. Шефу честно скажи, что сайт из РФ закрыт."
+                % url[:120])
     if text and not blocked:
         return ("Заголовок: %s\n\n" % title[:200]) + text[:6000]
+    # v3.25.0 (Task 163): путь 1.5 — OpenSerp /extract: ЛОКАЛЬНЫЙ
+    # Chromium (headless, служба OpenSerpSvc) рендерит страницу и
+    # отдаёт чистый Markdown. Живые замеры 12.11: iamcook 0.6 с,
+    # habr 0.5 с (JS-сайты читаются!) — в ~50 раз быстрее экранной
+    # автоматизации и БЕЗ дёргания браузера Шефа. Идея из разбора
+    # списка Шефа (это наш аналог Crawl4AI, уже стоит). Антибот-
+    # гиганты (Ozon: 502) не по зубам — им остаётся путь 2 (экран).
+    try:
+        xtitle, xtext = _openserp_extract(url)
+        if xtext and len(xtext) >= 250:
+            return (("Заголовок: %s\n\n"
+                     "[страница прочитана локальным Chromium — быстро и "
+                     "без браузера на экране]\n\n"
+                     % (xtitle or title)[:200]) + xtext[:6000])
+        log("open_url: openserp-extract пустой (%d симв.) — в браузер"
+            % len(xtext or ""))
+    except Exception as e:
+        log("open_url: openserp-extract не смог: %s" % str(e)[:120])
     # сайт не отдал текст роботу — открываю в браузере Шефа
     return _browser_open_read(url)
+
+
+def _openserp_extract(url):
+    """v3.25.0 (Task 163): страница -> чистый текст через ЛОКАЛЬНЫЙ
+    Chromium OpenSerp (GET /extract, служба на localhost:7000).
+    Возвращает (title, text): markdown-текст страницы без рекламы и
+    вёрстки; '' если сайт не отдал. Это наш «Crawl4AI» из списка
+    Шефа — уже установлен, без облачных лимитов и ключей (Jina
+    Reader из РФ даёт 451, облачные Crawl4AI-аналоги не нужны)."""
+    u = OPENSERP_URL + "/extract?url=" + urllib.parse.quote_plus(url[:800])
+    req = urllib.request.Request(u, headers={"Accept": "application/json",
+                                             "User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=75) as r:
+        j = json.loads(r.read(5000000).decode("utf-8", "replace"))
+    title = (j.get("title") or "").strip()
+    for k in ("markdown", "text"):
+        v = (j.get(k) or "").strip()
+        if v:
+            return title, re.sub(r"\n{3,}", "\n\n", v)
+    return title, ""
 
 
 def _browser_find_chrome_title():
@@ -2598,13 +2848,18 @@ def _browser_open_read(url):
     txt = _chrome_page_text(not_url=real_url)
     log("browser-open: title=%r url=%r текст=%d симв."
         % (title[:60], (real_url or "")[:80], len(txt or "")))
-    if not txt:
-        return ("не смог прочитать текст страницы (капча или медленная "
-                "загрузка; окно: %s). Если на «скрине» видно окно браузера "
-                "с этой страницей — работай по нему; если страницы на "
-                "экране НЕТ — честно скажи Шефу, что она не открылась. "
-                "НЕ описывай рабочий стол вместо страницы (закон З6)."
-                % (title or "Chrome"))
+    # v3.20.0 (Task 152): раньше пустышкой считался только НОЛЬ симв.
+    # Живой сбой 11.11 21:00: страница-заглушка 451 дала 93 симв. —
+    # мусор ушёл в мозг как «текст страницы», и тот честно пытался
+    # «читать» его трижды. Порог 250 — как у blocked в open_url.
+    if not txt or len(txt) < 250:
+        return ("страница НЕ прочиталась (получил %d симв. — пустая "
+                "загрузка, ошибка сайта или он закрыт для нашего IP; "
+                "окно: %s). НЕ выдумывай содержимое (З6) и НЕ описывай "
+                "рабочий стол. Если сайт отвечает 451 — он закрыт для "
+                "РФ: возьми ДРУГУЮ ссылку из результатов «интернет». "
+                "Посмотреть, что реально на экране, — «скрин»."
+                % (len(txt or ""), title or "Chrome"))
     head = ("САЙТ ЗАКРЫТ ОТ РОБОТОВ — открыл ссылку в браузере на экране.\n"
             "Запрошено: %s\nРеальный адрес вкладки: %s\nОкно: %s\n\n"
             "Текст страницы:\n" % (url, real_url or "?", title or "?"))
@@ -4820,10 +5075,13 @@ def plan_without_tool(ans, called):
     return bool(PLAN_VERB_RE.search(str(ans or "")))
 
 # v3.7.0 (Task 104): ЯЗЫКОВОЙ СТРАЖ (закон З5) — финальный ответ Шефу
-# целиком без кириллицы = мозг сорвался на английский. Промпт не гарантия
+# не по-русски = мозг сорвался на английский. Промпт не гарантия
 # (ночь 02.11: отвечал Шефу по-английски) — это гарантия уровнем кода.
 # Один перезапрос, потом честный русский ответ. Термины латиницей — не
 # нарушение: короткие ответы («OK», «GTA 5») пропускаем.
+# v3.22.2 (Task 159): «русский» теперь по ДОЛЕ кириллицы (>= 1/3 букв),
+# а не «хоть одна буква» — англ. текст с рус. цитатой внутри больше
+# не проходит (живой случай 12.11 11:27).
 LANG_FIX_MSG = ("Служебная проверка языка (закон З5): твой ответ Шефу "
                 "целиком без русского языка. С Шефом говоришь ТОЛЬКО "
                 "по-русски — названия программ и технические термины "
@@ -4832,12 +5090,26 @@ LANG_FIX_MSG = ("Служебная проверка языка (закон З5)
 
 
 def _is_russian(t):
-    """З5: русский ответ = есть кириллица; чистая латиница короче 15
-    букв («OK», «GTA 5», «Discord») нарушением не считается."""
+    """З5 (v3.22.2, Task 159): русский ответ = кириллица составляет
+    НЕ МЕНЬШЕ трети букв (cyr*2 >= lat). Прежняя проверка «хоть одна
+    кириллическая буква» пропускала английский текст с русской цитатой
+    внутри (живой случай 12.11 11:27: ответ на «И где ответ?» ушёл в
+    английский «разговор с собой», внутри была кириллическая цитата —
+    страж молчал). URL, код-блоки, инлайн-код и виндовые пути из
+    подсчёта ИСКЛЮЧЕНЫ — это легитимная латиница технического ответа
+    (лог/команда/ссылка не должны ломать проверку языка); чистая
+    латиница короче 15 букв («OK», «GTA 5», «Discord») нарушением не
+    считается."""
     t = str(t or "")
-    cyr = len(re.findall(r"[а-яёА-ЯЁ]", t))
-    lat = len(re.findall(r"[a-zA-Z]", t))
-    return cyr > 0 or lat < 15
+    s = re.sub(r"```.*?```", " ", t, flags=re.S)      # код-блоки
+    s = re.sub(r"`[^`]*`", " ", s)                    # инлайн-код
+    s = re.sub(r"https?://\S+|www\.\S+", " ", s)    # ссылки
+    s = re.sub(r"\b[A-Za-z]:\\[^\s\"']*", " ", s)  # пути D:\...
+    cyr = len(re.findall(r"[а-яёА-ЯЁ]", s))
+    lat = len(re.findall(r"[a-zA-Z]", s))
+    if not cyr:
+        return lat < 15
+    return cyr * 2 >= lat
 
 
 # v3.14.3 (Task 133): МЫШЬ-СТРАЖ — живой e2e 08.11: на «где сейчас мышь?
@@ -5401,8 +5673,8 @@ def hist_msgs(h):
         out.append({"role": m.get("role", "user"), "content": c[:1000]})
     return out
 
-FRESH_RE = re.compile(r"(курс|цен[аыу]|стоит|новост|новинк|погод|сегодня|сейчас|"
-                      r"последни|свеж|результат|кто выиграл|матч|счёт|итог|"
+FRESH_RE = re.compile(r"(курс|цен[аыу]|стоит|новост|новинк|что\s+нового|погод|сегодня|сейчас|"
+                      r"последн|свеж|результат|кто выиграл|матч|счёт|итог|"
                       r"произошл|случил|вышел|обновлен|прогноз)", re.I)
 
 
@@ -5425,6 +5697,50 @@ CLOUD_RE = re.compile(
     r"спроси у старших|спроси старших|старшие братья|старший брат|"
     r"старшая сестра|у старших|облачн(?:ом|ый|ым)\s+(?:мозг|ии|модель)|"
     r"мощн(?:ее|ую)\s+(?:модель|нейросеть)", re.I)
+
+# ------------- v3.22.0 ТОЧНЫЙ МАРШРУТ (Task 157, 12.11) -------------
+# Приказ Шефа: «надо сделать максимально точно отправку запросов по
+# моделям ИИ — кому какой запрос выполнять или проверять». Факты:
+# локальная Qwen3.8-27B знания НЕ обновляет (веса заморожены на дату
+# тренировки, из интернета сама не учится) — свежесть ей дают
+# инструменты (интернет/новости/курсы). Старшие братья в облаке умнее,
+# но их знания ТОЖЕ заморожены — поэтому свежие вопросы уходят к ним
+# ВМЕСТЕ с собранными сейчас данными сети, сложное поднимается к ним
+# автоматически, а важное проверяется консилиумом. Приватное (пароли,
+# личные файлы, финансы) старшим автоматически НЕ отправляется.
+CONSIL_RE = re.compile(
+    r"проверь\s+у\s+старших|проверь\s+старших|спроси\s+и\s+проверь|"
+    r"сверь\s+(?:со\s+)?старшими|сверь\s+ответ|второе\s+мнение|консилиум|"
+    r"проверь\s+ответ|перепроверь", re.I)
+BIG_RE = re.compile(
+    r"напиши\s+(?:код|программ\w*|скрипт|функци\w*|класс|алгоритм|запрос|"
+    r"sql|regex|регулярк)|"
+    r"составь\s+(?:код|программ\w*|скрипт|алгоритм|запрос|sql|regex)|"
+    r"реши\s+(?:задач|уравнен|пример|головоломк)|"
+    r"оптимизиру\w+\s+(?:код|запрос|алгоритм|скрипт)|"
+    r"найди\s+ошибк\w*\s+в\s+(?:коде|скрипте|программе|запросе)|"
+    r"спроектируй|спланируй\s+(?:архитектур|систем|проект)|"
+    r"архитектур\w*\s+(?:решени|приложени|систем)|"
+    r"глубок(?:ий|о)\s+анализ|проанализируй|сравнительн\w*\s+анализ|"
+    r"стратеги\w+|исследован\w+", re.I)
+PRIVATE_RE = re.compile(
+    r"парол|пин-?код|сид-?фраз|seed\s*phrase|private\s*key|"
+    r"\bинн\b|\bснилс\b|паспорт|номер\w*\s+карт|\bcvv\b|\bcvc\b|"
+    r"личн\w*\s+данн|персональн\w*\s+данн|"
+    r"мои\s+(?:личн|файл|заметк|трат|расход|доход|секрет|парол)|"
+    r"мо\w+\s+финанс|моём\s+(?:пк|комп)|моей\s+почт|секретн\w*\s+данн", re.I)
+UNCERT_RE = re.compile(
+    r"не\s+(?:уверен|знаю|могу\s+(?:точно\s+)?(?:сказать|определить|"
+    r"проверить|найти)|смог\s+(?:найти|получить)|удалось\s+(?:найти|"
+    r"получить)|располага\w+\s+(?:точной\s+)?информац|наш\w+\s+"
+    r"(?:точной\s+)?информац)|сомнева\w+|нет\s+(?:точных|достоверных|"
+    r"актуальных|свежих)\s+данн\w*|(?:точных|достоверных|актуальных|"
+    r"свежих)\s+данн\w*\s+нет|(?:данн\w*|информац\w*)\s+(?:мог\w*\s+)?"
+    r"(?:быть\s+)?устар\w*|мог\w*\s+(?:быть\s+)?устар\w*|"
+    r"могу\s+ошибаться", re.I)
+ABOUT_SELF_RE = re.compile(
+    r"что\s+ты\s+умеешь|что\s+умеешь|кто\s+ты\b|какая\s+ты\s+модель|"
+    r"ты\s+умеешь|как\s+ты\s+работаешь|джарвис", re.I)
 THINK_HINT_RE = re.compile(
     r"(почему|зачем|объясни|в чём разниц|чем отлич|как устроен|как работает|"
     r"сравни|что лучше|проанализир|посчитай|вычисли|реши задач|придумай|сочини|"
@@ -5433,18 +5749,28 @@ THINK_HINT_RE = re.compile(
 
 
 def smart_mode(text):
-    """v3.14.5: ДЖАРВИС ДУМАЕТ ВСЕГДА (приказ Шефа 08.11: «Сделай чтобы
-    Джарвис думал всегда! Не надо быстрых ответов, он тупит сильно,
-    пусть думает нормально всегда!!!»). ЛЮБОЙ вопрос — режим «think»:
-    размышления 10-30 с перед ответом. Режимы «fast» и «big» больше не
-    существуют: v3.10.1 сам решал, что «простое» (привет/спасибо/
-    короткое) — и отвечал бездумно за 3-8 с, что Шефу и надоело.
-    Единственное исключение — явное «спроси у старших» = «cloud»
-    (провал облака = своё глубокое думание, как и раньше). Свежие
-    вопросы (новости/курсы) теперь тоже думают на первом шаге, а
-    данные берут инструментами, как и раньше."""
+    """v3.22.0 «ТОЧНЫЙ МАРШРУТ» (Task 157): кому какой вопрос выполнять
+    и проверять. Приоритет решений:
+    1) «проверь у старших / консилиум / второе мнение» -> consilium:
+       локальный мозг отвечает как обычно, старший брат затем СВЕРЯЕТ
+       его ответ (вердикт: верно / есть ошибки + исправления);
+    2) «спроси у старших» -> cloud: вопрос целиком старшему брату;
+       если вопрос свежий (курс/цены/новости) — ему в контекст
+       автоматически подкладываются живые данные из сети;
+    3) явно сложное и НЕ приватное (код/расчёт/архитектура/стратегия)
+       -> big: автоматически старшему брату (он умнее; отключается
+       config «senior_auto»: 0);
+    4) всё остальное -> think: локальный мозг думает сам. Приказ Шефа
+       08.11 «думает всегда» НЕ отменён — простое тоже думает локально.
+    Приватное (пароли/личные файлы/финансы/секреты) старшим
+    автоматически НЕ отправляется — только по явной фразе."""
+    if CONSIL_RE.search(text):
+        return "consilium"
     if CLOUD_RE.search(text):
         return "cloud"
+    if (BIG_RE.search(text) and not PRIVATE_RE.search(text)
+            and _senior_auto() and _cloud_ready()):
+        return "big"
     return "think"
 
 
@@ -5457,6 +5783,248 @@ CLOUD_SYS = ("Ты — «старший брат» Джарвиса: облач�
              "и без лишних извинений.")
 
 
+def _cloud_sys(base=None):
+    """v3.22.0: системный промпт старшего брата + СЕГОДНЯШНЯЯ дата +
+    честность о свежести: знания брата заморожены на дату его
+    тренировки, факты «сейчас» он обязан брать из блока «СВЕЖИЕ
+    ДАННЫЕ», если тот есть, иначе — честно предупреждать, что данные
+    могут быть устаревшими (главная причина неточных ответов облака
+    на свежих вопросах — до v3.22 брат не знал ни даты, ни данных)."""
+    return ((base or CLOUD_SYS)
+            + " Сегодня " + time.strftime("%d.%m.%Y")
+            + ". Ты и есть старший брат: отвечай на вопрос САМ, сразу и"
+              " полно — никаких пересылок другим и никаких «жду ответа»."
+            + ". Твои знания могли устареть к этой дате: всё о текущем "
+              "моменте (курсы, цены, новости, версии, события) давай "
+              "ТОЛЬКО из блока «СВЕЖИЕ ДАННЫЕ», если он есть ниже; если "
+              "блока нет — честно скажи, что данные могут быть "
+              "неактуальными.")
+
+
+CLOUD_VERIFY_SYS = ("Ты — «старший брат» Джарвиса: облачный ИИ. Локальный "
+                    "Джарвис (27B, работает на ПК Шефа) уже ответил Шефу, "
+                    "а ты ПРОВЕРЯЕШЬ его ответ как старший коллега на "
+                    "консилиуме. Отвечай по-русски, кратко и строго в "
+                    "формате: 1) ВЕРДИКТ: верно / верно с оговорками / есть "
+                    "ошибки; 2) если есть ошибки или важные упущения — что "
+                    "именно и как правильно; 3) если всё верно — строка "
+                    "«Ответ верный» и (по желанию) одно ценное дополнение. "
+                    "Без markdown и извинений.")
+
+
+def _senior_auto():
+    """v3.22.0: рубильник АВТО-маршрутизации к старшим (config
+    «senior_auto»; дефолт ВКЛ, 0/false/off/нет = выключить — тогда
+    старшие только по явным фразам, как в v3.21)."""
+    return str(CFG.get("senior_auto", "1")).strip().lower() \
+        not in ("0", "false", "off", "нет", "no")
+
+
+def _cloud_question(text, hist):
+    """v3.22.1 (Task 157): «спроси у старших» БЕЗ вопроса в этой же
+    фразе — вопрос был прошлой репликой (живой случай Шефа 12.11
+    11:24: «Спроси у старших братьев» после вопроса про НТВ — старший
+    брат растерялся и ответил заглушкой «Ожидаю их ответа»).
+    Срезаем триггерную фразу; если остаток пуст — берём последний
+    вопрос Шефа из истории. Старший получает ЧИСТЫЙ вопрос и
+    отвечает на него сам."""
+    q = CLOUD_RE.sub(" ", CONSIL_RE.sub(" ", text or ""))
+    q = re.sub(r"\s+", " ", q)
+    # v3.22.1a: огрызки триггера по краям («Спроси у старших братьев» ->
+    # «братьев») срезаем; слова «братья/старшие» в СЕРЕДИНЕ вопроса не трогаем
+    for _ in range(3):
+        nq = re.sub(r"^(?:брать\w*|сестр\w*|старш\w*)[\s,.:;-]*", "", q,
+                    flags=re.I).strip()
+        nq = re.sub(r"[\s,.:;-]*(?:брать\w*|сестр\w*|старш\w*)$", "", nq,
+                    flags=re.I).strip()
+        if nq == q:
+            break
+        q = nq
+    q = q.strip(" ,.!?:;—«»")
+    if q:
+        return q
+    for m in reversed(hist or []):
+        if m.get("role") == "user":
+            c = (m.get("content") or "").strip()
+            c = re.sub(r"\s+", " ", c).strip(" ,.!?:;-—«»")
+            if c and not CLOUD_RE.search(c) and len(c) > 3:
+                return c
+    return (text or "").strip()
+
+
+def _fresh_ctx_block(text, limit=1800):
+    """v3.22.0: СВЕЖИЕ ДАННЫЕ для старшего брата. Локальные инструменты
+    Джарвиса (курсы ЦБ РФ/Binance, RSS-новости, веб-поиск) собирают
+    живые факты СЕЙЧАС — брат получает их в контексте и не
+    фантазирует по замороженным знаниям. None = данных не нашлось."""
+    parts = []
+    _t = " ".join((text or "").split())
+    try:
+        if re.search(r"курс|цен[аыу]|стоит|валют|доллар|евро|рубл|юан|"
+                     r"биткоин|btc|эфири|крипт", _t, re.I):
+            parts.append("КУРСЫ (ЦБ РФ + крипта, собрано сейчас):\n"
+                         + get_rates())
+    except Exception:
+        pass
+    try:
+        if re.search(r"новост|новинк|что\s+случил|произошл|событ", _t, re.I):
+            parts.append("НОВОСТИ (RSS, собрано сейчас):\n"
+                         + news_search(_t[:150] if len(_t) > 40 else "", 6))
+    except Exception:
+        pass
+    _got = bool(parts)
+    if not _got or re.search(r"погод|температур|прогноз|версия|вышл|"
+                             r"обновлен|расписан|афиш|цена|стоит", _t, re.I):
+        try:
+            parts.append("ПОИСК ПО ЗАПРОСУ (собрано сейчас):\n"
+                         + web_search(_t[:200], 5))
+        except Exception:
+            pass
+    if not parts:
+        return None
+    block = "\n\n".join(parts)[:limit]
+    return ("СВЕЖИЕ ДАННЫЕ ИЗ СЕТИ (собраны локальным Джарвисом %s — "
+            "факты о текущем моменте бери ТОЛЬКО отсюда):\n%s"
+            % (time.strftime("%d.%m.%Y %H:%M"), block))
+
+
+def cloud_verify(question, local_answer):
+    """v3.22.0 (Task 157): КОНСИЛИУМ — старший брат проверяет ответ
+    локального мозга. Возвращает (вердикт, None) или (None, причина)."""
+    if not _cloud_ready():
+        return None, "старшие не настроены"
+    _fctx = None
+    try:
+        if FRESH_RE.search(question or "") and \
+                not ABOUT_SELF_RE.search(question or ""):
+            _fctx = _fresh_ctx_block(question)
+    except Exception:
+        _fctx = None
+    content = ("Вопрос Шефа: %s\n\nОтвет локального Джарвиса (27B):\n%s%s"
+               % (_cloud_question(question, None)[:1500],
+                  (local_answer or "")[:2500],
+                  ("\n\n" + _fctx) if _fctx else ""))
+    msgs = [{"role": "system", "content": _cloud_sys(CLOUD_VERIFY_SYS)},
+            {"role": "user", "content": content}]
+    return cloud_ask(None, [], msgs=msgs, temperature=0.3)
+
+
+# ----------------- v3.21.0 СТАРШИЙ БРАТ GIGACHAT (Task 156, 12.11) --------
+# Приказ Шефа: «консилиум» — облачный ИИ как второе мнение/помощь локальному
+# мозгу. Главный старший брат — GigaChat-3-Ultra (Сбер, 702B MoE): заметно
+# умнее локальной Qwen3.8-27B, русский из коробки, из РФ без VPN, Freemium-
+# токены физлица. Authorization key (base64(client_id:client_secret)) —
+# config.json «gigachat_auth», модель — «gigachat_model» (дефолт Ультра;
+# 2-Max/2-Pro как запасные на том же эндпоинте), URL — «gigachat_url»
+# (v3.21.1: базовый адрес поменялся — Ультра живёт ТОЛЬКО на новом
+# api.giga.chat/v1, старый gigachat.devices.sberbank.ru про неё 404;
+# новый отдаёт и двойку, и тройку — живые тесты 12.11), TLS-корни НУЦ
+# Минцифры — «gigachat_ca». OAuth-токен живёт ~30 мин и перевыпускается
+# сам; при 401 — перевыпуск и повтор. Провал GigaChat = фолбэк на
+# бесплатного брата Pollinations. Работает и при спящем мозге (игра).
+
+GIGA_TOKEN = {"tok": None, "exp": 0.0}
+
+
+def _giga_ssl_ctx():
+    """v3.21.0: ssl-контекст с корнями НУЦ Минцифры — без них
+    *.sberbank.ru для urllib «self-signed certificate in certificate
+    chain» (живой тест 12.11 на MSK)."""
+    ca = (CFG.get("gigachat_ca") or
+          r"D:\Jarvis\certs\russian_ca.pem").strip()
+    try:
+        return ssl.create_default_context(cafile=ca)
+    except Exception as e:
+        log("GIGACHAT ssl (%s): fallback без проверки цепочки"
+            % str(e)[:80])
+        return ssl._create_unverified_context()
+
+
+def _giga_token():
+    """v3.21.0: OAuth-токен GigaChat (ngw:9443, scope GIGACHAT_API_PERS),
+    кэш до истечения. None = провал (сеть/ключи)."""
+    now = time.time()
+    if GIGA_TOKEN["tok"] and GIGA_TOKEN["exp"] - now > 120:
+        return GIGA_TOKEN["tok"]
+    auth = (CFG.get("gigachat_auth") or "").strip()
+    if not auth:
+        return None
+    try:
+        data = urllib.parse.urlencode(
+            {"scope": "GIGACHAT_API_PERS"}).encode()
+        req = urllib.request.Request(
+            "https://ngw.devices.sberbank.ru:9443/api/v2/oauth", data=data,
+            headers={"Authorization": "Basic " + auth,
+                     "RqUID": str(uuid.uuid4()),
+                     "Content-Type": "application/x-www-form-urlencoded"})
+        with urllib.request.urlopen(req, timeout=30,
+                                    context=_giga_ssl_ctx()) as r:
+            j = json.loads(r.read().decode())
+        tok = j.get("access_token") or ""
+        if not tok:
+            return None
+        exp = (j.get("expires_at") or 0) / 1000.0 or (now + 1500)
+        GIGA_TOKEN.update(tok=tok, exp=exp)
+        return tok
+    except Exception as e:
+        log("GIGACHAT oauth провал: %s" % str(e)[:160])
+        return None
+
+
+def _giga_chat(msgs, temperature, max_tokens):
+    """v3.21.0: запрос к GigaChat /api/v1/chat/completions (контракт
+    OpenAI-подобный). (ответ, None) или (None, причина)."""
+    tok = _giga_token()
+    if not tok:
+        return None, "нет OAuth-токена GigaChat"
+    body = {"model": (CFG.get("gigachat_model") or "GigaChat-3-Ultra"),
+            "messages": msgs, "temperature": temperature,
+            "max_tokens": int(max_tokens or
+                              CFG.get("cloud_max_tokens", 1200) or 1200)}
+    url = (CFG.get("gigachat_url") or
+           "https://api.giga.chat/v1/chat/completions").strip()
+    for _try in (1, 2):
+        try:
+            req = urllib.request.Request(
+                url, data=json.dumps(body).encode(),
+                headers={"Authorization": "Bearer " + tok,
+                         "Content-Type": "application/json",
+                         "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=150,
+                                        context=_giga_ssl_ctx()) as r:
+                j = json.loads(r.read().decode())
+            txt = ((j.get("choices") or [{}])[0].get("message")
+                   or {}).get("content") or ""
+            txt = _strip_think(txt).strip()
+            if txt:
+                return txt, None
+            return None, "пустой ответ GigaChat"
+        except Exception as e:
+            _m = str(e)
+            if _try == 1 and "401" in _m:   # токен протух — перевыпуск
+                GIGA_TOKEN.update(tok=None, exp=0.0)
+                tok = _giga_token()
+                if tok:
+                    continue
+            if _try == 1 and ("429" in _m or "Too Many" in _m):
+                time.sleep(20)
+                continue
+            return None, _m[:160]
+    return None, "GigaChat не ответил"
+
+
+def _cloud_ready():
+    """v3.21.0: старшие доступны, если настроен GigaChat ИЛИ cloud-ключ."""
+    return bool((CFG.get("gigachat_auth") or "").strip()
+                or (CFG.get("cloud_api_key") or "").strip())
+
+
+def _bro_src():
+    """v3.21.0: какой брат ответил — подпись в ответе Шефу."""
+    s = (CLOUD_LAST.get("src") or "").strip()
+    return " (%s)" % s if s else ""
+
+
 def cloud_ask(text, hist, msgs=None, temperature=0.6, max_tokens=None):
     """v3.10.0: бесплатный облачный «старший брат» (по умолчанию
     Pollinations — ключ не нужен; endpoint/model/key в config.json,
@@ -5466,12 +6034,63 @@ def cloud_ask(text, hist, msgs=None, temperature=0.6, max_tokens=None):
     обработка 402 — только бесплатному Pollinations (v3.10.1);
     429 ловим у всех. Работает и когда локальный мозг спит (игра)."""
     url = (CFG.get("cloud_api_url") or "").strip()
-    if not url:
-        return None, "старшие не настроены (cloud_api_url)"
+    giga_auth = (CFG.get("gigachat_auth") or "").strip()
+    if not url and not giga_auth:
+        return None, "старшие не настроены (cloud_api_url/gigachat_auth)"
     key = (CFG.get("cloud_api_key") or "").strip()
     if msgs is None:   # msgs можно передать извне
-        msgs = ([{"role": "system", "content": CLOUD_SYS}] + list(hist[-8:])
+        def _clean(m):
+            # v3.21.1: ярлыки братьев из истории не отдаём — иначе
+            # облачный брат копирует их в свой ответ (живой тест:
+            # «[старшие братья] Канберра»). Срезаем в ЦИКЛЕ: в истории
+            # встречаются ДВОЙНЫЕ ярлыки (chat_server добавил свой
+            # поверх утёкшего от модели — «[старшие братья]
+            # [старшие братья] Канберра»), один срез оставлял второй.
+            c = m.get("content")
+            if isinstance(c, str):
+                _pfxs = ("[старшие, мозг спал] ", "[старшие братья] ",
+                         "[старший брат] ")
+                _again = True
+                while _again:
+                    _again = False
+                    for _pfx in _pfxs:
+                        if c.startswith(_pfx):
+                            c = c[len(_pfx):]
+                            _again = True
+                if c != m.get("content"):
+                    return dict(m, content=c)
+            return m
+        _sys = _cloud_sys()
+        # v3.22.0 (Task 157): свежий вопрос старшим — локальные инстру-
+        # менты уже собрали живые данные (курсы/новости/поиск), брат
+        # получает их в контексте и НЕ фантазирует по замороженным
+        # знаниям (раньше «спроси у старших: какой курс?» = выдумка)
+        if FRESH_RE.search(text) and not ABOUT_SELF_RE.search(text):
+            try:
+                _fctx = _fresh_ctx_block(text)
+            except Exception as _e:
+                _fctx = None
+                log("fresh-ctx провал: %s" % str(_e)[:80])
+            if _fctx:
+                _sys += "\n\n" + _fctx
+        msgs = ([{"role": "system", "content": _sys}]
+                + [_clean(m) for m in hist[-8:]]
                 + [{"role": "user", "content": text[:4000]}])
+    # v3.21.0 (Task 156): главный старший брат — GigaChat-2-Max (Сбер);
+    # провал = запасной бесплатный Pollinations ниже по коду
+    if giga_auth:
+        # v3.22.0: Freemium физлица = 1 поток у Сбера — вызовы GigaChat
+        # сериализуем общим замком (вопрос/проверка не параллелятся)
+        with CLOUD_LOCK:
+            g_ans, g_err = _giga_chat(msgs, temperature, max_tokens)
+        if g_ans:
+            CLOUD_LAST["ts"] = time.time()
+            CLOUD_LAST["src"] = (CFG.get("gigachat_model")
+                                 or "GigaChat-3-Ultra")
+            return g_ans, None
+        log("GIGACHAT провал (%s) — пробую запасного брата" % g_err)
+        if not url:
+            return None, g_err
     body = {"model": (CFG.get("cloud_model") or "openai-fast"),
             "messages": msgs, "temperature": temperature,
             "max_tokens": int(max_tokens or
@@ -5494,6 +6113,7 @@ def cloud_ask(text, hist, msgs=None, temperature=0.6, max_tokens=None):
                 with urllib.request.urlopen(req, timeout=150) as r:
                     j = json.loads(r.read().decode())
                 CLOUD_LAST["ts"] = time.time()
+                CLOUD_LAST["src"] = "Pollinations"   # v3.21.0: подпись брата
                 txt = ((j.get("choices") or [{}])[0].get("message")
                        or {}).get("content") or ""
                 txt = _strip_think(txt).strip()
@@ -5561,10 +6181,11 @@ def _brain_reply_impl(text, mode="think"):
     результата инструмента, скрин-пассы, short/lang-повторы. Быстрыми
     остаются только механические стражи-коррекции (фантом/руки/план/
     приказ/файл/мышь/цикл) — это внутренняя дисциплина, не ответы.
-    mode: «think» — обычный путь (smart_mode теперь всегда отдаёт
-    его); «cloud» — явное «спроси у старших», провал = думание."""
+    mode: «think» — обычный путь; «cloud» — явное «спроси у старших»,
+    провал = думание; «big» — авто-сложное старшему; «consilium» —
+    локальный думает, старший брат затем ПРОВЕРЯЕТ ответ (v3.22.0)."""
     hist = hist_load()
-    if mode == "big" and (CFG.get("cloud_api_key") or "").strip():
+    if mode == "big" and _cloud_ready():
         # v3.10.1 (Task 128, приказ Шефа «нужен именно МОЩНЫЙ брат»):
         # сложные вопросы — старшему брату (GLM-5.3 / Mistral Large
         # 123B в облаке, в разы умнее локальных 27B), он не занимает
@@ -5574,8 +6195,8 @@ def _brain_reply_impl(text, mode="think"):
         c_ans, c_err = cloud_ask(text, hist_msgs(hist))
         if c_ans:
             hist_append(text, "[старший брат] " + c_ans[:900])
-            return "🛰 Сложный вопрос — спросил у старшего брата:\n\n" \
-                   + _strip_md(c_ans)
+            return ("🛰 Сложный вопрос — спросил у старшего брата"
+                    + _bro_src() + ":\n\n" + _strip_md(c_ans))
         log("СТАРШИЙ БРАТ: провал (%s) — думаю сам, глубоко" % c_err)
         send("🛰 Старший брат не на связи (%s) — включаю глубокое "
              "мышление сам." % c_err[:70])
@@ -5585,10 +6206,12 @@ def _brain_reply_impl(text, mode="think"):
     if mode == "cloud":
         typing()
         log("СТАРШИЕ: спрашиваю облако")
-        c_ans, c_err = cloud_ask(text, hist_msgs(hist))
+        c_ans, c_err = cloud_ask(_cloud_question(text, hist_msgs(hist)),
+                                 hist_msgs(hist))
         if c_ans:
             hist_append(text, "[старшие братья] " + c_ans[:900])
-            return "🛰 Спросил у старших братьев:\n\n" + _strip_md(c_ans)
+            return ("🛰 Спросил у старших" + _bro_src()
+                    + ":\n\n" + _strip_md(c_ans))
         log("СТАРШИЕ: провал (%s) — думаю сам, глубоко" % c_err)
         send("🛰 Старшие не на связи (%s) — включаю глубокое мышление "
              "сам." % c_err[:70])
@@ -5604,15 +6227,19 @@ def _brain_reply_impl(text, mode="think"):
     _hist_len = len(msgs) - 2
 
     def _fit(ms):
-        """v3.9.0: жёсткий бюджет 28К символов — контекст 12288 не
+        """v3.9.0: жёсткий бюджет истории — контекст 12288 не
         переполняется даже на длинных цепочках инструментов (урок
         v3.8.4: переполнение = HTTP 400 и обрыв). Режу ТОЛЬКО старую
-        историю (msgs[1:1+_hist_len]), текущий обмен не трогаю."""
+        историю (msgs[1:1+_hist_len]), текущий обмен не трогаю.
+        v3.20.0 (Task 152): 15К -> 8.5К симв. И системный промпт
+        (23.4К симв. = 8015 токенов!) из суммы ИСКЛЮЧЁН — раньше он
+        ОДИН переливал бюджет, история выпиливалась ЦЕЛИКОМ каждый
+        раз, а раздутый текущий ход всё равно валился в 400. Финальную
+        упаковку под 12288 делает _pack_for_ctx прямо в llm_chat."""
         nonlocal _hist_len
-        # v3.18.1: 28К -> 15К символов: русский текст даёт ~2-2.5 символа
-        # на токен, 28К символов сами по себе = 11-14К токенов и переливают
-        # контекст 12288 ещё до системного промпта (живые 400-е 11.11).
-        while (sum(len(m.get("content", "")) for m in ms) > 15000
+        while (sum(len(m.get("content") or "")
+                   if isinstance(m.get("content"), str) else 2500
+                   for m in ms[1:]) > 8500
                and _hist_len > 0):
             ms.pop(1)
             _hist_len -= 1
@@ -5621,7 +6248,7 @@ def _brain_reply_impl(text, mode="think"):
     # v3.14.5: ДУМАЕТ ВСЕГДА — первый заход всегда с размышлениями
     # (smart_mode теперь всегда отдаёт «think»); думание продолжается
     # и на пассах-ответах после инструментов (см. шаги ниже)
-    ans = llm_chat(_fit(msgs), think=(mode == "think"))
+    ans = llm_chat(_fit(msgs), think=mode in ("think", "consilium"))
     called = set()
     _rep_key = None      # v3.14.1: страж повторов (анти-цикл)
     _rep_cnt = 0
@@ -5870,12 +6497,33 @@ def _brain_reply_impl(text, mode="think"):
             hist_append(text, "(ответ сорвался на английский)")
             return ("⚠️ Сорвался тут на английский, Шеф — а по закону З5 говорю "
                     "только по-русски. Переспроси, отвечу как положено.")
+    # v3.22.0 (Task 157) ТОЧНЫЙ МАРШРУТ: консилиум («проверь у старших»)
+    # и авто-второе-мнение — мозг признался в неуверенности, а вопрос
+    # не приватный: старший брат сверяет ответ, Шеф видит вердикт
+    if clean and _cloud_ready():
+        _verify = (mode == "consilium")
+        if (not _verify and _senior_auto() and mode == "think"
+                and not PRIVATE_RE.search(text) and UNCERT_RE.search(clean)):
+            _verify = True   # мозг САМ сказал «не уверен» — переспрашиваю
+        if _verify:
+            typing()
+            v_ans, v_err = cloud_verify(text, clean)
+            if v_ans:
+                full = (clean + "\n\n🛰 " +
+                        ("Старший брат проверил мой ответ"
+                         if mode == "consilium" else
+                         "Я был не уверен — переспросил у старших")
+                        + _bro_src() + ":\n\n" + _strip_md(v_ans))
+                hist_append(text, full[:1200])
+                return full
+            log("КОНСИЛИУМ: старшие не ответили (%s) — остаюсь при своём"
+                % str(v_err)[:80])
     hist_append(text, clean)
     return clean or "…"
 
 # ---------------------------------------------------------------- обработка
 
-HELP = ("🤖 *ДЖАРВИС v3.18 — ТЕКСТОВЫЙ МОЗГ*\n\n"
+HELP = ("🤖 *ДЖАРВИС v3.22 — ТОЧНЫЙ МАРШРУТ*\n\n"
         "Мозг — Qwen3.8-27B прямо на твоей видеокарте, без облака. Пиши "
         "обычным языком — я сам пойму, что сделать.\n\n"
         "*Действия:*\n"
@@ -5896,12 +6544,15 @@ HELP = ("🤖 *ДЖАРВИС v3.18 — ТЕКСТОВЫЙ МОЗГ*\n\n"
         "«голоса» — какие есть, «голос евгений» — сменить основной, "
         "«поставь silero» — самые натуральные голоса: Ксения, Ксеня, "
         "Байя, Евгений, Айдар.\n\n"
-        "*Умный режим:* простое — мгновенно; слово «подумай» — глубоко "
-        "думаю сам (10-30 с); сложный вопрос — сперва спрашиваю старшего "
-        "брата в облаке (если подключён — он мощнее меня; подключён, "
-        "если у меня есть его ключ).\n\n"
-        "*Старшие братья:* «спроси у старших» — облачный мозг (второе "
-        "мнение), работает даже когда я сплю из-за игры.\n\n"
+        "*Умный маршрут (v3.22):* думаю всегда сам (10-30 с); вопрос "
+        "про код/расчёт/стратегию — автоматически спрашиваю старшего "
+        "брата GigaChat-3-Ultra (702B, в разы умнее); если я не уверен "
+        "в ответе — сам переспрашиваю старших и показываю оба мнения.\n\n"
+        "*Старшие братья:* «спроси у старших …» — вопрос облаку; «проверь "
+        "у старших …» — консилиум: отвечаю я, старший брат сверяет ответ "
+        "и правит ошибки. Свежие вопросы (курс/новости/цены) уходят "
+        "братьям вместе с живыми данными из сети. Работает даже когда я "
+        "сплю из-за игры.\n\n"
         "*Интернет и API:* «что нового в мире», «курс биткоина», «погода в Москве» — "
         "найду свежее в сети. «найди на странице/сайте …» — читаю текст "
         "страницы (из ссылки или прямо из браузера) и выписываю точные "
@@ -6049,16 +6700,17 @@ def handle(text, chat_id):
     if LLM_PROC["sleeping"]:
         # старшие братья живут в облаке и не занимают VRAM:
         # отвечают даже когда локальный мозг спит (игра)
-        if _mode == "cloud" or (_mode == "big" and
-                                (CFG.get("cloud_api_key") or "").strip()):
+        if (_mode in ("cloud", "consilium")
+                or (_mode == "big" and _cloud_ready())):
             # v3.10.1: и авто-сложные вопросы уходят брату, даже когда
             # локальный мозг спит из-за игры (облако VRAM не занимает)
             typing(chat_id)
-            c_ans, c_err = cloud_ask(text, [])
+            c_ans, c_err = cloud_ask(_cloud_question(text, []), [])
             if c_ans:
                 hist_append(text, "[старшие, мозг спал] " + c_ans[:900])
-                return send("🛰 (локальный мозг спит — игра? Старшие "
-                            "ответили так:)\n\n" + _strip_md(c_ans),
+                return send("🛰 (локальный мозг спит — игра? Старшие"
+                            + _bro_src() + " ответили так:)\n\n"
+                            + _strip_md(c_ans),
                             chat_id, voice=_want_voice, voice_name=_vname)
             return send("😴 Мозг спит, а старшие не на связи (%s). "
                         "«проснись» — подниму локальный." % c_err[:60],
@@ -6588,7 +7240,19 @@ def main():
     log("TG-канал: %s" % ("через прокси MSK + автофолбэк на прямое"
                             if TG_OPENER else "напрямую (плавающая сеть)"))
     hello = "--hello" in sys.argv
-    log("=== ДЖАРВИС старт (v3.19.2 ССЫЛКИ ШЕФА — НАДЁЖНЫЙ ТЕКСТ СТРАНИЦЫ "
+    log("=== ДЖАРВИС старт (v3.25.0 ЧТЕНИЕ САЙТОВ: открыть_ссылку/найти_"
+                "на_странице теперь читают JS-сайты ЛОКАЛЬНЫМ Chromium "
+                "(OpenSerp /extract, 0.5-0.7 с живьём) БЕЗ экранного "
+                "браузера; Jina-облако из РФ 451 — отвергнуто, Task 163, "
+                "12.11) ===")
+    log("(пред. v3.24.0 OPENSERP: свой поисковый сервер на "
+        "ПК2, Chromium рендерит Google/Bing/DDG, без ключей и "
+        "оплаты, Task 162, 12.11)")
+    log("(пред. v3.21.1 СТАРШИЙ БРАТ GIGACHAT-3-ULTRA — КОНСИЛИУМ ДЛЯ "
+        "ШЕФА, Task 156, 12.11)")
+    log("(пред. v3.20.0 ПОИСК-ФИКС: 451-ГЕОБЛОК + БЮДЖЕТ КОНТЕКСТА — "
+        "Task 152, 12.11; ещё раньше: v3.19.2 ССЫЛКИ ШЕФА — НАДЁЖНЫЙ "
+        "ТЕКСТ СТРАНИЦЫ "
         "(Task 151, хотфикс-2 11.11: e2e показал текст=214 симв. — Ctrl+C "
         "не успевал положить выделение тяжёлой страницы в буфер, мозг "
         "уходил в медленный визуальный путь; теперь _chrome_page_text: "
@@ -6761,6 +7425,37 @@ def main():
         "физические пиксели скриншота; v3.6.0 РОУТЕР; v3.5.0 ЗРЕНИЕ+ДАТЧИКИ; "
         "события v3.4.0; v3.3.0 (рация — удалена в v3.8.3); v3.2.1 СВЕРКА; v3.2.0 ГЛАЗА И ГОЛОС; "
         "v3.1.0 ФАЙЛЫ; законы v3.0.1; ученик v3.0; v2.3.0 МАКС) ===")
+    journal("Джарвис v3.25.0 ЧТЕНИЕ САЙТОВ (Task 163, 12.11, разбор "
+            "списка Шефа «что есть интересного для нас»): "
+            "открыть_ссылку/найти_на_странице получили путь 1.5 — "
+            "ЛОКАЛЬНЫЙ Chromium OpenSerp /extract (служба уже стоит с "
+            "Task 162): рендерит JS-страницы и отдаёт чистый Markdown "
+            "за 0.5-0.7 с живьём (iamcook, habr), без экранного "
+            "браузера и без облака. Антибот-гиганты (Ozon 502) — "
+            "по-прежнему путь 2, экран. Разбор списка Шефа живьём: "
+            "Jina Reader r.jina.ai — 451 из РФ (жилой и ЦОД IP) и 401 "
+            "bad-IP-reputation из песочницы, мимо; ddgs — мёртв "
+            "(пакет ушёл на скрейп Yahoo, ConnectError живьём); "
+            "googlesearch-python/ddgs — дублируют наш OpenSerp-поиск; "
+            "Tavily/Exa/Firecrawl — платные облака + гео-блоки РФ "
+            "(Tavily уже проверяли в Task 161); Crawl4AI — идея "
+            "правильная, но у нас уже есть локально в OpenSerp; "
+            "Browser-Use/MCP-серверы — не наш стек (у нас свой "
+            "JSON-протокол инструментов)")
+    journal("Джарвис v3.24.0 OPENSERP (Task 162, 12.11, указание Шефа "
+            "«openserp и searxng, яндекс и tavily убирай — не работают»): "
+            "Яндекс/Tavily API вырезаны из кода и config.json (Яндекс — "
+            "нет роли у аккаунта Студии, Tavily — гео-блок РФ). Вместо "
+            "них — СВОЙ поисковый сервер OpenSerp v0.8.19 прямо на ПК2 "
+            "(D:\\Jarvis\\openserp, служба OpenSerpSvc, localhost:7000, "
+            "автостарт при загрузке): настоящий Chromium рендерит выдачу, "
+            "поэтому Google наконец отвечает результатами (JS-заглушка "
+            "побеждена, живой замер: 5 органик за 5.8 с), DDG — чисто за "
+            "1.7 с, Bing работает; IP жилой, ключей и оплаты нет. "
+            "SearXNG на MSK отклонён: 956 МБ RAM и IP датацентра — "
+            "движки капчят так же, как раньше. Цепочка: OpenSerp-Google "
+            "-> OpenSerp-DDG -> OpenSerp-Bing -> прежние Bing-RU/DDG "
+            "(Task 160) как запас")
     journal("Джарвис v3.17.2 САМОПРОВЕРКА ЖДЁТ МОЗГ (Task 144, 11.11, приказ "
             "Шефа « чини»): фикс ложной тревоги после перезагрузки — selftest "
             "на старте проверял мозг раньше, чем его поднимал вотчдог; теперь "
