@@ -9,15 +9,21 @@ router_pass) — НЕ в коде и НЕ в публичном гите. Зак
 никогда не вводит и не называет пароль — авторизация происходит целиком
 внутри этого модуля.
 
-Протокол: NDW4 Interactive (KeeneticOS 5.x) — SCRAM-рукопожатие:
-  GET  /auth                      -> 401, endpoint x-ndw4-interactive
-  POST /auth {login, nonce}       -> соль/nonce/iter/memcost
-  argon2id(пароль, соль)          -> client_key/server_key (HMAC-SHA3-512)
-  POST /auth {login, nonce, proof}-> сигнатура сервера (проверяем = пароль)
-  POST /auth {...signature-proof} -> сессия (cookie)
-  GET  /rci/...                   -> REST API роутера (JSON)
-Классический NDW2 (md5(login:realm:pass) + sha256(challenge)) на этой
-прошивке НЕ работает — не пытаться.
+Протокол — АВТОВЫБОР по заголовку роутера (v3.25.3, Task 166):
+  GET /auth -> 401 + WWW-Authenticate:
+    x-ndw4-interactive (KeeneticOS 5.x, до обновления 11.11) — SCRAM:
+      POST /auth {login, nonce}       -> соль/nonce/iter/memcost
+      argon2id(пароль, соль)          -> client_key/server_key (HMAC-SHA3-512)
+      POST /auth {login, nonce, proof}-> сигнатура сервера (проверяем = пароль)
+      POST /auth {...signature-proof} -> сессия (cookie)
+    x-ndw2-interactive (прошивка после обновления Шефа 11.11) — классика:
+      md5(login:realm:password)       -> хэш-ключ
+      sha256(хэш-ключ:challenge)      -> ответ (hex)
+      POST /auth {login, response}    -> сессия (cookie)
+  GET  /rci/...                       -> REST API роутера (JSON)
+Живой сбой 12.11: после обновления прошивки роутер перестал предлагать
+NDW4 (остался только NDW2) — модуль падал «роутер не предлагает NDW4».
+Теперь handshake() смотрит, ЧТО предлагает роутер, и идёт нужным путём.
 
 Только ЧТЕНИЕ: статус / устройства / интернет. Перезагрузку роутера
 намеренно не умеем: она оборвёт интернет всему дому, включая меня самого.
@@ -76,7 +82,8 @@ def _cookie_of(hd, old=None):
 
 
 def auth(force=False):
-    """NDW4 SCRAM-рукопожатие -> cookie сессии (кэшируется на SESS_TTL)."""
+    """Сессия -> cookie (кэш SESS_TTL). Протокол выбирает САМ роутер
+    (v3.25.3, Task 166): что предложит в WWW-Authenticate — тем и идём."""
     if _SESS["cookie"] and not force and time.time() - _SESS["ts"] < SESS_TTL:
         return _SESS["cookie"]
     ip, user, password = _cfg()
@@ -89,16 +96,69 @@ def auth(force=False):
         raise RuntimeError("роутер %s не отвечает (выключен?)" % ip)
     if st != 401:
         raise RuntimeError("роутер ответил неожиданно (HTTP %s)" % st)
+    offers = hd.get_all("WWW-Authenticate") or []
     ndw4 = None
-    for w in (hd.get_all("WWW-Authenticate") or []):
+    for w in offers:
         if w.strip().lower().startswith("x-ndw4-interactive"):
             m = re.search(r'endpoint="([^"]*)"', w)
             ndw4 = m.group(1) if m else "/auth"
             break
-    if not ndw4:
-        raise RuntimeError("роутер не предлагает NDW4 (прошивка сменилась?)")
-    auth_url = base + ndw4
-    cookie = _cookie_of(hd)
+    if ndw4:
+        cookie = _auth_ndw4(base, ndw4, _cookie_of(hd), user, password)
+    else:
+        ndw2 = None
+        for w in offers:
+            if w.strip().lower().startswith("x-ndw2-interactive"):
+                ndw2 = w
+                break
+        if ndw2:
+            cookie = _auth_ndw2(base, ndw2, _cookie_of(hd), user, password)
+        else:
+            raise RuntimeError("роутер не предлагает знакомую авторизацию "
+                               "(NDW2/NDW4 нет — прошивка сменилась?)")
+    _SESS["cookie"] = cookie
+    _SESS["ts"] = time.time()
+    return cookie
+
+
+def _auth_ndw2(base, www, cookie, user, password):
+    """v3.25.3 (Task 166): классический Keenetic NDW2-interactive —
+    прошивка после обновления Шефа 11.11 предлагает только его.
+    Формат по эталонному клиенту keenetik-auth (ndm_auth.py):
+      md5(login:realm:password)          -> hex
+      sha256(challenge + md5hex)         -> hex (challenge ПЕРВЫМ, без ':')
+      POST /auth {"login": ..., "password": sha256hex}  (именно password!)
+    Первая попытка с sha256(hash:challenge) и полем "response" ловила
+    HTTP 400 — прошивка ждёт именно этот формат. challenge/realm берём
+    и из WWW-Authenticate, и из одиночных X-NDM-* заголовков (KeenDNS
+    вариант). Сессия = session_cookie из того же 401-ответа."""
+    realm = re.search(r'realm="([^"]*)"', www)
+    chal = re.search(r'challenge="([^"]*)"', www)
+    if not (realm and chal):
+        raise RuntimeError("NDW2 без realm/challenge — не понял роутер")
+    realm, chal = realm.group(1), chal.group(1)
+    h = hashlib.md5(("%s:%s:%s" % (user, realm, password))
+                    .encode("utf-8")).hexdigest()
+    resp = hashlib.sha256((chal + h).encode("utf-8")).hexdigest()
+    st, hd, body = _http("POST", base + "/auth",
+                         {"login": user, "password": resp}, cookie, 15)
+    cookie = _cookie_of(hd, cookie)
+    if st != 200:
+        try:
+            d = json.loads(body.decode("utf-8", "replace"))
+            why = d.get("error") or d.get("e") or ("HTTP %s" % st)
+        except Exception:
+            why = "HTTP %s" % st
+        if st == 401:
+            raise RuntimeError("пароль/логин роутера не подошли (%s) — "
+                               "проверь router_user/router_pass в config.json"
+                               % why)
+        raise RuntimeError("NDW2-вход не удался: %s" % why)
+    return cookie
+
+
+def _auth_ndw4(base, auth_url, cookie, user, password):
+    """NDW4 SCRAM (KeeneticOS 5.x до обновления 11.11) — прежний путь."""
     c_nonce = base64.b64encode(secrets.token_bytes(16)).decode()
 
     # --- фаза 1: сервер выдаёт соль и параметры argon2 ---
@@ -160,8 +220,6 @@ def auth(force=False):
     cookie = _cookie_of(h3, cookie)
     if st3 != 200:
         raise RuntimeError("сессия не открылась (HTTP %s)" % st3)
-    _SESS["cookie"] = cookie
-    _SESS["ts"] = time.time()
     return cookie
 
 
