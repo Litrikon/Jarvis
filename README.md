@@ -790,7 +790,7 @@ OpenSerp-Google → OpenSerp-DDG → OpenSerp-Bing → HTTP-запас. Ключ
   диспетчер устройств). Раньше печаталось загадочное `access=1`.
 - Проверено на ПК2: radios consent = Allow (приватность радиомодулей
   открыта), JarvisAgent RunLevel=Highest — оба «этапа разрешений» из
-  статьи уже выполнены, Вика не нужна отдельно выдача прав.
+  статьи уже выполнены, отдельная выдача прав не нужна.
 - Живой тест: state=Off → on → `access=Allowed; radio now: On` +
   CONFIRMED → state=On.
 
