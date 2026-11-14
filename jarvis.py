@@ -1761,9 +1761,15 @@ def _llm_attempts():
     # до 12288 без роста VRAM (модель 13.1 ГБ + mmproj + KV@q8_0 влезают
     # в 16 ГБ с запасом). Живой Е2Э: 8192 переполнялся на цепочках
     # инструментов («request exceeds context size» -> HTTP 400 -> обрыв).
+    # Task 167 (13.11): Blackfrost вшивает свой промпт в chat_template
+    # GGUF («task-execution machine») — он ломает личность Джарвиса.
+    # Лечим: оригинальный шаблон Qwen через --chat-template-file.
+    _tpl = os.path.join(BASE, "chat_template_qwen_orig.jinja")
     common = ["--host", "127.0.0.1", "--port", "1234", "-a", MODEL_ID,
               "-c", ctx, "-np", slots, "-fa", "on",
               "-ctk", "q8_0", "-ctv", "q8_0"]
+    if os.path.exists(_tpl):
+        common = ["--chat-template-file", _tpl] + common
     tail = ["--threads", str(CFG.get("llm_threads", "6"))]
     attempts = []
     if vis and os.path.exists(MMPROJ):
@@ -2039,8 +2045,13 @@ def llm_chat(messages, max_tokens=None, temperature=0.7, think=False):
             raise
         msg = r["choices"][0]["message"]
         raw = msg.get("content") or ""
-        if not raw.strip():
-            raw = msg.get("reasoning_content") or ""
+        # Task 168 (14.11): reasoning_content НИКОГДА не ответ.
+        # Старый хак v2.2.3 подсовывал английские размышления
+        # как ответ, когда Blackfrost сжигал лимит токенов на
+        # думание (content пуст) — обходя штатную защиту ниже.
+        if not raw.strip() and (msg.get("reasoning_content") or "").strip():
+            log("llm_chat: content пуст, размышления %d симв. — не ответ, "
+                "идём на повтор без думания" % len(msg["reasoning_content"]))
         txt = _strip_think(raw)
         _broke_think = (THINK_OPEN in raw and THINK_CLOSE not in raw)
         # v3.14.5: думали — а ответа нет (пусто/только размышления) —
@@ -4713,6 +4724,14 @@ SYSTEM = """Ты — Джарвис, ИИ-ассистент Шефа, живё�
 
 Сегодня: {date}.
 
+ЗАКОН З6 — ЧЕСТНЫЙ ОТЧЁТ ОБ ИНСТРУМЕНТАХ (14.11, приказ Шефа «не ври»):
+Никогда не говори Шефу «сделал/включил/нашёл/настроил», пока инструмент
+не вернул ПОДТВЕРЖДЕНИЕ результата (CONFIRMED, список найденного,
+созданный файл, код успеха). Пустой вывод, ошибка или NOT_CONFIRMED =
+НЕ СДЕЛАНО — докладывай как есть и пробуй другой путь. Проверка «драйвер
+OK» НЕ равна проверке «функция работает» (пример: блютуз-драйвер OK при
+выключенном радио). Врал Шефу один раз — потерял его доверие.
+
 Ты УПРАВЛЯЕШЬ этим компьютером. У тебя МАКСИМАЛЬНЫЕ ПОЛНОМОЧИЯ (приказ Шефа от 31.10.2026): процесс работает с правами АДМИНИСТРАТОРА, все прежние запреты и белые списки сняты. Если для ответа нужны данные или действие — вызывай инструмент: ответь СТРОГО одним JSON-объектом и ничем больше:
 {"tool": "<имя>", "args": {...}, "say": "короткий комментарий Шефу перед исполнением"}
 
@@ -5276,6 +5295,28 @@ MOUSE_FIX_MSG = ("Служебная проверка: Шеф спросил, Г
                  "или \"скрин\" — точная позиция курсора придёт тебе "
                  "текстом вместе с описанием экрана. Потом ответь Шефу "
                  "строго по факту.")
+
+
+# v3.25.3 (Task 169): BT-страж — вопрос Шефа про Bluetooth, а мозг
+# отвечает «включил/нашёл/включён» БЕЗ единого вызова инструмента.
+# Живой сбой 14.11 15:46: «включи блютуз и поищи устройства» -> ответ
+# из головы «включён, устройств нет» (0 вызовов, радио было выключено,
+# мозг копировал собственное старое враньё из истории).
+BT_Q_RE = re.compile(r"блютуз|bluetooth|\bBT\b", re.I)
+BT_A_RE = re.compile(r"блютуз|bluetooth", re.I)
+BT_TOOLS = {"run_ps", "скилл", "статус"}
+BT_FIX_MSG = ("Служебная проверка (закон З6 — честный отчёт): Шеф спросил "
+              "про Bluetooth, а ты ответил, НЕ вызвав ни одного "
+              "инструмента. Состояние блютуза НЕВОЗМОЖНО знать из головы — "
+              "это радио-тумблер Windows. Единственный рабочий путь — "
+              "инструмент bt.py: run_ps: {\"tool\":\"run_ps\",\"args\":"
+              "{\"cmd\":\"& \\\"D:\\Jarvis\\python\\python.exe\\\" "
+              "\\\"D:\\Jarvis\\data\\bt.py\\\" state\"}} — покажет "
+              "реальное состояние радио (On/Off/Disabled). Дальше по "
+              "заданию: включить — bt.py on (доложи только при CONFIRMED), "
+              "поиск устройств — bt.py scan 15 (доложи список MAC/RSSI из "
+              "вывода). Ничего не выдумывай: нет CONFIRMED/списка — нет "
+              "\"готово\".")
 
 # v3.19.0 (Task 151): ссылка-страж — Шеф прислал ССЫЛКУ (http/https/www),
 # а мозг ответил текстом без единого инструмента. Живой сбой 11.11 19:28:
@@ -6409,6 +6450,7 @@ def _brain_reply_impl(text, mode="think"):
     retried_short = False
     retried_mouse = False   # v3.14.3: мышь-страж
     retried_link = False    # v3.19.0: ссылка-страж
+    retried_bt = False      # v3.25.3: BT-страж
     _order = bool(HANDS_ORDER_VERB_RE.search(text)
                   and HANDS_ORDER_CTX_RE.search(text))
     has_file = bool(FILE_MSG_RE.search(text) or FILE_PATH_RE.search(text))
@@ -6439,6 +6481,17 @@ def _brain_reply_impl(text, mode="think"):
                 msgs.append({"role": "assistant", "content": ans})
                 msgs.append({"role": "user", "content": MOUSE_FIX_MSG})
                 ans = llm_chat(_fit(msgs))
+                continue
+            # v3.25.3 (Task 169): BT-страж — вопрос про блютуз,
+            # а ответ без единого вызова инструмента = из головы
+            if (BT_Q_RE.search(text) and BT_A_RE.search(clean)
+                    and not (called & BT_TOOLS) and not retried_bt):
+                retried_bt = True
+                log("bt-guard: ответ про блютуз без инструмента — перезапрос")
+                msgs.append({"role": "assistant", "content": ans})
+                msgs.append({"role": "user", "content": BT_FIX_MSG})
+                ans = llm_chat(_fit(msgs), think=False)
+                clean = _strip_md(ans)
                 continue
             # v3.19.0 (Task 151): ссылка-страж — Шеф прислал ссылку,
             # а мозг отвечает «из головы» без единого инструмента
@@ -6643,8 +6696,12 @@ def _brain_reply_impl(text, mode="think"):
         log("lang-guard: ответ без русского (%r) — перезапрос" % clean[:60])
         journal("З5: ответ сорвался не на русский — перезапрос")
         msgs.append({"role": "assistant", "content": ans})
-        msgs.append({"role": "user", "content": LANG_FIX_MSG})
-        ans2 = llm_chat(_fit(msgs), think=True)  # v3.14.5: думает и тут
+        msgs.append({"role": "user", "content": LANG_FIX_MSG +
+                     " Отвечай сразу готовым текстом, без размышлений."})
+        # Task 168 (14.11): повтор БЕЗ думания — Blackfrost в think-
+        # режиме на длинных цепочках может снова уйти в английские
+        # размышления (content пуст); без think отвечает стабильно.
+        ans2 = llm_chat(_fit(msgs), think=False)
         clean2 = _strip_md(ans2)
         if _is_russian(clean2) and len(clean2.strip()) >= 3:
             ans, clean = ans2, clean2

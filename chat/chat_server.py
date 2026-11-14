@@ -630,6 +630,7 @@ class Handler(BaseHTTPRequestHandler):
             _rep_cnt = 0
             retried_claim = False
             retried_file = False
+            retried_bt = False   # v3.25.3: BT-страж
             retried_plan = False
             retried_order = False
             retried_mouse = False   # v3.14.3: мышь-страж
@@ -696,6 +697,19 @@ class Handler(BaseHTTPRequestHandler):
                         continue
                     # v3.14.3 (Task 133): мышь-страж — «где мышь» без
                     # скрина/мыши = выдуманные координаты (живой e2e)
+                    # v3.25.3 (Task 169): BT-страж — вопрос про
+                    # блютуз, ответ без инструмента = перезапрос
+                    if (jarvis.BT_Q_RE.search(utext)
+                            and jarvis.BT_A_RE.search(ans)
+                            and not (called & jarvis.BT_TOOLS)
+                            and not retried_bt):
+                        retried_bt = True
+                        jarvis.log("bt-guard(веб): ответ про блютуз без инструмента — перезапрос")
+                        msgs.append({"role": "assistant", "content": ans})
+                        msgs.append({"role": "user", "content": jarvis.BT_FIX_MSG})
+                        ans = jarvis.llm_chat(msgs, think=False)
+                        buf = [ans]
+                        continue
                     if (jarvis.MOUSE_NOW_RE.search(message)
                             and not (called & jarvis.MOUSE_NOW_TOOLS)
                             and not retried_mouse):
