@@ -1148,7 +1148,8 @@ def silero_install_async(chat, voice_name=None):
                     try:
                         p = subprocess.run(args, timeout=2400,
                                            stdout=subprocess.PIPE,
-                                           stderr=subprocess.STDOUT)
+                                           stderr=subprocess.STDOUT,
+                                           creationflags=0x08000000)
                         if p.returncode == 0:
                             ok = True
                             break
@@ -1179,7 +1180,7 @@ def silero_install_async(chat, voice_name=None):
                     p = subprocess.run(
                         [sys.executable, "-m", "pip", "install", "numpy"],
                         timeout=600, stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT)
+                        stderr=subprocess.STDOUT, creationflags=0x08000000)
                     if p.returncode != 0:
                         log("pip numpy: код %s\n%s" % (
                             p.returncode,
@@ -1376,7 +1377,8 @@ def tts_wav(text, voice_name=None, timeout=180):
             p = subprocess.run([exe, "--model", voice, "--output_file", out],
                                input=text.encode("utf-8"),
                                stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, timeout=timeout)
+                               stderr=subprocess.DEVNULL, timeout=timeout,
+                               creationflags=0x08000000)
             if p.returncode == 0 and os.path.isfile(out) \
                     and os.path.getsize(out) > 200:
                 return out
@@ -1410,7 +1412,8 @@ def send_voice(text, chat=None, voice_name=None):
         p = subprocess.run([ff, "-y", "-i", wav, "-c:a", "libopus",
                             "-b:a", "48k", "-ar", "48000", ogg],
                            stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=120)
+                           stderr=subprocess.DEVNULL, timeout=120,
+                           creationflags=0x08000000)
         if p.returncode != 0 or not os.path.isfile(ogg) \
                 or os.path.getsize(ogg) < 200:
             log("send_voice: ffmpeg не сделал ogg (код %s) — откат"
@@ -3536,6 +3539,27 @@ def cmd_sensors():
     return "\n".join(L)
 
 
+def cmd_home(what=""):
+    """v3.27.1 (Task 176) «УМНЫЙ ДОМ»: устройства Шефа.
+    ДВА ТВ по Cast (TCL 192.168.1.6 + Grundig 192.168.1.4, оба локально).
+    Tuya свет/тёплый пол: изоляция Guest-сети снята с роутера самим
+    Джарвисом 15.11 (no isolate-private), устройства достижимы,
+    команды — после выдачи Шефом local_key. Google Home API закрыт
+    (мобSDK/MCP-подписка) — путь локальный, приказ Шефа от 15.11."""
+    try:
+        import home_ctl as H
+    except Exception as e:
+        return "Модуль умного дома не завёлся: %s" % e
+    q = (what or "").strip()
+    try:
+        out = H.handle(q)
+        journal("дом: запрос «%s» — ок" % (q or "справка")[:80])
+        return out
+    except Exception as e:
+        journal("дом: ошибка: %s" % e)
+        return ("Умный дом не ответил: %s" % e + chr(10) + "Скажи Шефу, если повторится.")
+
+
 def cmd_router(what=""):
     """v3.6.0 «РОУТЕР»: наш Keenetic (192.168.1.1) через родной API.
     Приказ Шефа 02.11 «это пароль от роутера, Джарвису дай его» — доступ
@@ -4689,7 +4713,8 @@ def _screen_fact():
         out = subprocess.run(
             ["reg", "query", r"HKCU\Control Panel\Desktop\WindowMetrics",
              "/v", "AppliedDPI"],
-            capture_output=True, text=True, timeout=10).stdout
+            capture_output=True, text=True, timeout=10,
+            creationflags=0x08000000).stdout
         m = re.search(r"AppliedDPI\s+REG_DWORD\s+0x([0-9a-fA-F]+)", out)
         if m:
             pct = int(m.group(1), 16) * 100 // 96
@@ -4745,7 +4770,8 @@ OK» НЕ равна проверке «функция работает» (пр�
 - область {"x":0,"y":0,"w":900,"h":700} — рассмотреть КУСОК экрана в ПОЛНОМ разрешении 1:1: ТОЧНЫЕ координаты мелких кнопок/иконок/тулбаров. Вызывай ПОСЛЕ «скрин», когда надо точно прицелиться: x,y — левый верх куска (из описания скрина), w,h — размер
 - журнал {} — последние записи AI_Журнала
 - датчики {} — живые температуры/обороты/мощности GPU, CPU, платы, дисков (HWiNFO — мгновенно, ничего не открываю)
-- роутер {"что":"статус|устройства|интернет|wifi"} — наш Keenetic-роутер напрямую через API, без браузера и экрана: аптайм/нагрузка, кто сейчас в сети (имена, IP), интернет/WAN-адрес, Wi-Fi (каналы, ширина полосы, сигнал). Доступ у меня уже есть — пароль не нужен и не называть. Перезагрузку роутера НЕ делаю (оборву интернет всему дому).
+- роутер {"что":"статус|устройства|интернет|wifi"}
+- дом {"что":"тв статус|тв громкость 20|тв пауза|тв ютуб <запрос>|грундиг статус|грундиг громкость 20|грундиг пауза|свет в спальне вкл|скан|статус"} — умный дом: ДВА ТВ по Cast — TCL (192.168.1.6, по умолчанию) и Grundig (192.168.1.4, слово «грундиг» в команде); громкость/пауза/YouTube работают на обоих. Свет в спальне (192.168.2.2) и тёплый пол (192.168.2.10) — Tuya: сеть открыта (изоляция роутера снята 15.11, «no isolate-private»), устройства вижу, но команды ждут local_key от Шефа. «статус» — сводка по всем.
 - торренты {"что":"список|удалить","какая":"имя раздачи или пусто=все","файлы":"да|нет"} — uTorrent: «список» покажет раздачи и пути данных; «удалить» очищает список (клиент перезапускается и стартует ПУСТЫМ — это нормальный результат). «файлы»=«да» — удалить и скачанные данные с диска (необратимо; ставь только когда Шеф ЯВНО приказал удалить вместе с файлами, иначе спроси его одним коротким вопросом).
 - run_ps {"cmd":"<PowerShell>"} — ЛЮБАЯ команда PowerShell от имени АДМИНИСТРАТОРА: чтение, создание, удаление, реестр, службы, установка и запуск программ, скачивание, настройки системы — ВСЁ РАЗРЕШЕНО. Вывод вернётся тебе следующим сообщением.
 
@@ -5438,6 +5464,9 @@ def _tool_exec_core(name, args):
         if name == "роутер":
             return cmd_router(str(args.get("что") or args.get("what")
                                     or args.get("запрос") or ""))
+        if name in ("дом", "умный дом", "home"):
+            return cmd_home(str(args.get("что") or args.get("what")
+                                   or args.get("запрос") or ""))
         if name in ("торренты", "торрент", "utorrent", "раздача"):
             return cmd_torrents(str(args.get("что") or args.get("what")
                                     or args.get("запрос") or ""),
@@ -6772,6 +6801,29 @@ HELP = ("🤖 *ДЖАРВИС v3.22 — ТОЧНЫЙ МАРШРУТ*\n\n"
         "роутер, сервисы) — опрошу напрямую и по делу.\n\n"
         "Или просто поговори со мной 😊")
 
+# v3.27.1 (Task 176, 15.11): умный дом — второй ТВ Grundig (192.168.1.4,
+# Cast) рядом с TCL; изоляция Guest-сети снята самим Джарвисом через
+# CLI роутера (no isolate-private, приказ Шефа «зайди в роутер и открой
+# доступ сам») — Tuya-устройства теперь видимы, команды ждут local_key.
+# v3.26.2 (Task 175): строгие триггеры питания ПК — ложный перехват
+# «выключи музыку/обои/мозг» ДО мозга больше не срабатывает (глюк
+# substring «выкл» in t). Питание = только явный приказ про ПК.
+PC_POWER_WORDS = r"(?:пк[0-9]*|компьютер\w*|комп\b|систем[уые]\w*|машину|железо)"
+PC_POWER_OFF_RE = re.compile(
+    r"^(?:выключи|выруби|загаси|погаси)(?:\s+(?:это[тг]|мо[йё]|наш))?"
+    r"\s+" + PC_POWER_WORDS + r"\W*$"
+    r"|^заверши\s+работу(?:\s+" + PC_POWER_WORDS + r")?\W*$"
+    r"|^(?:выключи|выруби|загаси|погаси)$"
+    r"|^shutdown$",
+    re.IGNORECASE)
+PC_POWER_REBOOT_RE = re.compile(
+    r"^(?:перезагрузи|рестартни|перезапусти)(?:\s+(?:это[тг]|мо[йё]|наш))?"
+    r"\s+" + PC_POWER_WORDS + r"\W*$"
+    r"|^(?:перезагрузи|рестартни)$"
+    r"|^(?:reboot|restart)$",
+    re.IGNORECASE)
+
+
 def handle(text, chat_id):
     # v3.16.0 (Task 137, наследие приказа Шефа 09.11) «ОТВЕТЬ ГОЛОСОМ»:
     # фраза «ответь голосом [имя]» вырезается ДО разбора команд и мозга —
@@ -6882,9 +6934,11 @@ def handle(text, chat_id):
     if GEN_GONE_RE.search(text):
         return send(GEN_GONE_MSG, chat_id)
 
-    if "выкл" in t or "shutdown" in t:
+    # v3.26.2 (Task 175): строгий триггер питания — «выключи X» (музыку/
+    # обои/мозг/программу) больше не считается приказом выключить ПК.
+    if PC_POWER_OFF_RE.match(t):
         return send(power_confirm("off"), chat_id)
-    if "перезагруз" in t or "reboot" in t or "restart" in t:
+    if PC_POWER_REBOOT_RE.match(t):
         return send(power_confirm("reboot"), chat_id)
     if "спать" in t or t in ("сон", "sleep", "усни"):
         llm_stop("manual")
@@ -7452,13 +7506,12 @@ def main():
     log("TG-канал: %s" % ("через прокси MSK + автофолбэк на прямое"
                             if TG_OPENER else "напрямую (плавающая сеть)"))
     hello = "--hello" in sys.argv
-    log("=== ДЖАРВИС старт (v3.25.2 ГЛЮК-ФИКС + ТЕЛЕПРОГРАММА: вопрос "
-                "Шефа больше НИКОГДА не выбрасывается из контекста (глюк "
-                "v3.20.0: «программа НТВ» -> ответ про NAS; упаковщик "
-                "переписан, веб-чат тоже упаковывает) + новый инструмент "
-                "«телепрограмма» (tv.mail.ru напрямую, 26 каналов, без "
-                "браузера — поиск по ТВ-вопросам больше не умирает на "
-                "лимите шагов), Task 165, 12.11) ===")
+    log("=== ДЖАРВИС старт (v3.27.1 УМНЫЙ ДОМ — ДВА ТВ: TCL + Grundig по "
+                "Cast (Grundig — второй телевизор Шефа, приказ 15.11), "
+                "изоляция Guest-сети снята с роутера сам (no isolate-"
+                "private): Tuya свет/тёплый пол видимы, команды ждут "
+                "local_key; Google Home закрыт по приказу Шефа 15.11, "
+                "путь — только локальный, Task 176) ===")
     log("(пред. v3.24.0 OPENSERP: свой поисковый сервер на "
         "ПК2, Chromium рендерит Google/Bing/DDG, без ключей и "
         "оплаты, Task 162, 12.11)")
