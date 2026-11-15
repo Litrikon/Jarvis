@@ -102,6 +102,24 @@ def _try_connect(ip=None, port=None):
     return ok, out
 
 
+def _mdns_services():
+    """mDNS-сервисы «Беспроводной отладки» (Android 11+): телефон слушает
+    СЛУЧАЙНЫЙ порт, который меняется при каждом включении отладки/ребуте
+    WiFi — обычный connect по старому порту не сработает. adb mdns находит
+    актуальный порт сам. Возвращает (connect-порты, pairing-порты)."""
+    code, out = _adb("mdns", "services", timeout=15)
+    conn, pr = [], []
+    for ln in (out or "").splitlines():
+        m = re.search(r"(\d+\.\d+\.\d+\.\d+):(\d+)", ln)
+        if not m:
+            continue
+        if "_adb-tls-connect" in ln:
+            conn.append((m.group(1), int(m.group(2))))
+        elif "_adb-tls-pairing" in ln:
+            pr.append((m.group(1), int(m.group(2))))
+    return conn, pr
+
+
 def _one_device():
     devs = _connected()
     if not devs:
@@ -165,21 +183,53 @@ def connect(what=""):
     ip = m.group(1) if m else None
     port = m.group(2) if m and m.group(2) else None
     if ip is None:
-        # IP с роутера
+        # IP с роутера; недоступен — берём сохранённый/дефолтный и всё
+        # равно пробуем mDNS (он работает и без роутера)
         on, info = _phone_online_router()
         if on:
             m2 = re.search(r"(\d+\.\d+\.\d+\.\d+)", info or "")
             if m2:
                 ip = m2.group(1)
     if ip is None:
-        return ("Не вижу POCO в WiFi (роутер его не показывает). Телефон "
-                "дома и на зарядке? Тогда: %s" % _howto_enable())
-    # пробуем стандартный порт, затем mDNS-поиск портов беспроводной отладки
-    ports = [port] if port else [5555, 5554, 5037]
+        conn, pr = _mdns_services()
+        if conn or pr:
+            ip = (conn or pr)[0][0]  # mDNS сам знает адрес телефона
+    if ip is None:
+        ip = _state().get("ip") or DEFAULT_IP
+    # ЖИВАЯ ОСОБЕННОСТЬ (Task 178b): mDNS-обнаружение у adb «просыпается»
+    # не сразу после kill/disconnect; если ничего не нашли — restart
+    # adb-сервера и ещё раз (живой тест: после disconnect mdns пуст,
+    # после kill/start-server сервис появился мгновенно)
+    conn, pr = _mdns_services()
+    if not conn and not pr:
+        _adb("kill-server", timeout=10)
+        _adb("start-server", timeout=15)
+        time.sleep(4)
+        conn, pr = _mdns_services()
+    # пробуем сохранённый порт, затем mDNS-поиск СЛУЧАЙНОГО порта
+    # беспроводной отладки, затем стандартные
+    st = _state()
+    ports = [port] if port else [st.get("adb_port"), 5555, 5554, 5037]
     for p in ports:
+        if not p:
+            continue
         ok, out = _try_connect(ip, p)
         if ok:
             return ("✅ Подключился к телефону: %s:%s (%s)" % (ip, p, out))
+    # порт беспроводной отладки случайный — mDNS-порты
+    for cip, cport in conn:
+        ok, out = _try_connect(cip, cport)
+        if ok:
+            return ("✅ Подключился к телефону по беспроводной отладке "
+                    "(mDNS нашёл порт): %s:%s" % (cip, cport))
+    if pr and not conn:
+        return ("Вижу телефон в сети отладки, но он ещё НЕ СПАРЕН с ПК "
+                "(mDNS показывает только pairing-порт %s). Спари один раз: "
+                "на телефоне «Беспроводная отладка» → «Подключение устройства "
+                "с помощью кода» — скажи мне код из 6 цифр и цифры IP:порт "
+                "с экрана, я запомню НАВСЕГДА (пара переживает ребуты, "
+                "меняться будет только порт — его я сам найду)."
+                % ("%s:%s" % pr[0]))
     return ("Не подключился (%s:%s — отладка выключена или порт другой). %s"
             % (ip, ports, _howto_enable()))
 
@@ -373,6 +423,55 @@ def _no_adb():
     return ("Телефон не подключён по ADB. %s" % _howto_enable())
 
 
+def pair(code, host=""):
+    """Спарить ПК с телефоном ОДИН РАЗ (adb pair ip:port code).
+    Код из 6 цифр и ip:порт Шеф видит на телефоне: «Беспроводная
+    отладка» → «Подключение устройства с помощью кода». Пара сохраняется
+    НАВСЕГДА (переживает ребуты и смену порта) — пароль больше не нужен."""
+    m = re.search(r"(\d+\.\d+\.\d+\.\d+):(\d+)", host or "")
+    if not m or not re.fullmatch(r"\d{6}", (code or "").strip()):
+        # может, в host лежит всё вместе: «спарить 123456 192.168.1.20:37851»
+        m2 = re.search(r"(\d+\.\d+\.\d+\.\d+):(\d+)", (code or "") + " " + (host or ""))
+        if m2 and re.search(r"\b\d{6}\b", (code or "") + " " + (host or "")):
+            code = re.search(r"\b(\d{6})\b", code + " " + host).group(1)
+            m = m2
+        else:
+            return ("Спарка: нужны код из 6 цифр и адрес с экрана телефона. "
+                    "На телефоне: Настройки → Дополнительно → Параметры "
+                    "разработчика → Беспроводная отладка → «Подключение "
+                    "устройства с помощью кода». Продиктуй мне, например: "
+                    "«телефон спарить 482913 192.168.1.20:37851»")
+    ip, port = m.group(1), m.group(2)
+    code, out = _adb("pair", "%s:%s" % (ip, port), code.strip(), timeout=20)
+    if code == 0 and ("success" in out.lower() or "paired" in out.lower()):
+        # спарились — сразу пробуем подключиться (порт подключения другой,
+        # обычно соседний; найдём mDNS или перебором рядом с pairing-портом)
+        st = _state()
+        st["ip"] = ip
+        st["paired"] = True
+        _save_state(st)
+        ok_msg = ("✅ Спарил ПК с телефоном НАВСЕГДА (adb pair %s:%s). "
+                  "Пара сохранена — пароль/код больше не понадобятся. "
+                  % (ip, port))
+        # пробуем mDNS и соседние порты для connect
+        for cip, cport in _mdns_services()[0]:
+            ok, out = _try_connect(cip, cport)
+            if ok:
+                return ok_msg + "Подключился сразу: %s:%s" % (cip, cport)
+        base = int(port)
+        for p in (base - 1, base + 1, base, 5555, base + 2, base - 2):
+            ok, out = _try_connect(ip, p)
+            if ok:
+                return ok_msg + "Подключился сразу: %s:%s" % (ip, p)
+        return ok_msg + ("Подключиться сразу не вышло — скажи «телефон "
+                         "подключи», я найду актуальный порт (он меняется, "
+                         "это нормально — я ищу его сам).")
+    return ("Не спарился (%s). Проверь: код из 6 цифр и ip:порт должны "
+            "быть с ЭКРАНА телефона прямо сейчас (код живёт ~минуту, "
+            "меняется при каждом открытии). Повтори: «телефон спарить "
+            "<код> <ip:порт>». Ответ adb: %s" % (ip, out[:150]))
+
+
 def handle(what):
     """Единый вход для cmd_phone(what): строка -> строка."""
     q = (what or "").strip().lower()
@@ -382,6 +481,24 @@ def handle(what):
         return status()
     if q.startswith("подключ"):
         return connect(q)
+    if q.startswith("спар") or q.startswith("pair"):
+        # «спарить 482913 192.168.1.20:37851» или «спарить 482913»
+        rest = re.sub(r"^(спарить|спарка|pair)\s*", "", q).strip()
+        nums = re.search(r"\b(\d{6})\b", rest)
+        addr = re.search(r"(\d+\.\d+\.\d+\.\d+:\d+)", rest)
+        if nums and addr:
+            return pair(nums.group(1), addr.group(1))
+        if nums:
+            # адрес не дали — попробуем с роутера/mDNS pairing-порт
+            _, pr = _mdns_services()
+            if pr:
+                return pair(nums.group(1), "%s:%s" % pr[0])
+            on, info = _phone_online_router()
+            m = re.search(r"(\d+\.\d+\.\d+\.\d+)", info or "")
+            return ("Код понял (%s), но нужен ещё ip:порт с экрана телефона "
+                    "(строка «IP-адрес и порт» над кодом). Скажи: «телефон "
+                    "спарить %s <ip:порт>»" % (nums.group(1), nums.group(1)))
+        return pair("", "")
     if "батаре" in q or "заряд" in q:
         # может быть без adb — тогда через роутер только онлайн
         d = _one_device()
@@ -424,7 +541,10 @@ def handle(what):
 
 def help_str():
     return ("📱 Телефон: «телефон статус» (сеть/adb/батарея), «телефон "
-            "подключи», «телефон фото 5» (скачать свежие), «телефон скрин», "
-            "«телефон зеркало» (экран на ПК), «телефон приложения <поиск>», "
-            "«телефон тап X Y» / «свайп X1 Y1 X2 Y2» / «печать текст» / "
-            "«кнопка home|back|power», «телефон залить <путь>».")
+            "подключи» (сам найдёт порт по mDNS), «телефон спарить <6 цифр> "
+            "<ip:порт>» (один раз, пара навсегда), «телефон фото 5» (скачать "
+            "свежие), «телефон скрин», «телефон зеркало» (экран на ПК), "
+            "«телефон приложения <поиск>», «телефон тап X Y» / «свайп X1 Y1 "
+            "X2 Y2» / «печать текст» / «кнопка home|back|power», «телефон "
+            "залить <путь>». Порт отладки на телефоне меняется — это "
+            "нормально, я ищу актуальный сам.")
