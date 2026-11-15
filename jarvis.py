@@ -3539,6 +3539,404 @@ def cmd_sensors():
     return "\n".join(L)
 
 
+def cmd_remind(what="", text="", when="", repeat="", ref=""):
+    """v3.28.0 (Task 177) «НАПОМИНАНИЯ»: время + текст + повторы.
+    Ядро remind_ctl.py (JSON на диске, переживает рестарт); поток
+    remind_loop каждые 20 сек проверяет и шлёт Шефу в Telegram.
+    Время парсит МОЗГ («через 20 мин», «в 19:30», «завтра в 9:00») —
+    сюда приходит epoch в when, либо относительные минуты в what."""
+    try:
+        import remind_ctl as RC
+    except Exception as e:
+        return "Модуль напоминаний не завёлся: %s" % e
+    q = (what or "").strip().lower()
+    text = (text or "").strip()
+    when = (when or "").strip()
+    rep = (repeat or "").strip().lower()
+    if rep in ("ежедневно", "каждый день", "каждодневно"):
+        rep = "daily"
+    elif rep in ("еженедельно", "каждую неделю", "каждый неделю"):
+        rep = "weekly"
+    elif rep in ("ежемесячно", "каждый месяц", "каждого числа"):
+        rep = "monthly"
+    elif rep not in ("", "daily", "weekly", "monthly"):
+        return ("Повтор не понял: «%s». Бывает: без повтора, daily, "
+                "weekly, monthly." % repeat)
+    # --- служебные запросы ---
+    if any(w in q for w in ("список", "покажи", "какие", "что напомин")):
+        return RC.list_items()
+    if any(w in q for w in ("сними", "отмени", "удали", "стоп")):
+        return RC.cancel(ref or text or q.replace("сними", "")
+                         .replace("отмени", "").replace("напоминание", "")
+                         .replace("напоминания", "").strip(" ,."))
+    if not text:
+        return RC.help_str()
+    # --- время: epoch или относительные минуты ---
+    due = None
+    if when:
+        try:
+            due = float(when)
+        except Exception:
+            pass
+    if due is None:
+        m = re.search(r"(\d+)\s*(мин|минут|м)", q)
+        if m and ("через" in q or "напомни" in q):
+            due = time.time() + int(m.group(1)) * 60
+        else:
+            m = re.search(r"(\d+)\s*(ч|час)", q)
+            if m:
+                due = time.time() + int(m.group(1)) * 3600
+    if due is None:
+        return ("Не понял время. Сформулируй точно: «напомни через 20 мин "
+                "выключить чайник», «в 19:30 принять лекарства», «каждый "
+                "день в 9:00 зарядка» — время обязательно.")
+    rec = RC.add(text, due, rep)
+    if "error" in rec:
+        return "Не завёл напоминание: %s" % rec["error"]
+    import remind_ctl as _RC
+    return ("⏰ ЗАВЕЛ: " + _RC._fmt(rec))
+
+
+def cmd_volume_pc(what=""):
+    """v3.28.0 (Task 177) «ГРОМКОСТЬ ПК»: системный микшер без экрана.
+    Главный путь — pycaw (Core Audio, COM): точный статус, уровень,
+    мьют. Резерв — nircmd.exe в D:/Jarvis/bin (менять умеет, читать
+    уровень — нет). Живой урок 15.11: pycaw 20260927 сменил API —
+    dev.Activate() больше нет, теперь device.EndpointVolume (property);
+    поддерживаем ОБА варианта. Нет ни того ни другого — честно
+    отказываемся, без выдумок (З6)."""
+    q = (what or "").strip().lower()
+    nircmd = r"D:\Jarvis\bin\nircmd.exe"
+    have_nircmd = os.path.exists(nircmd)
+
+    def _get_vol_interface():
+        """Старый API (до 20260927) ИЛИ новый — что заведётся."""
+        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+        dev = AudioUtilities.GetSpeakers()
+        if dev is None:
+            raise RuntimeError("нет устройства вывода")
+        ev = getattr(dev, "EndpointVolume", None)  # новый API
+        if ev is not None:
+            return ev, dev
+        from ctypes import cast, POINTER           # старый API
+        from comtypes import CLSCTX_ALL
+        inter = dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        return cast(inter, POINTER(IAudioEndpointVolume)), dev
+
+    try:
+        vol, dev = _get_vol_interface()
+        cur = round(vol.GetMasterVolumeLevelScalar() * 100)
+        muted = bool(vol.GetMute())
+        if not q or q.startswith("статус"):
+            return ("Громкость ПК: %d%%%s (устройство: %s)"
+                    % (cur, " (без звука)" if muted else "",
+                       getattr(dev, "FriendlyName", "?")))
+        if q in ("mute", "без звука", "выкл звук", "выключи звук"):
+            vol.SetMute(1, None)
+            return "Заглушил звук ПК (было %d%%) — проверено pycaw" % cur
+        if q in ("unmute", "со звуком", "вкл звук"):
+            vol.SetMute(0, None)
+            return "Включил звук ПК — проверено pycaw"
+        if q in ("тише",):
+            vol.SetMasterVolumeLevelScalar(max(0, (cur - 10)) / 100, None)
+        elif q in ("громче",):
+            vol.SetMasterVolumeLevelScalar(min(100, cur + 10) / 100, None)
+        else:
+            m = re.search(r"(\d+)", q)
+            if not m:
+                return ("Не понял: «%s». Скажи «громкость 20», «тише», "
+                        "«громче», «без звука»" % q)
+            val = max(0, min(100, int(m.group(1))))
+            vol.SetMasterVolumeLevelScalar(val / 100, None)
+        now = round(vol.GetMasterVolumeLevelScalar() * 100)
+        return ("Громкость ПК: %d%% -> %d%% — проверено pycaw"
+                % (cur, now))
+    except ImportError:
+        pass
+    except Exception as e:
+        if not have_nircmd:
+            return ("Громкость не подкралась: %s. Поставь pycaw "
+                    "(pip install pycaw comtypes) или положи nircmd.exe "
+                    "в D:\\Jarvis\\bin." % e)
+    # резерв: nircmd (не отдаёт статус, но умеет менять)
+    if not have_nircmd:
+        return ("pycaw не установлен и nircmd.exe не найден — громкостью "
+                "ПК пока не управляю. Скажи инженеру.")
+    if q in ("тише",):
+        r = ps_run('& "%s" changesysvolume -6553' % nircmd)
+    elif q in ("громче",):
+        r = ps_run('& "%s" changesysvolume 6553' % nircmd)
+    elif q in ("mute", "без звука"):
+        r = ps_run('& "%s" mutesysvolume 1' % nircmd)
+    elif q in ("unmute", "со звуком"):
+        r = ps_run('& "%s" mutesysvolume 0' % nircmd)
+    elif q.isdigit():
+        r = ps_run('& "%s" setsysvolume %d' % (nircmd, int(q) * 655))
+    else:
+        return ("Громкость через nircmd: скажи число 0-100, «тише», "
+                "«громче», «без звука». Текущий уровень nircmd не "
+                "показывает.")
+    return ("Громкость: команда nircmd выполнена (текущий уровень не "
+            "читается — pycaw не установлен). Вывод: %s" % (r or "ок"))
+
+
+def cmd_brightness(how_much=""):
+    """v3.28.0 (Task 177) «ЯРКОСТЬ»: монитор через WMI
+    (WmiMonitorBrightnessMethods). Не все мониторы отдают — тогда честно
+    говорим, внешней кнопкой надёжнее."""
+    q = (how_much or "").strip().lower()
+    head = ("$m = Get-WmiObject -Namespace root/WMI "
+            "-Class WmiMonitorBrightnessMethods\n"
+            'if (-not $m) { "NO_WMI"; exit }\n'
+            "$cur = (Get-WmiObject -Namespace root/WMI "
+            "-Class WmiMonitorBrightness).CurrentBrightness\n"
+            '"CUR=$cur"\n')
+    tail = '} catch { "ERR: " + $_.Exception.Message }\n'
+    if q.isdigit():
+        mid = "  $m.WmiSetBrightness(1,%s)\n" % q.replace("%", "")
+    else:
+        mid = '  "ONLY_STATUS"\n'
+    out = ps_run("try {\n" + head + mid + tail)
+    if "NO_WMI" in out or out.startswith("ERR"):
+        return ("Монитор яркость через WMI не отдаёт (внешний монитор "
+                "без DDC/CI или драйвер закрыл). Яркость меняется "
+                "кнопками монитора.")
+    cur = ""
+    m = re.search(r"CUR=(\d+)", out)
+    if m:
+        cur = m.group(1) + "%"
+    if q.isdigit():
+        val = max(0, min(100, int(q.replace("%", ""))))
+        check = ps_run("$m = Get-WmiObject -Namespace root/WMI "
+                       "-Class WmiMonitorBrightnessMethods\n"
+                       "$m.WmiSetBrightness(1,%d) | Out-Null\n"
+                       "(Get-WmiObject -Namespace root/WMI "
+                       "-Class WmiMonitorBrightness).CurrentBrightness"
+                       % val)
+        got = check.strip().splitlines()[-1].strip() if check.strip() else "?"
+        if got == str(val):
+            return ("Яркость: %s -> %d%% — проверено WMI" % (cur or "?", val))
+        return ("Яркость: команда ушла (%s -> %d%%), проверка читает %s%% — "
+                "если монитор не поменял, у него кнопки поверх WMI."
+                % (cur or "?", val, got))
+    return "Яркость монитора сейчас: %s" % cur
+
+
+def cmd_clipboard(what="", text="", find=""):
+    """v3.28.0 (Task 177) «БУФЕР»: история буфера обмена (текст).
+    Поток clip_loop (ниже) каждые 3 сек снимает текст из буфера и пишет
+    в data\\clip_history.jsonl (последние 500). Инструмент: положить
+    текст в буфер, показать историю, найти в ней, очистить."""
+    q = (what or "").strip().lower()
+    hist = os.path.join(BASE, "data", "clip_history.jsonl")
+    if q.startswith("скоп") or (text and not q or q.startswith("полож")):
+        t = (text or "").strip()
+        if not t:
+            return "Что скопировать? Дай текст в «текст»."
+        r = ps_run(r"Set-Clipboard -Value '%s'" % t.replace("'", "''"))
+        back = ps_run("Get-Clipboard")
+        if back.strip() == t:
+            return "Скопировал в буфер: «%s» — проверено (Get-Clipboard)" % t[:100]
+        return ("Не удалось (вернулось: «%s»). Попробуй ещё раз." % back[:60])
+    if q.startswith("очист"):
+        try:
+            os.remove(hist)
+            return "История буфера очищена."
+        except Exception:
+            return "Истории и не было."
+    if q.startswith("найд"):
+        needle = (find or text or "").strip().lower()
+        if not needle:
+            return "Что искать? Дай слово в «что найти»."
+        rows = []
+        try:
+            with open(hist, encoding="utf-8") as f:
+                rows = [json.loads(l) for l in f if l.strip()][-500:]
+        except Exception:
+            return "История буфера пока пуста."
+        hits = [r for r in rows if needle in str(r.get("text", "")).lower()]
+        if not hits:
+            return "По «%s» в истории ничего." % needle
+        out = []
+        for r in hits[-8:]:
+            out.append("[%s] %s" % (
+                time.strftime("%d.%m %H:%M", time.localtime(r.get("ts", 0))),
+                str(r.get("text", ""))[:120].replace("\n", " ")))
+        return "Нашёл в истории буфера:\n" + "\n".join(out)
+    # показать историю
+    try:
+        with open(hist, encoding="utf-8") as f:
+            rows = [json.loads(l) for l in f if l.strip()]
+    except Exception:
+        return "История буфера пока пуста — я записываю всё, что Шеф копирует."
+    rows = rows[-15:]
+    if not rows:
+        return "История буфера пока пуста."
+    out = []
+    for r in rows:
+        out.append("[%s] %s" % (
+            time.strftime("%d.%m %H:%M", time.localtime(r.get("ts", 0))),
+            str(r.get("text", ""))[:100].replace("\n", " ")))
+    return ("Последние %d записей буфера (новые внизу):\n%s"
+            % (len(out), "\n".join(out)))
+
+
+def cmd_focus(what="", sites=""):
+    """v3.28.0 (Task 177) «ФОКУС»: отвлекающие сайты закрываются
+    hosts-файлом (127.0.0.1) — блокировка на уровне ОС, браузер не
+    обойти (в отличие от расширения). Файл правится с бэкапом, исходник
+    сохраняем в data\\hosts_backup.txt. ВЫКЛ = восстановить бэкап.
+    Список по умолчанию: youtube, vk, twitter, instagram, tiktok,
+    twitch, reddit, facebook."""
+    q = (what or "").strip().lower()
+    state_f = os.path.join(BASE, "data", "focus_state.json")
+    default_sites = ("youtube.com www.youtube.com vk.com m.vk.com "
+                     "twitter.com x.com www.twitter.com instagram.com "
+                     "tiktok.com www.tiktok.com twitch.tv www.twitch.tv "
+                     "reddit.com www.reddit.com facebook.com "
+                     "www.facebook.com").split()
+    def _state():
+        try:
+            with open(state_f, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {"on": False, "sites": []}
+    st = _state()
+    if q.startswith("статус") or not q:
+        if not st.get("on"):
+            return ("Режим фокуса ВЫКЛ. «фокус вкл» — закрыть сайты по "
+                    "умолчанию, «фокус вкл youtube vk» — свои.")
+        until = st.get("until")
+        left = (" до %s" % time.strftime("%H:%M", time.localtime(until))
+                if until else "")
+        return ("Режим фокуса ВКЛ%s. Закрыто: %s"
+                % (left, ", ".join(st.get("sites", [])[:12])))
+    if q.startswith("список"):
+        return "Сайты по умолчанию: " + ", ".join(default_sites)
+    hosts = r"C:\Windows\System32\drivers\etc\hosts"
+    if q.startswith("вкл"):
+        want = [s.strip().lower() for s in (sites or "").replace(",", " ").split()
+                if s.strip()] or default_sites
+        # нормализуем: без протоколов
+        want = [re.sub(r"^https?://", "", s) for s in want][:30]
+        try:
+            orig = open(hosts, encoding="utf-8").read()
+        except Exception as e:
+            return "hosts не читается: %s" % e
+        # снять старую метку, если была
+        base = re.sub(r"# BEGIN JARVIS FOCUS.*?# END JARVIS FOCUS\n?",
+                      "", orig, flags=re.S)
+        if "# BEGIN JARVIS FOCUS" in orig:
+            with open(os.path.join(BASE, "data", "hosts_backup.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write(base)
+        else:
+            with open(os.path.join(BASE, "data", "hosts_backup.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write(orig)
+        lines = ["", "# BEGIN JARVIS FOCUS (v3.28.0 Task 177)"]
+        for s in want:
+            lines.append("127.0.0.1 %s" % s)
+        lines.append("# END JARVIS FOCUS")
+        with open(hosts, "w", encoding="utf-8") as f:
+            f.write(base.rstrip("\n") + "\n" + "\n".join(lines) + "\n")
+        r = ps_run("ipconfig /flushdns")
+        st = {"on": True, "sites": want, "ts": time.time()}
+        with open(state_f, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False)
+        journal("фокус: ВКЛ, %d сайтов, hosts+flushdns" % len(want))
+        return ("🎯 Фокус ВКЛ: закрыл %d сайтов (hosts, DNS-кэш сброшен). "
+                "«фокус выкл» — вернуть как было. Проверка hosts: %s"
+                % (len(want), "метка на месте"
+                   if "# BEGIN JARVIS FOCUS" in open(hosts, encoding="utf-8").read()
+                   else "МЕТКИ НЕТ — смотреть права"))
+    if q.startswith("выкл"):
+        try:
+            with open(os.path.join(BASE, "data", "hosts_backup.txt"),
+                      encoding="utf-8") as f:
+                orig = f.read()
+        except Exception:
+            orig = re.sub(r"# BEGIN JARVIS FOCUS.*?# END JARVIS FOCUS\n?",
+                          "", open(hosts, encoding="utf-8").read(), flags=re.S)
+        base = re.sub(r"# BEGIN JARVIS FOCUS.*?# END JARVIS FOCUS\n?",
+                      "", orig, flags=re.S)
+        with open(hosts, "w", encoding="utf-8") as f:
+            f.write(base)
+        ps_run("ipconfig /flushdns")
+        st2 = {"on": False, "sites": [], "ts": time.time()}
+        with open(state_f, "w", encoding="utf-8") as f:
+            json.dump(st2, f, ensure_ascii=False)
+        now = open(hosts, encoding="utf-8").read()
+        journal("фокус: ВЫКЛ, hosts восстановлен")
+        if "# BEGIN JARVIS FOCUS" not in now:
+            return ("🎯 Фокус ВЫКЛ: hosts восстановлен (проверено — метки "
+                    "нет), DNS-кэш сброшен.")
+        return ("Не вышло снять метку из hosts — скажи Шефу, поднимем "
+                "вручную (C:\\Windows\\System32\\drivers\\etc\\hosts).")
+    return ("Фокус: «фокус вкл» / «фокус выкл» / «фокус статус» / "
+            "«фокус список»")
+
+
+def cmd_screen_time(days="1"):
+    """v3.28.0 (Task 177) «ЭКРАННОЕ ВРЕМЯ»: отчёт по окнам из СОБСТВЕННОГО
+    лога data\\winlog.csv — его пишет winlog_loop (снапшот каждые 60 с:
+    заголовок активного окна + процесс). Группируем по процессу, минуты
+    = записи * 1 мин. Честно: ПК выключен/спит — записей нет, время
+    считается только по минутам присутствия за ПК."""
+    try:
+        n = max(1, min(7, int(str(days).strip() or 1)))
+    except Exception:
+        n = 1
+    csv = os.path.join(BASE, "data", "winlog.csv")
+    if not os.path.exists(csv):
+        return ("Лог окон пока пуст — я начал его вести, через пару часов "
+                "уже будет отчёт. Считаю по активному окну каждую минуту.")
+    cutoff = time.time() - n * 86400
+    by_proc = {}
+    by_title = {}
+    total = 0
+    try:
+        with open(csv, encoding="utf-8-sig") as f:
+            for line in f:
+                parts = line.rstrip("\n").split(";", 2)
+                if len(parts) < 3 or parts[0] == "ts":
+                    continue
+                try:
+                    ts = float(parts[0])
+                except Exception:
+                    continue
+                if ts < cutoff:
+                    continue
+                proc, title = parts[1].strip(), parts[2].strip()[:70]
+                by_proc[proc] = by_proc.get(proc, 0) + 1
+                total += 1
+                key = (proc, title)
+                by_title[key] = by_title.get(key, 0) + 1
+    except Exception as e:
+        return "Лог не прочитался: %s" % e
+    if total == 0:
+        return ("За последние %s в логе ничего — ПК был выключен/спал или "
+                "я только начал вести учёт." % ("сутки" if n == 1 else "%d дн" % n))
+    top_p = sorted(by_proc.items(), key=lambda kv: -kv[1])[:10]
+    lines = ["Экранное время за %s (по активному окну, всего ~%s):"
+             % ("сутки" if n == 1 else "%d дн" % n,
+                ("%.1f ч" % (total / 60) if total >= 60
+                 else "%d мин" % total))]
+    for p, mins in top_p:
+        lines.append("- %s: %s (%d%%)"
+                     % (p, ("%.1f ч" % (mins / 60) if mins >= 60
+                            else "%d мин" % mins),
+                        round(mins * 100 / total)))
+    top_t = sorted(by_title.items(), key=lambda kv: -kv[1])[:3]
+    if top_t:
+        lines.append("Больше всего висело в фокусе:")
+        for (p, t), mins in top_t:
+            lines.append("  «%s» (%s) — %s"
+                         % (t, p, ("%.1f ч" % (mins / 60) if mins >= 60
+                                   else "%d мин" % mins)))
+    return "\n".join(lines)
+
+
 def cmd_home(what=""):
     """v3.27.1 (Task 176) «УМНЫЙ ДОМ»: устройства Шефа.
     ДВА ТВ по Cast (TCL 192.168.1.6 + Grundig 192.168.1.4, оба локально).
@@ -4772,6 +5170,12 @@ OK» НЕ равна проверке «функция работает» (пр�
 - датчики {} — живые температуры/обороты/мощности GPU, CPU, платы, дисков (HWiNFO — мгновенно, ничего не открываю)
 - роутер {"что":"статус|устройства|интернет|wifi"}
 - дом {"что":"тв статус|тв громкость 20|тв пауза|тв ютуб <запрос>|грундиг статус|грундиг громкость 20|грундиг пауза|свет в спальне вкл|скан|статус"} — умный дом: ДВА ТВ по Cast — TCL (192.168.1.6, по умолчанию) и Grundig (192.168.1.4, слово «грундиг» в команде); громкость/пауза/YouTube работают на обоих. Свет в спальне (192.168.2.2) и тёплый пол (192.168.2.10) — Tuya: сеть открыта (изоляция роутера снята 15.11, «no isolate-private»), устройства вижу, но команды ждут local_key от Шефа. «статус» — сводка по всем.
+- напомни {"что":"список|сними <№>","текст":"выключить чайник","через_мин":20,"в_ччмм":"19:30","дата":"завтра","повтор":"daily|weekly|monthly"} — НАПОМИНАНИЯ И ТАЙМЕРЫ. «напомни через 20 мин…», «в 19:30…», «завтра в 9:00…», «каждый день в 9:00 зарядка». Рассчитай время сам и передай «через_мин» (целые минуты от сейчас) или «в_ччмм»+"дата" (дата: сегодня|завтра|ДД.ММ). Повтор — для регулярных. Придёт Шефу в Telegram точно в срок. Список: {"что":"список"}; снять: {"что":"сними","ref":"<№ или часть текста>"}
+- громкость {"что":"статус|20|тише|громче|без звука|со звуком"} — громкость САМОГО ПК (динамики/наушники), не ТВ: уровень 0-100, точный статус. Число = выставить уровень
+- яркость {"сколько":"50"} — яркость монитора ПК в процентах (0-100)
+- буфер {"что":"история|найди|скопируй|очисти","текст":"...","что_найти":"номер счёта"} — буфер обмена: что Шеф копировал (история с временем), поиск по ней («что я копировал вчера с номером счёта?» = найди), положить текст, очистить историю
+- фокус {"что":"вкл|выкл|статус|список","сайты":"youtube.com vk.com"} — режим фокуса: отвлекающие сайты закрываются на уровне Windows (hosts), браузером не обойти. Без «сайты» — стандартный список (ютуб, вк, твиттер, инстаграм, тикток, твич, реддит, фейсбук)
+- экранное_время {"дней":"1"} — сколько часов за какие программы просидел Шеф (отчёт по окнам за сутки или до 7 дней)
 - торренты {"что":"список|удалить","какая":"имя раздачи или пусто=все","файлы":"да|нет"} — uTorrent: «список» покажет раздачи и пути данных; «удалить» очищает список (клиент перезапускается и стартует ПУСТЫМ — это нормальный результат). «файлы»=«да» — удалить и скачанные данные с диска (необратимо; ставь только когда Шеф ЯВНО приказал удалить вместе с файлами, иначе спроси его одним коротким вопросом).
 - run_ps {"cmd":"<PowerShell>"} — ЛЮБАЯ команда PowerShell от имени АДМИНИСТРАТОРА: чтение, создание, удаление, реестр, службы, установка и запуск программ, скачивание, настройки системы — ВСЁ РАЗРЕШЕНО. Вывод вернётся тебе следующим сообщением.
 
@@ -5464,6 +5868,67 @@ def _tool_exec_core(name, args):
         if name == "роутер":
             return cmd_router(str(args.get("что") or args.get("what")
                                     or args.get("запрос") or ""))
+        if name in ("напомни", "напоминание", "напоминания", "таймер",
+                    "remind"):
+            rep = str(args.get("повтор") or args.get("repeat") or "")
+            due = None
+            mins = args.get("через_мин")
+            if mins is None:
+                mins = args.get("минут")
+            try:
+                if mins not in (None, ""):
+                    due = time.time() + float(str(mins).replace(",", ".")) * 60
+            except Exception:
+                due = None
+            if due is None:
+                hm = str(args.get("в_ччмм") or args.get("время") or "").strip()
+                if hm:
+                    m2 = re.search(r"(\d{1,2})[:.](\d{2})", hm)
+                    if m2:
+                        h_, mi_ = int(m2.group(1)) % 24, int(m2.group(2)) % 60
+                        date_s = str(args.get("дата") or "сегодня").strip().lower()
+                        d_ = time.localtime()
+                        if date_s.startswith("завтра"):
+                            due = time.mktime((d_.tm_year, d_.tm_mon,
+                                               d_.tm_mday + 1, h_, mi_,
+                                               0, 0, 0, -1))
+                        elif re.match(r"\d{2}\.\d{2}", date_s):
+                            dd, mm = date_s.split(".")[:2]
+                            due = time.mktime((d_.tm_year, int(mm),
+                                               int(dd), h_, mi_,
+                                               0, 0, 0, -1))
+                        else:
+                            due = time.mktime((d_.tm_year, d_.tm_mon,
+                                               d_.tm_mday, h_, mi_,
+                                               0, 0, 0, -1))
+            return cmd_remind(str(args.get("что") or ""),
+                              str(args.get("текст") or args.get("text")
+                                  or args.get("о_чём") or ""),
+                              str(due or ""),
+                              rep,
+                              str(args.get("ref") or args.get("номер")
+                                  or ""))
+        if name in ("громкость", "громкость пк", "volume"):
+            return cmd_volume_pc(str(args.get("что") or args.get("сколько")
+                                     or args.get("level") or ""))
+        if name in ("яркость", "brightness"):
+            return cmd_brightness(str(args.get("сколько")
+                                      or args.get("что")
+                                      or args.get("level") or ""))
+        if name in ("буфер", "буфер обмена", "clipboard"):
+            return cmd_clipboard(str(args.get("что") or args.get("what")
+                                     or ""),
+                                 str(args.get("текст") or args.get("text")
+                                     or ""),
+                                 str(args.get("что_найти")
+                                     or args.get("найти") or ""))
+        if name in ("фокус", "режим фокуса", "focus"):
+            return cmd_focus(str(args.get("что") or args.get("what") or ""),
+                             str(args.get("сайты") or args.get("sites")
+                                 or ""))
+        if name in ("экранное_время", "экранное время", "screentime"):
+            return cmd_screen_time(str(args.get("дней") or args.get("дни")
+                                       or "1"))
         if name in ("дом", "умный дом", "home"):
             return cmd_home(str(args.get("что") or args.get("what")
                                    or args.get("запрос") or ""))
@@ -7502,11 +7967,112 @@ def selftest_loop():
 
 # ---------------------------------------------------------------- main
 
+
+def remind_loop():
+    """v3.28.0 (Task 177): каждые 20 сек проверяем напоминания; зрелые
+    уходят Шефу в Telegram. Повторяющиеся двигаем вперёд (ядро уже
+    сделало). Сбои не роняют поток."""
+    log("remind_loop запущен (проверка каждые 20 с)")
+    while True:
+        try:
+            import remind_ctl as RC
+            fired, moved = RC.due_now()
+            for r in fired:
+                send("⏰ НАПОМИНАНИЕ: " + r["text"]
+                     + ("" if not r.get("repeat") else " (снято; повтор "
+                        "не задан)"))
+                journal("напоминание #%d сработало: %s"
+                        % (r.get("id", 0), r["text"][:60]))
+            for r in moved:
+                send("⏰ НАПОМИНАНИЕ: " + r["text"])
+                journal("напоминание #%d (повтор) сработало, следующее %s"
+                        % (r.get("id", 0),
+                           time.strftime("%d.%m %H:%M",
+                                         time.localtime(r["due"]))))
+        except Exception:
+            log("remind_loop ERR:\n" + traceback.format_exc())
+        time.sleep(20)
+
+
+def clip_loop():
+    """v3.28.0 (Task 177): каждые 3 сек снимаем текстовый буфер обмена
+    в data\\clip_history.jsonl (последние 500; дубли подряд не пишем).
+    Картинки/файлы не трогаем — только текст."""
+    hist = os.path.join(BASE, "data", "clip_history.jsonl")
+    last = {"t": None}
+    log("clip_loop запущен (снап каждые 3 с)")
+    while True:
+        try:
+            t = ps_run("Get-Clipboard -Raw -ErrorAction SilentlyContinue",
+                       timeout_read=8).strip("\r\n")
+            if t and t != last["t"]:
+                last["t"] = t
+                if len(t) < 20000:
+                    os.makedirs(os.path.dirname(hist), exist_ok=True)
+                    with open(hist, "a", encoding="utf-8") as f:
+                        f.write(json.dumps({"ts": time.time(),
+                                            "text": t[:5000]},
+                                           ensure_ascii=False) + "\n")
+                    try:
+                        with open(hist, encoding="utf-8") as f:
+                            rows = f.readlines()
+                        if len(rows) > 500:
+                            with open(hist, "w", encoding="utf-8") as f:
+                                f.writelines(rows[-500:])
+                    except Exception:
+                        pass
+            elif not t:
+                last["t"] = None
+        except Exception:
+            pass
+        time.sleep(3)
+
+
+def winlog_loop():
+    """v3.28.0 (Task 177): каждые 60 с пишем активное окно + процесс в
+    data\\winlog.csv (ts;proc;title) — топливо для «экранное_время».
+    Ротация: файл не больше ~30 тыс. строк (~месяц)."""
+    path = os.path.join(BASE, "data", "winlog.csv")
+    log("winlog_loop запущен (снап каждые 60 с)")
+    while True:
+        try:
+            import win_ctl
+            wins = win_ctl._visible_windows()
+            fg = [w for w in wins if w[4]]
+            if fg:
+                _h, title, _r, _ic, _f = fg[0]
+                import psutil
+                # hwnd -> pid -> имя процесса
+                import ctypes
+                pid = ctypes.c_ulong()
+                ctypes.windll.user32.GetWindowThreadProcessId(
+                    _h, ctypes.byref(pid))
+                try:
+                    pname = psutil.Process(pid.value).name().replace(";", ",")
+                except Exception:
+                    pname = "?"
+                title = (title or "").replace(";", ",").replace("\n", " ")[:70]
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write("%.0f;%s;%s\n" % (time.time(), pname, title))
+                try:
+                    if os.path.getsize(path) > 3000000:
+                        with open(path, encoding="utf-8") as f:
+                            rows = f.readlines()
+                        with open(path, "w", encoding="utf-8") as f:
+                            f.writelines(rows[-30000:])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        time.sleep(60)
+
+
 def main():
     log("TG-канал: %s" % ("через прокси MSK + автофолбэк на прямое"
                             if TG_OPENER else "напрямую (плавающая сеть)"))
     hello = "--hello" in sys.argv
-    log("=== ДЖАРВИС старт (v3.27.1 УМНЫЙ ДОМ — ДВА ТВ: TCL + Grundig по "
+    log("=== ДЖАРВИС старт (v3.28.0 БЫТОВЫЕ НАВЫКИ — напоминания/таймеры, громкость и яркость ПК, буфер обмена с историей, режим фокуса, экранное время; пред. v3.27.1 УМНЫЙ ДОМ — ДВА ТВ: TCL + Grundig по "
                 "Cast (Grundig — второй телевизор Шефа, приказ 15.11), "
                 "изоляция Guest-сети снята с роутера сам (no isolate-"
                 "private): Tuya свет/тёплый пол видимы, команды ждут "
@@ -7922,6 +8488,7 @@ def main():
             "(шаблон Qwen: system только первым — иначе llama-server "
             "HTTP 500; живой сбой: ответы обрывались до «Ше…»), запрет "
             "думания — в первое system, max_tokens повтора 1200")
+    journal("Джарвис v3.28.0 БЫТОВЫЕ НАВЫКИ (Task 177, 15.11, приказ Шефа «делай» после доклада про новые навыки управления компьютером): напоминания и таймеры с повторами (ядро remind_ctl.py, поток remind_loop шлёт в Telegram в срок); громкость самого ПК (pycaw, статус+уровень+мьют; резерв nircmd); яркость монитора (WMI); история буфера обмена (clip_loop пишет каждые 3 с, поиск «что я копировал вчера»); режим фокуса (hosts-блокировка отвлекающих сайтов с бэкапом и снятием); экранное время (winlog_loop пишет активное окно каждую минуту, отчёт за сутки/неделю)")
     journal("Джарвис v3.9.0 НАДЁЖНОСТЬ (Task 124, 06.11, приказ Шефа "
             "«делай все пункты кроме 7»): ротация логов jarvis.log и "
             "llama.log (~3 МБ, хвост сохраняется); фолбэк связи — прокси "
@@ -7931,18 +8498,19 @@ def main():
             "«дневник»); ежедневная самопроверка в 12:00 (стражи/мозг/"
             "зрение/поиск/файлы/связь — FAIL приходит Шефу)")
     if hello:
-        send("🤖 *ДЖАРВИС v3.13 на связи!*\n\n"
-             "Теперь я ещё и учусь: веду память и пишу себе скиллы — "
-             "новые умения остаются со мной навсегда.\n"
-             "Теперь я не только отвечаю — я ДЕЙСТВУЮ: чищу диск от мусора, "
-             "подсказываю что перенести, запускаю и закрываю программы, а когда "
-             "ты запускаешь игру — сам освобождаю видеокарту и возвращаюсь после.\n\n"
-             "Пиши обычным языком: «освободи диск C», «что можно перенести», "
-             "«запусти стим». «помощь» — список команд.")
+        send("🤖 *ДЖАРВИС v3.28 на связи!*\n\n"
+             "Теперь я веду напоминания (прилетят в срок), кручу громкость "
+             "и яркость самого ПК, помню, что ты копировал в буфер, умею "
+             "закрывать отвлекающие сайты режимом фокуса и показывать "
+             "экранное время.\n"
+             "Пиши обычным языком: «напомни через час выключить чайник», "
+             "«каждый день в 9:00 зарядка», «громкость 20», «что я копировал "
+             "вчера», «фокус вкл».")
     threading.Thread(target=llm_start, daemon=True).start()
     for fn in (polling_loop, watchdog_loop, events_loop, briefing_loop,
                llm_watchdog, game_watch_loop, flags_loop, chat_watchdog,
-               selftest_loop):
+               selftest_loop, remind_loop, clip_loop,
+               winlog_loop):
         threading.Thread(target=fn, daemon=True).start()
     while True:
         time.sleep(60)
