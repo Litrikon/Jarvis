@@ -6876,15 +6876,16 @@ GEN_GONE_MSG = ("🎨 Генерация картинок и видео удал
                 "описать идею словами.")
 
 
-def brain_reply(text, mode="think"):
+def brain_reply(text, mode="think", chat_id=None):
     """v3.15.0 «САМОУЧКА»: обёртка самообучения — ход начинается
     turn_begin'ом и заканчивается turn_finish'ем: после задач с 2+
     инструментами или со сбоями в memory/lessons.json пишется урок-опыт,
     и мозг видит его в следующих промптах (lessons_block). Сама логика —
-    в _brain_reply_impl (без изменений)."""
+    в _brain_reply_impl (без изменений).
+    v3.30.0: chat_id пробрасывается в emit-мост (typing/say/фото)."""
     turn_begin(text)
     try:
-        ans = _brain_reply_impl(text, mode)
+        ans = _brain_reply_impl(text, mode, chat_id=chat_id)
     except Exception:
         turn_finish("")   # сбой хода — урок без итога (опыт про сбой)
         raise
@@ -6892,7 +6893,7 @@ def brain_reply(text, mode="think"):
     return ans
 
 
-def _brain_reply_impl(text, mode="think"):
+def _brain_reply_impl(text, mode="think", chat_id=None):
     """LLM -> (инструмент -> LLM) до 3 раз -> финальный ответ Шефу.
     v3.14.5: ДУМАЕТ ВСЕГДА (приказ Шефа 08.11) — думание на каждом
     шаге, который может стать ответом Шефу: первый заход, пасс после
@@ -6934,335 +6935,19 @@ def _brain_reply_impl(text, mode="think"):
         send("🛰 Старшие не на связи (%s) — включаю глубокое мышление "
              "сам." % c_err[:70])
         mode = "think"
-    sysmsg = {"role": "system", "content": prompt_fill(SYSTEM)}
-    utext = text
-    if FRESH_RE.search(text):
-        utext = (text +
-                 "\n(Служебное напоминание: это свежий вопрос. Для новостей вызови "
-                 "инструмент «новости», для курса валют/крипты — «курсы», для "
-                 "прочего свежего — «интернет». Не отвечай без данных.)")
-    # v3.25.1 (Task 165): вопрос Шефа помечен "_q" — упаковщик контекста
-    # не выбросит его НИКОГДА (глюк v3.20.0: мозг терял вопрос и отвечал
-    # на самый старый вопрос истории)
-    msgs = ([sysmsg] + hist_msgs(hist)
-            + [{"role": "user", "content": utext, "_q": 1}])
-    _hist_len = len(msgs) - 2
-
-    def _fit(ms):
-        """v3.9.0: жёсткий бюджет истории — контекст 12288 не
-        переполняется даже на длинных цепочках инструментов (урок
-        v3.8.4: переполнение = HTTP 400 и обрыв). Режу ТОЛЬКО старую
-        историю (msgs[1:1+_hist_len]), текущий обмен не трогаю.
-        v3.20.0 (Task 152): 15К -> 8.5К симв. И системный промпт
-        (23.4К симв. = 8015 токенов!) из суммы ИСКЛЮЧЁН — раньше он
-        ОДИН переливал бюджет, история выпиливалась ЦЕЛИКОМ каждый
-        раз, а раздутый текущий ход всё равно валился в 400. Финальную
-        упаковку под 12288 делает _pack_for_ctx прямо в llm_chat."""
-        nonlocal _hist_len
-        while (sum(len(m.get("content") or "")
-                   if isinstance(m.get("content"), str) else 2500
-                   for m in ms[1:]) > 8500
-               and _hist_len > 0):
-            ms.pop(1)
-            _hist_len -= 1
-        return ms
-
-    # v3.14.5: ДУМАЕТ ВСЕГДА — первый заход всегда с размышлениями
-    # (smart_mode теперь всегда отдаёт «think»); думание продолжается
-    # и на пассах-ответах после инструментов (см. шаги ниже)
-    ans = llm_chat(_fit(msgs), think=mode in ("think", "consilium"))
-    called = set()
-    _rep_key = None      # v3.14.1: страж повторов (анти-цикл)
-    _rep_cnt = 0
-    retried_claim = False
-    retried_file = False
-    retried_plan = False
-    retried_order = False
-    retried_short = False
-    retried_mouse = False   # v3.14.3: мышь-страж
-    retried_link = False    # v3.19.0: ссылка-страж
-    retried_bt = False      # v3.25.3: BT-страж
-    _order = bool(HANDS_ORDER_VERB_RE.search(text)
-                  and HANDS_ORDER_CTX_RE.search(text))
-    has_file = bool(FILE_MSG_RE.search(text) or FILE_PATH_RE.search(text))
-    # v3.8.6: бюджет — стражи (фантом/руки/план) тоже едят шаги: живой
-    # тест 02.11 19:59 — 3 перезапроса подряд + 4 шага действий = 7 > 5,
-    # ответ обрывался на «Выполняю тест по шагам».
-    # v3.14.0 (Task 132): 8 -> 12 — GUI-цепочка «окна -> окно ->
-    # элементы_окна -> клик_элемент -> проверка -> ответ» + стражи
-    # не влезала в 8 (живой сбой 07.11 21:43-22:01).
-    for _step in range(12):
-        tool = parse_tool(ans)
-        if not tool:
-            # v3.1.1 (Task 97): файл-страж — файл прислан, но ни один
-            # инструмент не вызван = мозг выдумал содержимое.
-            if has_file and not called and not retried_file:
-                retried_file = True
-                log("file-guard: ответ о файле без чтения — перезапрос")
-                msgs.append({"role": "assistant", "content": ans})
-                msgs.append({"role": "user", "content": FILE_FIX_MSG})
-                ans = llm_chat(_fit(msgs))
-                continue
-            # v3.14.3 (Task 133): мышь-страж — «где сейчас мышь/курсор?»
-            # без инструментов зрения/мыши = выдуманные координаты
-            if (MOUSE_NOW_RE.search(text) and not (called & MOUSE_NOW_TOOLS)
-                    and not retried_mouse):
-                retried_mouse = True
-                log("mouse-guard: «где мышь» без инструмента — перезапрос")
-                msgs.append({"role": "assistant", "content": ans})
-                msgs.append({"role": "user", "content": MOUSE_FIX_MSG})
-                ans = llm_chat(_fit(msgs))
-                continue
-            # v3.25.3 (Task 169): BT-страж — вопрос про блютуз,
-            # а ответ без единого вызова инструмента = из головы
-            if (BT_Q_RE.search(text) and BT_A_RE.search(clean)
-                    and not (called & BT_TOOLS) and not retried_bt):
-                retried_bt = True
-                log("bt-guard: ответ про блютуз без инструмента — перезапрос")
-                msgs.append({"role": "assistant", "content": ans})
-                msgs.append({"role": "user", "content": BT_FIX_MSG})
-                ans = llm_chat(_fit(msgs), think=False)
-                clean = _strip_md(ans)
-                continue
-            # v3.19.0 (Task 151): ссылка-страж — Шеф прислал ссылку,
-            # а мозг отвечает «из головы» без единого инструмента
-            _links_in_msg = LINK_MSG_RE.findall(text)
-            if (_links_in_msg and not (called & LINK_TOOLS)
-                    and not retried_link):
-                retried_link = True
-                _lnk = _links_in_msg[0][:300]
-                log("link-guard: ссылка без открытия — перезапрос")
-                msgs.append({"role": "assistant", "content": ans})
-                msgs.append({"role": "user", "content":
-                             LINK_FIX_MSG % (_lnk, _lnk)})
-                ans = llm_chat(_fit(msgs))
-                continue
-            # v3.1.0: трос — «сохранил/создал» без вызова = ложь (Task 96)
-            _claim_fix = claim_without_tool(ans, called)
-            if _claim_fix:
-                if retried_claim:
-                    log("claim-guard: ложь повторилась — честный отказ")
-                    hist_append(text, "(заявил действие без инструмента)")
-                    return ("⚠️ Тут я запнулся, Шеф: заявил действие, но не "
-                            "выполнил его. Скажи ещё раз — сделаю как надо.")
-                retried_claim = True
-                _kind = "фантом" if _claim_fix is PHANTOM_FIX_MSG else (
-                    "руки" if _claim_fix is HANDS_FIX_MSG else "файлы/память")
-                log("claim-guard(%s): заявлено без инструмента — перезапрос" % _kind)
-                msgs.append({"role": "assistant", "content": ans})
-                # v3.8.6: мозгу идёт ИМЕННО то сообщение стража, которое
-                # вернулось (руки/фантом/файлы), а не всегда CLAIM_FIX_MSG
-                msgs.append({"role": "user", "content": _claim_fix})
-                ans = llm_chat(_fit(msgs))
-                continue
-            # v3.8.2 (Task 68): план-гард — «сейчас сделаю/запущу/наберу»
-            # текстом без единого инструмента = действие НЕ выполнено
-            if plan_without_tool(ans, called):
-                if retried_plan:
-                    log("plan-guard: план повторился — отдаю ответ как есть")
-                    break
-                retried_plan = True
-                log("plan-guard: обещание действия без инструмента — перезапрос")
-                msgs.append({"role": "assistant", "content": ans})
-                msgs.append({"role": "user", "content": PLAN_FIX_MSG})
-                ans = llm_chat(_fit(msgs))
-                continue
-            # v3.8.6: приказ-гард — Шеф приказал руки-действие, а за весь
-            # ход НИ ОДНОГО руки-инструмента = приказ не выполнен
-            # (живой тест 20:03: «Делаю тест по факту» текстом и конец)
-            if (_order and not (called & HANDS_ACT_TOOLS)
-                    and not retried_order):
-                retried_order = True
-                log("order-guard: приказ рук без инструмента — перезапрос")
-                msgs.append({"role": "assistant", "content": ans})
-                msgs.append({"role": "user", "content": HANDS_ORDER_FIX_MSG})
-                ans = llm_chat(_fit(msgs))
-                continue
-            break
-        name, args, say = tool
-        called.add(name)
-        # v3.14.1: СТРАЖ ПОВТОРОВ — одинаковый вызов инструмента подряд
-        # (живой e2e 08.11: мышь (3348,2328) x9 — координаты за экраном,
-        # модель не смотрела, что клик не работает, и сожгла весь бюджет).
-        _k = name + "|" + json.dumps(args, sort_keys=True, ensure_ascii=False)
-        if _k == _rep_key:
-            _rep_cnt += 1
-        else:
-            _rep_key, _rep_cnt = _k, 1
-        if _rep_cnt >= 6:
-            log("repeat-guard: 6 одинаковых вызовов — честный останов")
-            hist_append(text, "(застрял на повторе одинакового действия)")
-            return ("⚠️ Я застрял, Шеф: шесть раз подряд одно и то же "
-                    "действие не даёт результата. Остановился, чтобы не "
-                    "молоть впустую. Скажи, что делать дальше — попробую "
-                    "другим путём (другие координаты, клавиатура, run_ps).")
-        if _rep_cnt >= 3:
-            log("repeat-guard: %d одинаковых вызовов — коррекция" % _rep_cnt)
-            msgs.append({"role": "assistant", "content": ans})
-            msgs.append({"role": "user", "content":
-                         "Служебная проверка ЦИКЛА: ты уже %d раз вызываешь "
-                         "тот же инструмент с теми же аргументами — результат "
-                         "не изменится. Остановись и действуй иначе: 1) вызови "
-                         "«скрин» или «область» и ПОСМОТРИ, что реально на "
-                         "экране и что изменилось; 2) смени координаты или "
-                         "подход (клавиша, элементы_окна, run_ps); 3) или "
-                         "честно ответь Шефу, что не получилось, и предложи "
-                         "другой путь." % _rep_cnt})
-            ans = llm_chat(_fit(msgs))
-            continue
-        # v3.7.0 (З5): комментарий перед исполнением — тоже речь Шефу;
-        # сорвавшийся на английский say не показываем (мозг получит
-        # результат инструмента в любом случае)
-        if say and (_is_russian(say) or len(say.strip()) <= 40):
-            send("⚙️ " + say[:300])
-        if name not in ("спать", "проснись"):
-            typing()
-        res = tool_exec(name, args)
-        if name == "спать":
-            hist_append(text, "мозг выгружен из VRAM")
-            return ((say + "\n") if say else "") + \
-                "😴 Мозг выгружен из видеопамяти — VRAM свободна для игр. " \
-                "«проснись» — верну обратно."
-
-        if res == "SCREENSHOT":
-            # v3.14.0 (Task 132): «скрин» — ПРОМЕЖУТОЧНЫЙ инструмент, а НЕ
-            # конец хода. Раньше описание улетало Шефу финальным ответом, и
-            # многошаговые задачи («измени настройку в программе») умирали
-            # здесь ВСЕГДА (живой цикл 07.11 21:45-22:01 — пять ходов
-            # подряд умерли на скрине, до кликов не дошло ни разу).
-            path = take_shot()
-            if not path:
-                why = ("экран залочен (Win+L) — Windows прячет картинку"
-                       if _station_locked() else "ошибка захвата, см. jarvis.log")
-                msgs.append({"role": "assistant", "content": ans})
-                msgs.append({"role": "user", "content":
-                             "Результат инструмента «скрин»: НЕ удался — %s. "
-                             "Продолжай другим путём (окно/элементы_окна/"
-                             "run_ps) или честно ответь Шефу." % why})
-                ans = llm_chat(_fit(msgs), think=True)  # v3.14.5: всегда
-                continue
-            if not vision_available():
-                send_photo(path, caption="📸 Экран (зрение не загружено — просто фото)")
-                os.remove(path)
-                msgs.append({"role": "assistant", "content": ans})
-                msgs.append({"role": "user", "content":
-                             "Результат инструмента «скрин»: фото отправлено "
-                             "Шефу, но зрение не загружено — описать не могу. "
-                             "Продолжай без картинок (элементы_окна/run_ps) "
-                             "или честно ответь Шефу."})
-                ans = llm_chat(_fit(msgs), think=True)  # v3.14.5: всегда
-                continue
-            typing()
-            try:
-                desc = llm_vision(path, ui=True)
-            except Exception as e:
-                log("vision ERR: %s" % e)
-                desc = ""
-            _cur = SHOT_CURSOR  # v3.14.2: где мышь — точные пиксели из ОС
-            send_photo(path, caption=("📸 Экран %s, " % HOSTNAME
-                        + time.strftime("%d.%m %H:%M")
-                        + ((" | 🖱 мышь: %d, %d" % (_cur["x"], _cur["y"]))
-                           if _cur else "")))
-            os.remove(path)
-            msgs.append({"role": "assistant", "content": ans})
-            msgs.append({"role": "user", "content":
-                         "Результат инструмента «скрин» (фото уже ушло Шефу)."
-                         "%s\nЧто вижу на экране:\n%s\n\n"
-                         "Это ПРОМЕЖУТОЧНЫЙ взгляд — задачу Шефа продолжай: "
-                         "следующий JSON (клик_элемент/область/мышь/клавиша/"
-                         "печатать/элементы_окна) или, если всё сделано, "
-                         "финальный ответ по-русски обычным текстом. "
-                         "ВНИМАНИЕ: координаты в описании ПРИБЛИЗИТЕЛЬНЫ "
-                         "(картинка сжата) — для точного клика по кнопке "
-                         "вызови «область» вокруг неё, там 1:1; после клика "
-                         "обязательно проверь результат новым скрин/область."
-                         % (_cursor_note(), desc or
-                            "(не смог разобрать снимок — используй "
-                            "«элементы_окна» или «мышь» по описанию)")})
-            ans = llm_chat(_fit(msgs), think=True)  # v3.14.5: всегда
-            continue
-
-        typing()
-        msgs.append({"role": "assistant", "content": ans})
-        # v3.25.1 (Task 165): результат инструмента в ход — 2200 симв.
-        # (было 3000): при 12 шагах результаты одни съедали ~36К симв.,
-        # упаковщик выкидывал ВОПРОС Шефа (глюк v3.20.0). 2200 = cap
-        # упаковщика; больше всё равно не дойдёт, а ход влезает целиком.
-        _res_tail = str(res)[:2200]
-        msgs.append({"role": "user", "content":
-                     "Результат инструмента «%s»:\n%s\n\n"
-                     "Если данных достаточно — ответь Шефу по-русски, коротко и по делу, "
-                     "обычным текстом без JSON. Если нужен ещё один инструмент — "
-                     "ответь снова одним JSON-объектом."
-                     % (name, _res_tail)})
-        # v3.14.5: пасс после инструмента тоже ДУМАЕТ — здесь рождается
-        # и финальный ответ Шефу, и следующий шаг цепочки
-        ans = llm_chat(_fit(msgs), think=True)
-
-    clean = _strip_md(ans)
-    # v3.9.2: АНТИ-ЗАТУХАНИЕ — короткий обрывок («Шеф, я», 3-11 симв.,
-    # не JSON) = генерация сорвалась. Один перезапрос с требованием
-    # ответить полно; останется коротким — честная замена ниже.
-    if (3 <= len(clean.strip()) < 12
-            and not clean.lstrip().startswith('{"tool"')
-            and not retried_short):
-        retried_short = True
-        log("short-guard: ответ оборвался (%r) — перезапрос" % clean[:40])
-        msgs.append({"role": "assistant", "content": ans})
-        msgs.append({"role": "user", "content":
-                     "Твой прошлый ответ оборвался на полуслове. Ответь "
-                     "Шефу ПОЛНОСТЬЮ: что именно ты видишь или собираешься "
-                     "делать, и вызови нужный инструмент, если он нужен "
-                     "(скриншот/зрение для того, что на экране)."})
-        ans = llm_chat(_fit(msgs), think=True)  # v3.14.5: думает и тут
-        clean = _strip_md(ans)
-    if len(clean.strip()) < 3 or clean.lstrip().startswith('{"tool"'):
-        log("brain_reply: дегенеративный ответ (%r) — честный финал" % clean[:60])
-        hist_append(text, "(не успел доделать за лимит шагов — «продолжай»)")
-        return ("⚠️ Я сделал много шагов, но не успел доделать до конца, "
-                "Шеф. Скажи «продолжай» — доделаю с места, где остановился.")
-    # v3.7.0: языковой страж (З5) — ответ без кириллицы переспрашиваем
-    # один раз; остаётся английским — честный русский отказ.
-    if not _is_russian(clean):
-        log("lang-guard: ответ без русского (%r) — перезапрос" % clean[:60])
-        journal("З5: ответ сорвался не на русский — перезапрос")
-        msgs.append({"role": "assistant", "content": ans})
-        msgs.append({"role": "user", "content": LANG_FIX_MSG +
-                     " Отвечай сразу готовым текстом, без размышлений."})
-        # Task 168 (14.11): повтор БЕЗ думания — Blackfrost в think-
-        # режиме на длинных цепочках может снова уйти в английские
-        # размышления (content пуст); без think отвечает стабильно.
-        ans2 = llm_chat(_fit(msgs), think=False)
-        clean2 = _strip_md(ans2)
-        if _is_russian(clean2) and len(clean2.strip()) >= 3:
-            ans, clean = ans2, clean2
-        else:
-            hist_append(text, "(ответ сорвался на английский)")
-            return ("⚠️ Сорвался тут на английский, Шеф — а по закону З5 говорю "
-                    "только по-русски. Переспроси, отвечу как положено.")
-    # v3.22.0 (Task 157) ТОЧНЫЙ МАРШРУТ: консилиум («проверь у старших»)
-    # и авто-второе-мнение — мозг признался в неуверенности, а вопрос
-    # не приватный: старший брат сверяет ответ, Шеф видит вердикт
-    if clean and _cloud_ready():
-        _verify = (mode == "consilium")
-        if (not _verify and _senior_auto() and mode == "think"
-                and not PRIVATE_RE.search(text) and UNCERT_RE.search(clean)):
-            _verify = True   # мозг САМ сказал «не уверен» — переспрашиваю
-        if _verify:
-            typing()
-            v_ans, v_err = cloud_verify(text, clean)
-            if v_ans:
-                full = (clean + "\n\n🛰 " +
-                        ("Старший брат проверил мой ответ"
-                         if mode == "consilium" else
-                         "Я был не уверен — переспросил у старших")
-                        + _bro_src() + ":\n\n" + _strip_md(v_ans))
-                hist_append(text, full[:1200])
-                return full
-            log("КОНСИЛИУМ: старшие не ответили (%s) — остаюсь при своём"
-                % str(v_err)[:80])
-    hist_append(text, clean)
-    return clean or "…"
+    # v3.30.0 (Task 182) «ОДИН МОЗГ — ДВА КАНАЛА»: цикл вынесен в
+    # brain_core.brain_loop — ЕДИНЫЙ для Telegram и веб-чата. Стражи,
+    # консилиум, короткие/иностранные ответы живут в одном месте и
+    # больше не расползаются (аудит Task 181: ссылка-/short-стражи и
+    # консилиум существовали только в TG-ветке).
+    import brain_core
+    ans, _fail = brain_core.brain_loop(
+        sys.modules[__name__],
+        {"text": text, "mode": mode, "stream": False,
+         "sysmsg": {"role": "system", "content": prompt_fill(SYSTEM)},
+         "emit": (lambda ev: _brain_emit(ev, chat_id)),
+         "log": log})
+    return ans
 
 # ---------------------------------------------------------------- обработка
 
@@ -7326,6 +7011,23 @@ PC_POWER_REBOOT_RE = re.compile(
     re.IGNORECASE)
 
 
+def _brain_emit(ev, chat_id):
+    """v3.30.0 (Task 182): мост событий brain_loop -> Telegram: say —
+    текст Шефу, waiting — индикатор «печатает», image — фото, tool —
+    в TG молча (тихий ход), tok — только для потоковых каналов."""
+    try:
+        et = ev.get("type")
+        if et == "say":
+            send(ev.get("text", ""), chat_id)
+        elif et == "waiting":
+            typing(chat_id)
+        elif et == "image":
+            send_photo(ev.get("path", ""), caption=ev.get("caption", ""))
+        return True
+    except Exception:
+        return True
+
+
 def handle(text, chat_id):
     # v3.16.0 (Task 137, наследие приказа Шефа 09.11) «ОТВЕТЬ ГОЛОСОМ»:
     # фраза «ответь голосом [имя]» вырезается ДО разбора команд и мозга —
@@ -7349,35 +7051,19 @@ def handle(text, chat_id):
             PENDING["action"] = None
             return send("👌 Отменено.", chat_id)
         PENDING["action"] = None
-    # ---- точные быстрые команды (всё остальное решает мозг) ----
-    if t in ("/start", "/help") or t in ("помощь", "хелп", "help", "начало"):
-        return send(HELP, chat_id, voice=_want_voice)
-    if t in ("статус", "/status", "стат"):
-        return send(cmd_status(), chat_id, voice=_want_voice)
-    if t in ("диски", "/disks", "smart", "смарт"):
-        return send(cmd_disks(), chat_id, voice=_want_voice)
-    if t in ("место", "/space", "свободное место"):
-        return send(cmd_space(), chat_id, voice=_want_voice)
-    if t in ("процессы", "/ps", "проц"):
-        return send(cmd_processes(), chat_id, voice=_want_voice)
-    if t in ("журнал", "лог"):
-        return send(cmd_journal(), chat_id, voice=_want_voice)
-    if t in ("пинг", "/ping", "живой"):
-        return send("🏓 Джарвис жив. Аптайм процесса: %s" %
-                    time.strftime("%H:%M:%S", time.gmtime(time.time() - BIRTH)),
-                    chat_id, voice=_want_voice)
-    if t.startswith("скрин") or t == "/shot":
-        r = cmd_shot()
-        if r:
-            send(r, chat_id, voice=_want_voice)
-        return
-    if t.startswith("камер") or t == "/cam":   # v3.18.0: глаза-камера
-        r = cmd_camera()
-        if r:
-            send(r, chat_id, voice=_want_voice)
-        return
-    if t.startswith("больш"):
-        return send(cmd_bigfolders(), chat_id, voice=_want_voice)
+    # ---- v3.30.0 (Task 182): быстрые команды — единый справочник
+    # brain_core.fast_command (тот же список работает и в веб-чате;
+    # раньше веб «статус»/«скрин» жёг 12 шагов думания). Голоса, GEN_GONE
+    # и подтверждения питания — как раньше, ниже по handle() ----
+    import brain_core
+    _fast = brain_core.fast_command(sys.modules[__name__], t)
+    if _fast is not None:
+        _txt = brain_core.run_fast(
+            sys.modules[__name__], _fast,
+            lambda p, cap="": send_photo(p, caption=cap, chat_id=chat_id))
+        if _txt:
+            return send(_txt, chat_id, voice=_want_voice)
+        return None
 
     # ---- v3.16.0 (Task 137): голоса — команды до мозга ----
     if t in ("голоса", "голос", "какие голоса", "какие голоса есть",
@@ -7442,23 +7128,12 @@ def handle(text, chat_id):
         return send(power_confirm("off"), chat_id)
     if PC_POWER_REBOOT_RE.match(t):
         return send(power_confirm("reboot"), chat_id)
-    if "спать" in t or t in ("сон", "sleep", "усни"):
-        llm_stop("manual")
-        journal("Мозг выгружен из VRAM по команде Шефа («спать»)")
-        return send("😴 Мозг выгружен из видеопамяти — VRAM свободна для игр.\n"
-                    "«проснись» — верну (загрузка ~минуты).", chat_id)
-    if "проснись" in t or "проспись" in t or "подъём" in t or "wake" in t:
-        LLM_PROC["sleeping"] = False
-        LLM_PROC["reason"] = None
-        try:
-            os.remove(os.path.join(DATA, "BRAIN.SLEEP"))
-        except OSError:
-            pass
-        send("☕ Загружаю мозг в видеопамять...", chat_id)
-        ok = llm_start()
-        journal("Мозг загружен в VRAM по команде Шефа («проснись»): %s" % ok)
-        return send("🧠 Мозг на месте." if ok else
-                    "⚠️ Не смог загрузить модель — глянь jarvis.log / llama.log.", chat_id)
+    # v3.30.0 (Task 182): «спать»/«проснись» — brain_core.sleep_wake
+    # (единый код для TG и веба; раньше в вебе эти команды не работали
+    # вовсе — уходили мозгу, который спит)
+    _sw = brain_core.sleep_wake(sys.modules[__name__], t)
+    if _sw:
+        return send(_sw, chat_id, voice=_want_voice)
 
     # ---------- всё остальное: свободное общение с мозгом ----------
     # v3.14.5: маршрут упрощён приказом Шефа «думает ВСЕГДА»:
@@ -7490,7 +7165,7 @@ def handle(text, chat_id):
     if _mode != "cloud" and not llm_ensure():
         return send("⚠️ Мозг не отвечает и не завёлся. Записал в jarvis.log.", chat_id)
     try:
-        ans = brain_reply(text.strip(), _mode)
+        ans = brain_reply(text.strip(), _mode, chat_id=chat_id)
         if ans:
             # v3.16.0: голосом по фразе (имя — разовый голос, иначе основной)
             send(ans, chat_id, voice=_want_voice, voice_name=_vname)
@@ -8109,7 +7784,7 @@ def main():
     log("TG-канал: %s" % ("через прокси MSK + автофолбэк на прямое"
                             if TG_OPENER else "напрямую (плавающая сеть)"))
     hello = "--hello" in sys.argv
-    log("=== ДЖАРВИС старт (v3.29.0 ТЕЛЕФОН ШЕФА — POCO X7 Pro: статус/фото/зеркало/управление по WiFi+ADB, phone_ctl; пред. v3.28.0 БЫТОВЫЕ НАВЫКИ — напоминания/таймеры, громкость и яркость ПК, буфер обмена с историей, режим фокуса, экранное время; пред. v3.27.1 УМНЫЙ ДОМ — ДВА ТВ: TCL + Grundig по "
+    log("=== ДЖАРВИС старт (v3.30.0 ОДИН МОЗГ — ДВА КАНАЛА — стратегический рефакторинг по приказу Шефа 16.11: цикл LLM->инструмент->LLM вынесен в brain_core.py, единый для Telegram и веб-чата; в вебе заработали быстрые команды, консилиум, ссылка-/short-стражи, честное «мозг спит»; пред. v3.29.0 ТЕЛЕФОН ШЕФА — POCO X7 Pro: статус/фото/зеркало/управление по WiFi+ADB, phone_ctl; пред. v3.28.0 БЫТОВЫЕ НАВЫКИ — напоминания/таймеры, громкость и яркость ПК, буфер обмена с историей, режим фокуса, экранное время; пред. v3.27.1 УМНЫЙ ДОМ — ДВА ТВ: TCL + Grundig по "
                 "Cast (Grundig — второй телевизор Шефа, приказ 15.11), "
                 "изоляция Guest-сети снята с роутера сам (no isolate-"
                 "private): Tuya свет/тёплый пол видимы, команды ждут "
@@ -8525,6 +8200,7 @@ def main():
             "(шаблон Qwen: system только первым — иначе llama-server "
             "HTTP 500; живой сбой: ответы обрывались до «Ше…»), запрет "
             "думания — в первое system, max_tokens повтора 1200")
+    journal("Джарвис v3.30.0 ОДИН МОЗГ — ДВА КАНАЛА (Task 182, 16.11, стратегический рефакторинг по приказу Шефа «ДЕЛАЙ»): цикл LLM->инструмент->LLM вынесен из продублированных веток TG/веб в единый brain_core.brain_loop — стражи (файл/мышь/BT/ссылка/claim/план/приказ/повторы/short/язык), консилиум и честные финалы теперь в одном месте; быстрые команды (статус/диски/скрин/спать/...) — единый справочник brain_core.fast_command, заработали в веб-чате")
     journal("Джарвис v3.28.0 БЫТОВЫЕ НАВЫКИ (Task 177, 15.11, приказ Шефа «делай» после доклада про новые навыки управления компьютером): напоминания и таймеры с повторами (ядро remind_ctl.py, поток remind_loop шлёт в Telegram в срок); громкость самого ПК (pycaw, статус+уровень+мьют; резерв nircmd); яркость монитора (WMI); история буфера обмена (clip_loop пишет каждые 3 с, поиск «что я копировал вчера»); режим фокуса (hosts-блокировка отвлекающих сайтов с бэкапом и снятием); экранное время (winlog_loop пишет активное окно каждую минуту, отчёт за сутки/неделю)")
     journal("Джарвис v3.29.0 ТЕЛЕФОН ШЕФА (Task 178, 15.11, вопрос Шефа «если подключу телефон к ПК — что можно сделать» + «через WiFi? на ПК есть Связь с телефоном»): новый инструмент «телефон» — POCO X7 Pro; WiFi-статус через роутер и связка Phone Link работают сразу; полное управление (скрин/зеркало scrcpy/фото adb pull/тапы/приложения с поиском по-русски/заливка) — через ADB, adb+scrcpy установлены на ПК2, ждут включения Шефом отладки на телефоне (инструкция в ответах Джарвиса)")
     journal("Джарвис v3.9.0 НАДЁЖНОСТЬ (Task 124, 06.11, приказ Шефа "

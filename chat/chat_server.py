@@ -95,11 +95,10 @@ MAX_VOICE = 30 * 1024 * 1024   # v3.2.0: голосовой ввод (wav 16k ~ 
 sys.path.insert(0, BASE)
 import jarvis  # noqa: E402  (конфиг, инструменты, обёртки LLM)
 
-SYSTEM_LOCAL = jarvis.SYSTEM.replace(
-    "и общаешься с ним в Telegram",
-    "и общаешься с ним в окне локального чата прямо на этом ПК").replace(
-    "Пиши простым текстом БЕЗ markdown",
-    "Отвечай простым текстом БЕЗ markdown")
+import brain_core  # noqa: E402  (v3.30.0 Task 182: единый цикл мозга)
+# v3.30.0: системный промпт веб-чата — brain_core.web_sysmsg (замена
+# текста живёт рядом с циклом, а не во второй копии)
+SYSTEM_LOCAL = brain_core.web_sysmsg(jarvis)
 
 CHATLOG = os.path.join(CHAT_DIR, "chat.log")
 
@@ -500,6 +499,9 @@ class Handler(BaseHTTPRequestHandler):
         _web_files = []             # файлы этого хода для карточек «скачать»
         # v3.10 (Task 128): умный маршрут как в Telegram (коллега GLM — без)
         _mode = None if is_glm else jarvis.smart_mode(message)
+        # v3.30.0 (Task 182): консилиум больше НЕ молча превращается
+        # в think: cloud/big уходят старшим ДО цикла, consilium идёт в
+        # brain_loop (локальный думает + старший проверяет)
         _want_cloud = _mode == "cloud" or (
             _mode == "big" and jarvis._cloud_ready())  # v3.21.0: и GigaChat
 
@@ -508,6 +510,32 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
         self.end_headers()
+
+        def _emit_sw_photo(path, caption=""):
+            """v3.30.0: фото от быстрых команд (kind=photo) в веб —
+            карточкой b64; канал сам удалит файл после чтения."""
+            try:
+                with open(path, "rb") as fh:
+                    ok = emit({"type": "image",
+                               "b64": base64.b64encode(fh.read()).decode()})
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                return ok
+            except OSError:
+                return emit({"type": "say", "text": "(фото не дошло)"})
+
+        def _emit_sw(ev):
+            """v3.30.0: события sleep_wake до цикла: «☕ Загружаю мозг...»
+            уходит Шефу СРАЗУ (загрузка модели идёт минуты)."""
+            if ev.get("type") == "say":
+                try:
+                    return emit({"type": "say", "text": ev.get("text", "")})
+                except (BrokenPipeError, ConnectionAbortedError,
+                        ConnectionResetError):
+                    return False
+            return True
 
         def emit(obj):
             try:
@@ -599,6 +627,79 @@ class Handler(BaseHTTPRequestHandler):
                     "пишет тебе через API локального чата. Отвечай ему как коллеге-"
                     "профессионалу: сжатый отчёт по делу, без приветствий дворецкого. "
                     "Данные о ПК при необходимости бери инструментами.")
+            # ---------- v3.30.0 (Task 182): быстрые команды в вебе —
+            # впервые. Тот же справочник brain_core.fast_command, что и в
+            # TG (аудит Task 181: «статус» в вебе жёг 12 шагов думания,
+            # «спать» вообще не работал). Только для Шефа (не GLM).
+            if not is_glm:
+                _t = message.strip().lower()
+                _fast = brain_core.fast_command(jarvis, _t)
+                if _fast is not None:
+                    _txt = brain_core.run_fast(
+                        jarvis, _fast, _emit_sw_photo)
+                    if _txt is None and _fast.get("kind") == "cmd":
+                        # cmd_shot/cmd_camera уже отправили фото в TG
+                        # (send_photo живого jarvis); для веба покажем
+                        # факт действия и продублируем фото, если канал
+                        # его отдал (b64 недоступен из чужого процесса —
+                        # честная пометка)
+                        _txt = ("📸 Фото ушло в Telegram (команда "
+                                "выполнена).")
+                    if _txt:
+                        jarvis.mirror_append("web", "jarvis", _txt[:400])
+                        emit({"type": "done", "text": _txt})
+                        _final_txt_holder[0] = _txt
+                    return
+                _sw = brain_core.sleep_wake(jarvis, _t, emit=_emit_sw)
+                if _sw:
+                    jarvis.mirror_append("web", "jarvis", _sw[:400])
+                    emit({"type": "done", "text": _sw})
+                    _final_txt_holder[0] = _sw
+                    return
+            # ---------- v3.30.0 (Task 182): честный «мозг спит» ----------
+            # Раньше: «мозг не отвечает (llama-server не запустился)» —
+            # неверно, когда мозг спит из-за игры. Теперь: старшие братья
+            # отвечают на cloud/consilium/big без VRAM, иначе честное
+            # «спит» с подсказкой «проснись» (быстрые команды выше уже
+            # сработали).
+            if jarvis.LLM_PROC["sleeping"]:
+                if _want_cloud:
+                    emit({"type": "waiting"})
+                    try:
+                        c_ans, c_err = jarvis.cloud_ask(
+                            jarvis._cloud_question(message, []),
+                            [])
+                    except Exception as e:
+                        c_ans, c_err = None, str(e)
+                    if c_ans:
+                        txt = ("🛰 (локальный мозг спит — игра? Старшие%s "
+                               "ответили так:)\n\n%s"
+                               % (jarvis._bro_src(),
+                                  jarvis._strip_md(c_ans)))
+                        jarvis.hist_append(disp, "[старшие, мозг спал] "
+                                           + c_ans[:900])
+                        jarvis.mirror_append("web", "jarvis", txt)
+                        emit({"type": "tok", "text": txt})
+                        emit({"type": "done", "text": txt})
+                        _final_txt_holder[0] = txt
+                        return
+                    _txt = ("😴 Мозг спит, а старшие не на связи (%s). "
+                            "«проснись» — подниму локальный."
+                            % str(c_err or "?")[:60])
+                    jarvis.mirror_append("web", "jarvis", _txt)
+                    emit({"type": "done", "text": _txt})
+                    _final_txt_holder[0] = _txt
+                    return
+                _why = (" — идёт игра, сам вернусь после её закрытия"
+                        if jarvis.LLM_PROC.get("reason") == "game" else "")
+                _txt = ("😴 Мозг спит — видеопамять свободна%s. Быстрые "
+                        "команды работают (статус/диски/скрин). "
+                        "«проснись» — загружу обратно." % _why)
+                jarvis.mirror_append("web", "jarvis", _txt)
+                emit({"type": "done", "text": _txt})
+                _final_txt_holder[0] = _txt
+                return
+
             utext = message
             if clean:
                 # v3.1.1 (Task 97): подаём мозгу так же, как файлы из Telegram;
@@ -618,268 +719,61 @@ class Handler(BaseHTTPRequestHandler):
                          "\n(Служебное напоминание: это свежий вопрос — узнай "
                          "актуальные данные инструментом «новости», «курсы» или "
                          "«интернет».)")
-            # v2 (Task 89): единая история с Telegram (history.json);
-            # v3.25.1 (Task 165): вопрос помечен "_q" — упаковщик
-            # jarvis._pack_for_ctx не выбросит его из контекста
-            msgs = ([sysmsg] + jarvis.hist_msgs(jarvis.hist_load()) +
-                    [{"role": "user", "content": utext, "_q": 1}])
+            # ---------- v3.30.0 (Task 182) «ОДИН МОЗГ — ДВА КАНАЛА»:
+            # цикл мозга — brain_core.brain_loop, ЕДИНЫЙ с Telegram.
+            # Веб-итерация 12 шагов + стражи дублировала TG-ветку и
+            # отставала от неё (нет ссылка-/short-стражей, консилиум
+            # молча превращался в think — аудит Task 181).
             final = ""
-            called = set()
-            _force_nothink = False  # v3.14.5b: пустой ответ после думания
-            _rep_key = None   # v3.14.1: страж повторов (анти-цикл)
-            _rep_cnt = 0
-            retried_claim = False
-            retried_file = False
-            retried_bt = False   # v3.25.3: BT-страж
-            retried_plan = False
-            retried_order = False
-            retried_mouse = False   # v3.14.3: мышь-страж
-            hist_n = len(jarvis.hist_msgs(jarvis.hist_load()))
-            for _step in range(12):  # v3.14.0 (Task 132): 8 -> 12 — GUI-цепочки настроек длинные
-                buf, head, visible = [], "", None
-                ctx_retry = False
-                while True:
-                    try:
-                        # v3.14.5 (Task 135): ДУМАЕТ ВСЕГДА — приказ Шефа
-                        # «Не надо быстрых ответов, пусть думает нормально
-                        # всегда»: думание на КАЖДОМ шаге, а не только на
-                        # первом (smart_mode теперь всегда отдаёт «think»);
-                        # _force_nothink — повтор после пустого думания (5b)
-                        _think_now = (_mode == "think") and not _force_nothink
-                        for tok in llm_stream(
-                                msgs,
-                                max_tokens=(int(jarvis.CFG.get(
-                                    "llm_think_tokens", 2000))
-                                    if _think_now else 800),
-                                think=_think_now):
-                            if visible is None:
-                                head += tok
-                                st = head.lstrip()
-                                if st.startswith("{"):
-                                    visible = False
-                                elif len(st) >= 8 or "\n" in st:
-                                    visible = True
-                                    emit({"type": "tok", "text": head})
-                            elif visible:
-                                emit({"type": "tok", "text": tok})
-                            buf.append(tok)
-                    except urllib.error.HTTPError as _e:
-                        # v3.8.4 ctx-guard: llama-server ответил 400 «request
-                        # exceeds context size» — раньше это убивало весь
-                        # запрос. Сбрасываем старую историю (системный промпт
-                        # и текущая цепочка инструментов остаются) и повторяем
-                        # тот же шаг.
-                        if _e.code == 400 and not ctx_retry:
-                            ctx_retry = True
-                            clog("ctx-guard: 400 (контекст переполнен) — "
-                                 "сброс истории, повтор шага")
-                            msgs = [sysmsg] + msgs[1 + hist_n:]
-                            buf, head, visible = [], "", None
-                            continue
-                        raise
-                    break
-                if visible is None and head:
-                    emit({"type": "tok", "text": head})
-                ans = jarvis._strip_think("".join(buf))
-                tool = jarvis.parse_tool(ans)
-                if not tool:
-                    # v3.1.1 (Task 97): файл-страж — файлы прикреплены, но ни
-                    # один инструмент не вызван = содержимое выдумано.
-                    # v3.2.0 (Task 98): + явный ПУТЬ в тексте («расшифруй
-                    # D:\...») — содержимое тоже неизвестно мозгу.
-                    if (clean or jarvis.FILE_PATH_RE.search(message)) \
-                            and not called and not retried_file:
-                        retried_file = True
-                        clog("file-guard: ответ о файле без чтения — перезапрос")
-                        msgs.append({"role": "assistant", "content": ans})
-                        msgs.append({"role": "user",
-                                     "content": jarvis.FILE_FIX_MSG})
-                        continue
-                    # v3.14.3 (Task 133): мышь-страж — «где мышь» без
-                    # скрина/мыши = выдуманные координаты (живой e2e)
-                    # v3.25.3 (Task 169): BT-страж — вопрос про
-                    # блютуз, ответ без инструмента = перезапрос
-                    if (jarvis.BT_Q_RE.search(utext)
-                            and jarvis.BT_A_RE.search(ans)
-                            and not (called & jarvis.BT_TOOLS)
-                            and not retried_bt):
-                        retried_bt = True
-                        jarvis.log("bt-guard(веб): ответ про блютуз без инструмента — перезапрос")
-                        msgs.append({"role": "assistant", "content": ans})
-                        msgs.append({"role": "user", "content": jarvis.BT_FIX_MSG})
-                        ans = jarvis.llm_chat(msgs, think=False)
-                        buf = [ans]
-                        continue
-                    if (jarvis.MOUSE_NOW_RE.search(message)
-                            and not (called & jarvis.MOUSE_NOW_TOOLS)
-                            and not retried_mouse):
-                        retried_mouse = True
-                        clog("mouse-guard: «где мышь» без инструмента — "
-                             "перезапрос")
-                        msgs.append({"role": "assistant", "content": ans})
-                        msgs.append({"role": "user",
-                                     "content": jarvis.MOUSE_FIX_MSG})
-                        continue
-                    # v3.1.0: трос — «сохранил/создал» без вызова (Task 96)
-                    # v3.8.5: + руки («передвинул/кликнул/напечатал» без
-                    # инструмента) — claim_without_tool возвращает ГОТОВОЕ
-                    # сообщение-исправление (файловое или рук)
-                    _claim_fix = jarvis.claim_without_tool(ans, called)
-                    if _claim_fix:
-                        if retried_claim:
-                            clog("claim-guard: повторная ложь — честный отказ")
-                            jarvis.hist_append(disp, "(заявил без инструмента)")
-                            emit({"type": "done",
-                                  "text": "⚠️ Я заявил действие, но не выполнил "
-                                          "его (внутренняя проверка честности). "
-                                          "Спроси ещё раз."})
-                            return
-                        retried_claim = True
-                        clog("claim-guard: перезапрос после ложного «сделал»")
-                        msgs.append({"role": "assistant", "content": ans})
-                        msgs.append({"role": "user",
-                                     "content": _claim_fix})
-                        continue
-                    # v3.8.2 (Task 68): план-гард — «сейчас сделаю/запущу/
-                    # наберу» текстом без единого инструмента = НИЧЕГО
-                    # не произошло. Один перезапрос.
-                    if jarvis.plan_without_tool(ans, called) and not retried_plan:
-                        retried_plan = True
-                        clog("plan-guard: обещание действия без инструмента — перезапрос")
-                        msgs.append({"role": "assistant", "content": ans})
-                        msgs.append({"role": "user",
-                                     "content": jarvis.PLAN_FIX_MSG})
-                        continue
-                    # v3.8.6 (Task 107): приказ-гард — Шеф ПРИКАЗАЛ
-                    # руки-действие (передвинь/кликни/напечатай/открой...),
-                    # а за весь ход НИ ОДНОГО руки-инструмента = приказ
-                    # НЕ выполнен (живой тест 02.11 20:03/20:09: мозг дважды
-                    # уходил в «Честно: я ничего не делал — это была ложь.
-                    # Сейчас делаю по факту» и заканчивал без вызовов).
-                    if (jarvis.HANDS_ORDER_VERB_RE.search(message)
-                            and jarvis.HANDS_ORDER_CTX_RE.search(message)
-                            and not (called & jarvis.HANDS_ACT_TOOLS)
-                            and not retried_order):
-                        retried_order = True
-                        clog("order-guard: приказ рук без инструмента — перезапрос")
-                        msgs.append({"role": "assistant", "content": ans})
-                        msgs.append({"role": "user",
-                                     "content": jarvis.HANDS_ORDER_FIX_MSG})
-                        continue
-                    final = ans
-                    if len(final.strip()) < 3 and _step < 12:
-                        # v3.14.5b (Task 135, живой сбой 08.11 19:28):
-                        # «думает всегда» → иногда ВСЯ генерация уходит в
-                        # размышления и ответ пуст. Раньше сюда дописывали
-                        # system-сообщение В КОНЕЦ массива — шаблон Qwen
-                        # требует system только первым, llama-server
-                        # поднимал 500 «System message must be at the
-                        # beginning» и ход умирал без ответа. Теперь:
-                        # повтор ШАГА без думания, напоминание — в первое
-                        # system (как в jarvis.llm_chat v3.9.1); второй
-                        # пустой ответ — честное сообщение об ошибке.
-                        if not _force_nothink:
-                            _force_nothink = True
-                            clog("пустой ответ после думания — повтор без думания")
-                            if msgs and msgs[0].get("role") == "system":
-                                msgs[0] = dict(msgs[0])
-                                msgs[0]["content"] = (
-                                    (msgs[0].get("content") or "")
-                                    + "\n\nВАЖНО: не размышляй вслух и не "
-                                      "используй тег размышлений — отвечай "
-                                      "сразу готовым текстом. Коротко, "
-                                      "по-русски.")
-                            continue
-                        clog("веб-ответ сорвался (дегенеративный): %r"
-                             % final[:80])
-                        jarvis.hist_append(disp, "(веб: ответ сорвался)")
-                        emit({"type": "error",
-                              "text": "Я подумал, но ответ сорвался при "
-                                      "генерации. Переспроси — отвечу."})
-                        return
-                    break
-                name, args, say = tool
-                called.add(name)
-                # v3.14.1: страж повторов — как в brain_reply (Task 132)
-                _k = name + "|" + json.dumps(args, sort_keys=True,
-                                             ensure_ascii=False)
-                if _k == _rep_key:
-                    _rep_cnt += 1
-                else:
-                    _rep_key, _rep_cnt = _k, 1
-                if _rep_cnt >= 6:
-                    clog("repeat-guard: 6 одинаковых вызовов — останов")
-                    jarvis.hist_append(disp, "(застрял на повторе действия)")
-                    emit({"type": "done", "text":
-                          "⚠️ Я застрял: шесть раз подряд одно и то же "
-                          "действие не даёт результата. Остановился. "
-                          "Скажи, что делать дальше — попробую иначе."})
-                    return
-                if _rep_cnt >= 3:
-                    clog("repeat-guard: %d одинаковых — коррекция" % _rep_cnt)
-                    msgs.append({"role": "assistant", "content": ans})
-                    msgs.append({"role": "user", "content":
-                                 "Служебная проверка ЦИКЛА: ты уже %d раз "
-                                 "вызываешь тот же инструмент с теми же "
-                                 "аргументами — результат не изменится. "
-                                 "Действуй иначе: «скрин»/«область» и "
-                                 "посмотри что изменилось, смени координаты "
-                                 "или подход, либо честно ответь Шефу."
-                                 % _rep_cnt})
-                    continue
-                if say:
-                    emit({"type": "say", "text": say[:300]})
-                res = jarvis.tool_exec(name, args)
-                # v3.15.0: файл-инструменты — путь из результата идёт
-                # в карточки «скачать» (СОХРАНЕНО: <путь> / отправил Шефу: <путь>)
-                if name in FILE_EMIT_TOOLS:
-                    for _p in _paths_from_text(res):
-                        if _p not in _web_files and _web_allowed(_p) \
-                                and os.path.isfile(_p):
-                            _web_files.append(_p)
-                if res == "SCREENSHOT":
-                    path = jarvis.take_shot()
-                    if path:
-                        with open(path, "rb") as fh:
-                            emit({"type": "image",
-                                  "b64": base64.b64encode(fh.read()).decode()})
-                        # v3.2.0: в веб-чате скрин теперь ЕЩЁ и описываем
-                        # зрением (как в TG), а не просто показываем картинку
-                        if jarvis.vision_available():
-                            try:
-                                desc = jarvis.llm_vision(path, ui=True)
-                            except Exception as e:
-                                jarvis.log("vision ERR: %s" % e)
-                                desc = ""
-                            # v3.14.2: точная позиция мыши — текстом мозгу
-                            res = ("скриншот показан Шефу в чате.%s "
-                                   "Описание зрением: %s"
-                                   % (jarvis._cursor_note(),
-                                      desc or "(не разобрал)"))
-                        else:
-                            res = ("скриншот показан Шефу в чате (зрение не "
-                                   "загружено — не выдумывай описание, скажи "
-                                   "что видишь только картинку выше)")
-                        os.remove(path)
-                    else:
-                        res = "скриншот не удался (экран заблокирован?)"
-                emit({"type": "tool", "name": name})
-                msgs.append({"role": "assistant", "content": ans})
-                msgs.append({"role": "user", "content":
-                             "Результат инструмента «%s»:\n%s\n\n"
-                             "Если данных достаточно — ответь по-русски коротко, "
-                             "обычным текстом без JSON. Если нужен ещё инструмент — "
-                             "снова один JSON-объект." % (name, str(res)[:3000])})
-            final_txt = jarvis._strip_md(final)
-            if len(final_txt.strip()) < 3 or final_txt.lstrip().startswith('{"tool"'):
-                clog("веб-ответ сорвался (дегенеративный): %r" % final_txt[:80])
-                jarvis.hist_append(disp, "(веб: ответ сорвался)")
-                emit({"type": "error",
-                      "text": "Я сделал много шагов, но не успел доделать. "
-                              "Скажи «продолжай» — доделаю."})
+            _web_files_hist = list(_web_files)
+
+            def _emit(ev):
+                try:
+                    et = ev.get("type")
+                    if et == "tok":
+                        return emit({"type": "tok", "text": ev.get("text", "")})
+                    if et == "say":
+                        return emit({"type": "say", "text": ev.get("text", "")})
+                    if et == "waiting":
+                        return emit({"type": "waiting"})
+                    if et == "tool":
+                        # карточки «скачать»: пути из результата инструмента
+                        for _p in _paths_from_text(ev.get("result", "")):
+                            if (_p not in _web_files and _web_allowed(_p)
+                                    and os.path.isfile(_p)):
+                                _web_files.append(_p)
+                        return emit({"type": "tool", "name": ev.get("name", "")})
+                    if et == "image":
+                        try:
+                            with open(ev.get("path", ""), "rb") as fh:
+                                ok = emit({"type": "image",
+                                           "b64": base64.b64encode(
+                                               fh.read()).decode()})
+                        except OSError:
+                            ok = emit({"type": "say",
+                                       "text": "(фото не дошло)"})
+                        try:
+                            os.remove(ev.get("path", ""))
+                        except OSError:
+                            pass
+                        return ok
+                    if et == "final":
+                        final_txt_holder = ev.get("text", "")
+                        return True
+                    return True
+                except (BrokenPipeError, ConnectionAbortedError,
+                        ConnectionResetError):
+                    return False
+
+            final_txt, _brain_fail = brain_core.brain_loop(
+                jarvis,
+                {"text": utext, "mode": (_mode or "think"),
+                 "stream": True, "sysmsg": sysmsg,
+                 "emit": _emit, "log": clog})
+            if not final_txt:
+                # канал отвалился (вкладка закрыта) — тихо заканчиваем
                 return
-            # v3.15.0: пути из финального ответа тоже становятся карточками
-            # (Джарвис обязан называть путь из ответа инструмента — ловим его)
+            # v3.15.0: пути из финального ответа — в карточки «скачать»
             for _p in _paths_from_text(final_txt):
                 if _p not in _web_files and _web_allowed(_p) \
                         and os.path.isfile(_p):
@@ -905,6 +799,7 @@ class Handler(BaseHTTPRequestHandler):
                                     % (disp[:800], final_txt[:2400]))[:3900]})
             except Exception as e:
                 clog("дубль в Telegram не ушёл: %s" % e)
+            return
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             pass
         except Exception as e:
