@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""phone_ctl.py — телефон Шефа (POCO X7 Pro) под управлением Джарвиса.
-Task 178 (v3.29.0). Пути:
-  1) WiFi/сеть (работает УЖЕ, без настроек на телефоне):
-     - онлайн-статус и IP через роутер (router_api)
-     - связка «Связь с телефоном» (Phone Link): связан с POCO с 09.11
-  2) ADB (полное управление — включается на телефоне ОДИН раз):
-     - беспроводной ADB: пара по USB ИЛИ «Беспроводная отладка» в меню
-       разработчика (прямое соединение, без пары — adb connect ip:port)
-     - экран телефона на ПК + управление (scrcpy, без экрана: --record)
-     - фото/файлы с телефона (adb pull), заливка (adb push)
-     - батаре/память/статус (dumpsys battery, df)
-     - приложения: список/установка/удаление (pm list/install/uninstall)
-     - автоматизация: тапы/свайпы/текст (input tap/swipe/text)
-Состояние (переживает рестарт): data/phone_state.json — ip, порт adb.
+"""phone_ctl.py — телефоны семьи под управлением Джарвиса (v4, Task 179c).
+Телефоны:
+  - POCO X7 Pro (телефон Шефа, Task 178): спарен, adbkey навсегда
+  - Realme 15 5G (телефон жены, Task 179c): беспроводная отладка включена
+Пути управления (для каждого телефона):
+  1) WiFi/сеть: онлайн-статус и IP через роутер (router_api)
+  2) ADB (полное управление): беспроводная отладка (порт СЛУЧАЙНЫЙ,
+     меняется — находим через mDNS), спарка кодом из 6 цифр один раз
+Идентификация ЧЕЙ телефон: после connect читаем ro.product.brand/model
+и сверяем с реестром — mDNS видит ОБА телефона, перепутать нельзя.
+Состояние: data/phone_state.json — вложено по id телефона (миграция
+со старого плоского формата Task 178 автоматически).
 """
 import json
 import os
@@ -26,23 +24,53 @@ ADB = os.path.join(BASE, "platform-tools", "adb.exe")
 SCRCPY = os.path.join(BASE, "scrcpy", "scrcpy.exe")
 STATE_F = os.path.join(BASE, "data", "phone_state.json")
 
-# Телефон Шефа (роутер так его зовёт)
-PHONE_NAME = "POCO"
-DEFAULT_IP = "192.168.1.20"
+# ---------------- реестр телефонов семьи (Task 179c)
+PHONES = {
+    "poco": {
+        "id": "poco",
+        "label": "телефон Шефа (POCO X7 Pro)",
+        "who": "Шефа",
+        "router_names": ["poco"],           # как его зовёт роутер
+        "brands": ["poco", "redmi", "xiaomi"],
+        "models": ["2412dpc0ag", "rodin"],  # model / product
+        "default_ip": "192.168.1.20",
+    },
+    "realme": {
+        "id": "realme",
+        "label": "телефон жены (Realme 15 5G)",
+        "who": "жены",
+        "router_names": ["realme", "rmx"],
+        "brands": ["realme", "oppo", "oneplus"],
+        "models": ["rmx"],                  # Realme модели все RMXxxxx
+        "default_ip": None,                 # узнаем из роутера/mDNS
+    },
+}
+DEFAULT_WHO = "poco"
+
+_BRAND_CACHE = {}  # serial -> (brand, model); чистим при connect/pair
 
 
-def _state():
+def _state(who=DEFAULT_WHO):
+    """Состояние конкретного телефона (ip, adb_port, paired)."""
     try:
         with open(STATE_F, encoding="utf-8") as f:
-            return json.load(f)
+            all_st = json.load(f)
     except Exception:
-        return {"ip": DEFAULT_IP, "adb_port": 5555}
+        all_st = {}
+    # миграция со старого плоского формата Task 178 (только POCO)
+    if "ip" in all_st and "poco" not in all_st:
+        all_st = {"poco": all_st}
+    if not isinstance(all_st.get(who), dict):
+        all_st[who] = {}
+    return all_st, all_st[who]
 
 
-def _save_state(st):
+def _save_state(who, st):
+    all_st, _ = _state(who)
+    all_st[who] = st
     os.makedirs(os.path.dirname(STATE_F), exist_ok=True)
     with open(STATE_F, "w", encoding="utf-8") as f:
-        json.dump(st, f, ensure_ascii=False, indent=1)
+        json.dump(all_st, f, ensure_ascii=False, indent=1)
 
 
 def _adb(*args, timeout=25):
@@ -76,37 +104,74 @@ def _connected():
     return _devices()
 
 
-def _phone_online_router():
-    """POCO онлайн в WiFi? IP через роутер (если модуль доступен)."""
+def _phone_cfg(who):
+    return PHONES.get(who) or PHONES[DEFAULT_WHO]
+
+
+def _device_id(serial):
+    """(brand, model) подключённого устройства — с кэшем на вызов."""
+    if serial in _BRAND_CACHE:
+        return _BRAND_CACHE[serial]
+    code, out = _adb("-s", serial, "shell", "getprop ro.product.brand",
+                     timeout=10)
+    brand = (out or "").splitlines()[0].strip().lower() if out else ""
+    code, out = _adb("-s", serial, "shell", "getprop ro.product.model",
+                     timeout=10)
+    model = (out or "").splitlines()[0].strip().lower() if out else ""
+    _BRAND_CACHE[serial] = (brand, model)
+    return brand, model
+
+
+def _device_is(serial, who):
+    """Это тот самый телефон? Сверяем brand/model с реестром."""
+    cfg = _phone_cfg(who)
+    brand, model = _device_id(serial)
+    hay = "%s %s" % (brand, model)
+    return any(b in hay for b in cfg["brands"]) or \
+        any(m in hay for m in cfg["models"])
+
+
+def _phone_online_router(who=DEFAULT_WHO):
+    """Телефон онлайн в WiFi? IP через роутер (если модуль доступен)."""
+    cfg = _phone_cfg(who)
     try:
         import router_api as R
         out = R.devices()
         for ln in out.splitlines():
-            if PHONE_NAME.lower() in ln.lower():
+            if any(n in ln.lower() for n in cfg["router_names"]):
                 return True, ln.strip("• ").strip()
         return False, out
     except Exception as e:
         return None, "роутер не ответил: %s" % e
 
 
-def _try_connect(ip=None, port=None):
-    """adb connect по WiFi. Возвращает (ok, текст)."""
-    st = _state()
-    ip = ip or st.get("ip") or DEFAULT_IP
-    port = port or st.get("adb_port") or 5555
+def _router_ip(who):
+    """IP телефона из роутера (или None)."""
+    on, info = _phone_online_router(who)
+    if on:
+        m = re.search(r"(\d+\.\d+\.\d+\.\d+)", info or "")
+        if m:
+            return m.group(1)
+    return None
+
+
+def _try_connect(ip, port, who=DEFAULT_WHO):
+    """adb connect ip:port. Возвращает (ok, текст, serial|None)."""
     code, out = _adb("connect", "%s:%s" % (ip, port), timeout=12)
-    ok = "connected" in out.lower() and "cannot" not in out.lower()
+    ok = "connected" in out.lower() and "cannot" not in out.lower() \
+        and "failed" not in out.lower()
     if ok:
+        st_all, st = _state(who)
         st["ip"], st["adb_port"] = ip, port
-        _save_state(st)
-    return ok, out
+        _save_state(who, st)
+        return True, out, "%s:%s" % (ip, port)
+    return False, out, None
 
 
 def _mdns_services():
-    """mDNS-сервисы «Беспроводной отладки» (Android 11+): телефон слушает
-    СЛУЧАЙНЫЙ порт, который меняется при каждом включении отладки/ребуте
-    WiFi — обычный connect по старому порту не сработает. adb mdns находит
-    актуальный порт сам. Возвращает (connect-порты, pairing-порты)."""
+    """mDNS-сервисы «Беспроводной отладки» (Android 11+): телефоны слушают
+    СЛУЧАЙНЫЕ порты, меняющиеся при каждом включении отладки/ребуте WiFi.
+    Возвращает (connect-порты, pairing-порты) — списки (ip, порт)."""
     code, out = _adb("mdns", "services", timeout=15)
     conn, pr = [], []
     for ln in (out or "").splitlines():
@@ -120,124 +185,138 @@ def _mdns_services():
     return conn, pr
 
 
-def _one_device():
-    devs = _connected()
-    if not devs:
-        return None
-    # предпочитаем wifi-подключение телефона (ip:port)
-    for d in devs:
-        if ":" in d:
+def _one_device(who=DEFAULT_WHO):
+    """Подключённый serial НУЖНОГО телефона (или None).
+    ВСЕГДА сверяем brand/model с реестром: mDNS/роутер видят оба
+    телефона, и по IP угадывать нельзя — только по железу."""
+    for d in _connected():
+        if _device_is(d, who):
             return d
-    return devs[0]
+    return None
+
+
+def _shot_path(who):
+    return os.path.join(BASE, "data", "phone_shot_%s.png" % who)
 
 
 # ---------------------------------------------------------------- команды
 
-def status():
-    """Полный статус: сеть + adb + телефон."""
-    parts = []
-    on, info = _phone_online_router()
+def status(who=None):
+    """Статус: одного телефона (who) или обоих сразу (who=None)."""
+    if who is None:
+        return "\n\n".join(status(w) for w in PHONES)
+    cfg = _phone_cfg(who)
+    parts = ["📱 %s:" % cfg["label"]]
+    on, info = _phone_online_router(who)
     if on is True:
         parts.append("📶 В WiFi: ДА — %s" % info)
     elif on is False:
         parts.append("📶 В WiFi: нет (из роутера не виден)")
-        parts.append("   %s" % info if info else "")
     else:
         parts.append("📶 Роутер: %s" % info)
     devs = _connected()
-    if devs:
-        parts.append("🔌 ADB: подключён (%s)" % ", ".join(devs))
-        d = _one_device()
+    mine = [d for d in devs if _device_is(d, who)]
+    if mine:
+        parts.append("🔌 ADB: подключён (%s)" % ", ".join(mine))
+        d = mine[0]
         code, out = _adb("-s", d, "shell", "dumpsys battery", timeout=15)
         m = re.search(r"level:\s*(\d+)", out)
         if m:
             parts.append("🔋 Батарея: %s%%" % m.group(1))
-        code, model = _adb("-s", d, "shell", "getprop", "ro.product.model",
-                           timeout=10)
-        if model and "error" not in model.lower():
+        brand, model = _device_id(d)
+        if model:
             parts.append("📱 Модель: %s" % model)
     else:
-        ok, out = _try_connect()
-        if ok:
-            return status()  # подключились — перечитали
-        parts.append("🔌 ADB: не подключён (отладка на телефоне выключена?)")
-        parts.append(_howto_enable())
+        parts.append("🔌 ADB: не подключён (скажи «телефон %s подключи»)"
+                     % cfg["who"])
     return "\n".join(parts)
 
 
-def _howto_enable():
-    return ("ℹ️ Полное управление телефоном — включи на нём отладку ОДИН раз:\n"
-            "Настройки → О телефоне → 7 раз тапни «Версия HyperOS» → в "
-            "«Параметры разработчика» включи «Отладка по USB» (и/или "
-            "«Беспроводная отладка»). После этого скажи мне «телефон "
-            "подключи» — я сам найду его по WiFi.")
+def _howto_enable(who=DEFAULT_WHO):
+    cfg = _phone_cfg(who)
+    return ("ℹ️ Полное управление телефоном %s — включи на нём отладку ОДИН "
+            "раз:\nНастройки → О телефоне → 7 раз тапни «Версия …» → в "
+            "«Параметры разработчика» включи «Беспроводную отладку». После "
+            "этого скажи мне «телефон %s подключи» — я сам найду его по "
+            "WiFi." % (cfg["who"], cfg["who"]))
 
 
-def connect(what=""):
-    """Подключиться к телефону: adb connect ip:port (или auto)."""
-    # если USB-отладка включена и телефон воткнут — он уже в devices
-    devs = _connected()
-    if devs:
-        return ("Уже подключён: %s" % ", ".join(devs))
+def connect(what="", who=DEFAULT_WHO):
+    """Подключиться к НУЖНОМУ телефону: adb connect (или auto через mDNS).
+    mDNS видит ОБА телефона — после connect сверяем brand/model и чужие
+    отключаем."""
+    cfg = _phone_cfg(who)
+    _BRAND_CACHE.clear()
+    mine = _one_device(who)
+    if mine:
+        devs = _connected()
+        return ("✅ %s уже подключён: %s%s" % (
+            cfg["label"], mine,
+            (" (ещё в сети: %s — чужие)" % ", ".join(d for d in devs
+             if d != mine)) if len(devs) > 1 else ""))
     m = re.search(r"(\d+\.\d+\.\d+\.\d+):?(\d+)?", what or "")
     ip = m.group(1) if m else None
     port = m.group(2) if m and m.group(2) else None
-    if ip is None:
-        # IP с роутера; недоступен — берём сохранённый/дефолтный и всё
-        # равно пробуем mDNS (он работает и без роутера)
-        on, info = _phone_online_router()
-        if on:
-            m2 = re.search(r"(\d+\.\d+\.\d+\.\d+)", info or "")
-            if m2:
-                ip = m2.group(1)
-    if ip is None:
-        conn, pr = _mdns_services()
-        if conn or pr:
-            ip = (conn or pr)[0][0]  # mDNS сам знает адрес телефона
-    if ip is None:
-        ip = _state().get("ip") or DEFAULT_IP
-    # ЖИВАЯ ОСОБЕННОСТЬ (Task 178b): mDNS-обнаружение у adb «просыпается»
-    # не сразу после kill/disconnect; если ничего не нашли — restart
-    # adb-сервера и ещё раз (живой тест: после disconnect mdns пуст,
-    # после kill/start-server сервис появился мгновенно)
+    # кандидатные IP: роутер -> сохранённый -> дефолт
+    ip = ip or _router_ip(who) or _state(who)[1].get("ip") \
+        or cfg["default_ip"]
+    # mDNS: если пусто — рестарт adb-сервера (Task 178b: после kill/disconnect
+    # список «просыпается» только после рестарта)
     conn, pr = _mdns_services()
     if not conn and not pr:
         _adb("kill-server", timeout=10)
         _adb("start-server", timeout=15)
         time.sleep(4)
         conn, pr = _mdns_services()
-    # пробуем сохранённый порт, затем mDNS-поиск СЛУЧАЙНОГО порта
-    # беспроводной отладки, затем стандартные
-    st = _state()
-    ports = [port] if port else [st.get("adb_port"), 5555, 5554, 5037]
-    for p in ports:
-        if not p:
-            continue
-        ok, out = _try_connect(ip, p)
-        if ok:
-            return ("✅ Подключился к телефону: %s:%s (%s)" % (ip, p, out))
-    # порт беспроводной отладки случайный — mDNS-порты
+    st = _state(who)[1]
+    # 1) mDNS-порты (случайные, актуальные) — с проверкой ЧЕЙ телефон
+    tried = set()
     for cip, cport in conn:
-        ok, out = _try_connect(cip, cport)
+        tried.add((cip, cport))
+        ok, out, serial = _try_connect(cip, cport, who)
         if ok:
-            return ("✅ Подключился к телефону по беспроводной отладке "
-                    "(mDNS нашёл порт): %s:%s" % (cip, cport))
-    if pr and not conn:
-        return ("Вижу телефон в сети отладки, но он ещё НЕ СПАРЕН с ПК "
-                "(mDNS показывает только pairing-порт %s). Спари один раз: "
+            if _device_is(serial, who):
+                return ("✅ Подключился к %s (mDNS нашёл порт): %s:%s"
+                        % (cfg["label"], cip, cport))
+            _adb("disconnect", serial, timeout=10)  # чужой — отключили
+    # 2) сохранённый/стандартный порт на известном IP
+    if ip:
+        for p in ([port] if port else
+                  [st.get("adb_port"), 5555, 5554, 5037]):
+            if not p or (ip, p) in tried:
+                continue
+            ok, out, serial = _try_connect(ip, p, who)
+            if ok:
+                if _device_is(serial, who):
+                    return ("✅ Подключился к %s: %s:%s" % (cfg["label"], ip, p))
+                _adb("disconnect", serial, timeout=10)
+    # 3) не спарен? mDNS pairing-порт нужного телефона (по IP из роутера)
+    rip = _router_ip(who)
+    pr_mine = [(pip, pport) for pip, pport in pr if pip == rip] if rip else []
+    if pr_mine:
+        return ("Вижу телефон %s в сети отладки, но он ещё НЕ СПАРЕН с ПК "
+                "(mDNS показывает его pairing-порт %s:%s). Спари один раз: "
                 "на телефоне «Беспроводная отладка» → «Подключение устройства "
                 "с помощью кода» — скажи мне код из 6 цифр и цифры IP:порт "
-                "с экрана, я запомню НАВСЕГДА (пара переживает ребуты, "
-                "меняться будет только порт — его я сам найду)."
-                % ("%s:%s" % pr[0]))
-    return ("Не подключился (%s:%s — отладка выключена или порт другой). %s"
-            % (ip, ports, _howto_enable()))
+                "с экрана, например «телефон %s спарить 482913 %s:%s». Пара "
+                "сохранится НАВСЕГДА (переживает ребуты, меняется только "
+                "порт — его я найду сам)."
+                % (cfg["who"], pr_mine[0][0], pr_mine[0][1],
+                   cfg["who"], pr_mine[0][0], pr_mine[0][1]))
+    if pr:
+        return ("Вижу в сети отладки чужой телефон (pairing-порт %s:%s — это "
+                "не %s). Убедись, что на телефоне %s включена «Беспроводная "
+                "отладка», и скажи «телефон %s подключи»."
+                % (pr[0][0], pr[0][1], cfg["label"], cfg["who"], cfg["who"]))
+    return ("Не нашёл %s (ни в роутере, ни в mDNS). Телефон дома, в WiFi и "
+            "на зарядке? На нём включена «Беспроводная отладка»? Тогда: %s"
+            % (cfg["label"], _howto_enable(who)))
 
 
-def battery():
-    d = _one_device()
+def battery(who=DEFAULT_WHO):
+    d = _one_device(who)
     if not d:
-        return _no_adb()
+        return _no_adb(who)
     code, out = _adb("-s", d, "shell", "dumpsys battery", timeout=15)
     m = re.search(r"level:\s*(\d+)", out)
     s = re.search(r"status:\s*(\d+)", out)
@@ -248,11 +327,11 @@ def battery():
     return "Не прочитал: %s" % out[:200]
 
 
-def photos(count=5, days=3):
+def photos(count=5, days=3, who=DEFAULT_WHO):
     """Свежие фото с телефона: adb pull из DCIM/Camera."""
-    d = _one_device()
+    d = _one_device(who)
     if not d:
-        return _no_adb()
+        return _no_adb(who)
     code, out = _adb("-s", d, "shell",
                      "ls -t /sdcard/DCIM/Camera/ | head -%d" % int(count),
                      timeout=15)
@@ -271,20 +350,20 @@ def photos(count=5, days=3):
             got.append(os.path.join(dst_dir, f))
     if not got:
         return "Скачивание не вышло: %s" % out[:200]
-    return ("📸 Скачал %d фото с телефона (самые свежие):\n%s"
-            % (len(got), "\n".join(got)))
+    return ("📸 Скачал %d фото с телефона (%s):\n%s"
+            % (len(got), _phone_cfg(who)["who"], "\n".join(got)))
 
 
-def push(src, dst=""):
-    d = _one_device()
+def push(src, dst="", who=DEFAULT_WHO):
+    d = _one_device(who)
     if not d:
-        return _no_adb()
+        return _no_adb(who)
     if not os.path.exists(src):
         return "Файла нет: %s" % src
     dst = dst or "/sdcard/Download/" + os.path.basename(src)
     code, out = _adb("-s", d, "push", src, dst, timeout=120)
     if code == 0:
-        return "✅ Залил на телефон: %s" % dst
+        return "✅ Залил на телефон %s: %s" % (_phone_cfg(who)["who"], dst)
     return "Не вышло: %s" % out[:200]
 
 
@@ -315,10 +394,10 @@ def _translit(s):
     return ''.join(m.get(c, c) for c in s.lower())
 
 
-def apps(query=""):
-    d = _one_device()
+def apps(query="", who=DEFAULT_WHO):
+    d = _one_device(who)
     if not d:
-        return _no_adb()
+        return _no_adb(who)
     code, out = _adb("-s", d, "shell", "pm list packages", timeout=20)
     pkgs = sorted(l.replace("package:", "").strip()
                   for l in out.splitlines() if l.startswith("package:"))
@@ -333,41 +412,42 @@ def apps(query=""):
                 if any(n and n in p.lower() for n in needles)]
     if not pkgs:
         return "Приложений по запросу «%s» нет." % query
-    return "📱 Приложений: %d%s\n%s" % (
-        len(pkgs), (" по «%s»" % query if query else ""),
-        "\n".join(pkgs[:40]))
+    return "📱 Приложений на телефоне %s: %d%s\n%s" % (
+        _phone_cfg(who)["who"], len(pkgs),
+        (" по «%s»" % query if query else ""), "\n".join(pkgs[:40]))
 
 
-def tap(x, y):
-    d = _one_device()
+def tap(x, y, who=DEFAULT_WHO):
+    d = _one_device(who)
     if not d:
-        return _no_adb()
+        return _no_adb(who)
     _adb("-s", d, "shell", "input", "tap", str(int(x)), str(int(y)))
     return "Тапнул (%s, %s)" % (x, y)
 
 
-def swipe(x1, y1, x2, y2, ms=300):
-    d = _one_device()
+def swipe(x1, y1, x2, y2, ms=300, who=DEFAULT_WHO):
+    d = _one_device(who)
     if not d:
-        return _no_adb()
+        return _no_adb(who)
     _adb("-s", d, "shell", "input", "swipe", str(int(x1)), str(int(y1)),
          str(int(x2)), str(int(y2)), str(int(ms)))
     return "Свайпнул"
 
 
-def type_text(text):
-    d = _one_device()
+def type_text(text, who=DEFAULT_WHO):
+    d = _one_device(who)
     if not d:
-        return _no_adb()
+        return _no_adb(who)
     _adb("-s", d, "shell", "input", "text", text.replace(" ", "%s")[:300])
-    return "Напечатал на телефоне: %s" % text[:60]
+    return "Напечатал на телефоне %s: %s" % (_phone_cfg(who)["who"],
+                                             text[:60])
 
 
-def key(k):
+def key(k, who=DEFAULT_WHO):
     """Кнопка: home/back/recents/power/volume_up/volume_down."""
-    d = _one_device()
+    d = _one_device(who)
     if not d:
-        return _no_adb()
+        return _no_adb(who)
     keys = {"home": "3", "back": "4", "recents": "187", "power": "26",
             "volume_up": "24", "volume_down": "25", "camera": "27"}
     kc = keys.get((k or "").lower())
@@ -377,13 +457,14 @@ def key(k):
     return "Нажал %s" % k
 
 
-def screenshot():
+def screenshot(who=DEFAULT_WHO):
     """Скрин телефона -> файл; Джарвис смотрит его зрением и шлёт Шефу."""
-    d = _one_device()
+    d = _one_device(who)
     if not d:
-        return _no_adb()
-    _adb("-s", d, "shell", "screencap -p /sdcard/_jarvis_shot.png", timeout=20)
-    dst = os.path.join(BASE, "data", "phone_shot.png")
+        return _no_adb(who)
+    _adb("-s", d, "shell", "screencap -p /sdcard/_jarvis_shot.png",
+         timeout=20)
+    dst = _shot_path(who)
     code, out = _adb("-s", d, "pull", "/sdcard/_jarvis_shot.png", dst,
                      timeout=30)
     if code == 0 and os.path.exists(dst):
@@ -391,160 +472,212 @@ def screenshot():
     return "Скрин не вышел: %s" % out[:150]
 
 
-def mirror(record_seconds=0, window=True):
+def mirror(record_seconds=0, window=True, who=DEFAULT_WHO):
     """Зеркало экрана телефона на мониторе ПК2 (scrcpy)."""
-    d = _one_device()
+    d = _one_device(who)
     if not d:
-        return _no_adb()
+        return _no_adb(who)
     args = [SCRCPY, "-s", d]
+    rec = os.path.join(BASE, "data", "phone_rec_%s.mp4" % who)
     if record_seconds:
-        args += ["--record", os.path.join(BASE, "data",
-                                          "phone_rec.mp4"), "--no-playback"]
+        args += ["--record", rec, "--no-playback"]
         try:
             subprocess.Popen(args, creationflags=0x08000000)
         except Exception as e:
             return "Запись не стартовала: %s" % e
-        return ("🔴 Записываю экран телефона %d сек в D:\\Jarvis\\data\\"
-                "phone_rec.mp4" % record_seconds)
+        return ("🔴 Записываю экран телефона %s в %s"
+                % (_phone_cfg(who)["who"], rec))
     try:
         subprocess.Popen(args)  # окно на экране ПК2
-        return ("🖥 Открыл зеркало телефона на экране ПК2 (scrcpy). Закрыть "
-                "окно = прекратить.")
+        return ("🖥 Открыл зеркало телефона %s на экране ПК2 (scrcpy). "
+                "Закрыть окно = прекратить." % _phone_cfg(who)["who"])
     except Exception as e:
         return "scrcpy не стартовал: %s" % e
 
 
-def _no_adb():
-    devs_before = _connected()
-    if not devs_before:
-        ok, out = _try_connect()
-        if ok:
+def _no_adb(who=DEFAULT_WHO):
+    mine = _one_device(who)
+    if not mine:
+        connect("", who)
+        mine = _one_device(who)
+        if mine:
             return None  # подключились; вызывающий повторит
-    return ("Телефон не подключён по ADB. %s" % _howto_enable())
+    return ("Телефон %s не подключён по ADB. %s"
+            % (_phone_cfg(who)["who"], _howto_enable(who)))
 
 
-def pair(code, host=""):
+def pair(code, host="", who=DEFAULT_WHO):
     """Спарить ПК с телефоном ОДИН РАЗ (adb pair ip:port code).
     Код из 6 цифр и ip:порт Шеф видит на телефоне: «Беспроводная
     отладка» → «Подключение устройства с помощью кода». Пара сохраняется
-    НАВСЕГДА (переживает ребуты и смену порта) — пароль больше не нужен."""
+    НАВСЕГДА (переживает ребуты и смену порта)."""
+    cfg = _phone_cfg(who)
     m = re.search(r"(\d+\.\d+\.\d+\.\d+):(\d+)", host or "")
     if not m or not re.fullmatch(r"\d{6}", (code or "").strip()):
-        # может, в host лежит всё вместе: «спарить 123456 192.168.1.20:37851»
-        m2 = re.search(r"(\d+\.\d+\.\d+\.\d+):(\d+)", (code or "") + " " + (host or ""))
+        m2 = re.search(r"(\d+\.\d+\.\d+\.\d+):(\d+)",
+                       (code or "") + " " + (host or ""))
         if m2 and re.search(r"\b\d{6}\b", (code or "") + " " + (host or "")):
-            code = re.search(r"\b(\d{6})\b", code + " " + host).group(1)
+            code = re.search(r"\b(\d{6})\b",
+                             code + " " + host).group(1)
             m = m2
         else:
-            return ("Спарка: нужны код из 6 цифр и адрес с экрана телефона. "
-                    "На телефоне: Настройки → Дополнительно → Параметры "
-                    "разработчика → Беспроводная отладка → «Подключение "
-                    "устройства с помощью кода». Продиктуй мне, например: "
-                    "«телефон спарить 482913 192.168.1.20:37851»")
+            return ("Спарка телефона %s: нужны код из 6 цифр и адрес с "
+                    "экрана телефона. На телефоне: Настройки → Дополнительно "
+                    "→ Параметры разработчика → Беспроводная отладка → "
+                    "«Подключение устройства с помощью кода». Продиктуй "
+                    "мне, например: «телефон %s спарить 482913 "
+                    "192.168.1.30:37851»" % (cfg["who"], cfg["who"]))
     ip, port = m.group(1), m.group(2)
+    _BRAND_CACHE.clear()
     code, out = _adb("pair", "%s:%s" % (ip, port), code.strip(), timeout=20)
-    if code == 0 and ("success" in out.lower() or "paired" in out.lower()):
-        # спарились — сразу пробуем подключиться (порт подключения другой,
-        # обычно соседний; найдём mDNS или перебором рядом с pairing-портом)
-        st = _state()
+    low = out.lower()
+    ok = ("success" in low or "paired" in low) and "already" not in low \
+        and "failed" not in low and "error" not in low and code == 0
+    if ok:
+        st = _state(who)[1]
         st["ip"] = ip
         st["paired"] = True
-        _save_state(st)
-        ok_msg = ("✅ Спарил ПК с телефоном НАВСЕГДА (adb pair %s:%s). "
+        _save_state(who, st)
+        ok_msg = ("✅ Спарил ПК с телефоном %s НАВСЕГДА (adb pair %s:%s). "
                   "Пара сохранена — пароль/код больше не понадобятся. "
-                  % (ip, port))
-        # пробуем mDNS и соседние порты для connect
+                  % (cfg["who"], ip, port))
+        # сразу пробуем подключиться: mDNS + соседние порты
         for cip, cport in _mdns_services()[0]:
-            ok, out = _try_connect(cip, cport)
-            if ok:
+            ok, out, serial = _try_connect(cip, cport, who)
+            if ok and _device_is(serial, who):
                 return ok_msg + "Подключился сразу: %s:%s" % (cip, cport)
+            if ok:
+                _adb("disconnect", serial, timeout=10)
         base = int(port)
         for p in (base - 1, base + 1, base, 5555, base + 2, base - 2):
-            ok, out = _try_connect(ip, p)
-            if ok:
+            ok, out, serial = _try_connect(ip, p, who)
+            if ok and _device_is(serial, who):
                 return ok_msg + "Подключился сразу: %s:%s" % (ip, p)
-        return ok_msg + ("Подключиться сразу не вышло — скажи «телефон "
+            if ok:
+                _adb("disconnect", serial, timeout=10)
+        return ok_msg + ("Подключиться сразу не вышло — скажи «телефон %s "
                          "подключи», я найду актуальный порт (он меняется, "
-                         "это нормально — я ищу его сам).")
+                         "это нормально — я ищу его сам)." % cfg["who"])
     return ("Не спарился (%s). Проверь: код из 6 цифр и ip:порт должны "
-            "быть с ЭКРАНА телефона прямо сейчас (код живёт ~минуту, "
-            "меняется при каждом открытии). Повтори: «телефон спарить "
-            "<код> <ip:порт>». Ответ adb: %s" % (ip, out[:150]))
+            "быть с ЭКРАНА телефона %s прямо сейчас (код живёт ~минуту, "
+            "меняется при каждом открытии). Повтори: «телефон %s спарить "
+            "<код> <ip:порт>». Ответ adb: %s"
+            % (ip, cfg["who"], cfg["who"], out[:150]))
+
+
+# ---------------------------------------------------------------- разбор
+
+def _pick_who(q):
+    """Кто спрашивают: «жены/жена/жене» -> realme, «шефа/мой/poco» ->
+    poco. Возвращает (who, строка без слов-маркеров и слова «телефон»)."""
+    who = DEFAULT_WHO
+    keep = []
+    for w in q.split():
+        lw = w.lower().strip(",.!?")
+        if re.match(r"^жен[аыоиуе]в?\w*$", lw) or lw.startswith("супруг") \
+                or "realme" in lw or "realmi" in lw:
+            who = "realme"
+        elif re.match(r"^шеф[аы]?м?$", lw) or lw == "мой" or lw == "моя" \
+                or "poco" in lw:
+            who = "poco"
+        elif re.match(r"^телефон\w*$", lw):
+            pass  # само слово «телефон» — не команда и не маркер
+        else:
+            keep.append(w)
+    return who, " ".join(keep)
 
 
 def handle(what):
-    """Единый вход для cmd_phone(what): строка -> строка."""
-    q = (what or "").strip().lower()
-    if not q or q.startswith("статус") or q.startswith("справка"):
-        if q.startswith("справка"):
-            return help_str()
-        return status()
+    """Единый вход для cmd_phone(what): строка -> строка.
+    «телефон статус» — оба телефона; «телефон жены скрин» — телефон жены."""
+    raw = (what or "").strip()
+    q = raw.lower()
+    who, q = _pick_who(q)
+    has_marker = any(w in raw.lower() for w in
+                     ("жен", "супруг", "realme", "realmi", "шеф", "poco",
+                      "мой", "моя"))
+    if not q or q.startswith("статус"):
+        # «телефон статус» — ОБА телефона; «телефон жены статус» — только жены
+        return status(who if has_marker else None)
+    if q.startswith("справка"):
+        return help_str()
     if q.startswith("подключ"):
-        return connect(q)
+        return connect(q, who)
     if q.startswith("спар") or q.startswith("pair"):
-        # «спарить 482913 192.168.1.20:37851» или «спарить 482913»
+        # «спарить 482913 192.168.1.30:37851» или «спарить 482913»
         rest = re.sub(r"^(спарить|спарка|pair)\s*", "", q).strip()
         nums = re.search(r"\b(\d{6})\b", rest)
         addr = re.search(r"(\d+\.\d+\.\d+\.\d+:\d+)", rest)
         if nums and addr:
-            return pair(nums.group(1), addr.group(1))
+            return pair(nums.group(1), addr.group(1), who)
         if nums:
-            # адрес не дали — попробуем с роутера/mDNS pairing-порт
             _, pr = _mdns_services()
-            if pr:
-                return pair(nums.group(1), "%s:%s" % pr[0])
-            on, info = _phone_online_router()
-            m = re.search(r"(\d+\.\d+\.\d+\.\d+)", info or "")
+            rip = _router_ip(who)
+            pr_mine = [(pip, pport) for pip, pport in pr if pip == rip] \
+                if rip else []
+            if pr_mine:
+                return pair(nums.group(1), "%s:%s" % pr_mine[0], who)
             return ("Код понял (%s), но нужен ещё ip:порт с экрана телефона "
-                    "(строка «IP-адрес и порт» над кодом). Скажи: «телефон "
-                    "спарить %s <ip:порт>»" % (nums.group(1), nums.group(1)))
-        return pair("", "")
+                    "%s (строка «IP-адрес и порт» над кодом). Скажи: "
+                    "«телефон %s спарить %s <ip:порт>»"
+                    % (nums.group(1), _phone_cfg(who)["who"],
+                       _phone_cfg(who)["who"], nums.group(1)))
+        return pair("", "", who)
     if "батаре" in q or "заряд" in q:
-        # может быть без adb — тогда через роутер только онлайн
-        d = _one_device()
+        d = _one_device(who)
         if not d:
-            st = status()
-            return st
-        return battery()
+            _no_adb(who)  # попробовали подключиться
+            d = _one_device(who)
+            if not d:
+                return status(who)
+        return battery(who)
     if q.startswith("фото") or "снимк" in q or "камер" in q and "скрин" not in q:
         m = re.search(r"(\d+)", q)
-        return photos(int(m.group(1)) if m else 5)
+        return photos(int(m.group(1)) if m else 5, who=who)
     if q.startswith("скрин"):
-        r = screenshot()
-        return r
+        d = _one_device(who)
+        if not d:
+            _no_adb(who)
+            d = _one_device(who)
+            if not d:
+                return status(who)
+        return screenshot(who)
     if q.startswith("зеркал") or "экран на пк" in q:
-        return mirror()
+        return mirror(who=who)
     if q.startswith("приложени"):
         m = re.search(r"приложени[а-яё]*\s+(.+)$", q)
-        return apps(m.group(1).strip() if m else "")
+        return apps(m.group(1).strip() if m else "", who)
     if q.startswith("тап") or q.startswith("клик"):
         m = re.search(r"(\d+)[^\d]+(\d+)", q)
         if m:
-            return tap(m.group(1), m.group(2))
-        return "Тап куда? Пример: «телефон тап 540 1200»"
+            return tap(m.group(1), m.group(2), who)
+        return "Тап куда? Пример: «телефон жены тап 540 1200»"
     if q.startswith("свайп"):
         nums = re.findall(r"(\d+)", q)
         if len(nums) >= 4:
-            return swipe(nums[0], nums[1], nums[2], nums[3])
-        return "Свайп: «телефон свайп 540 1500 540 500»"
+            return swipe(nums[0], nums[1], nums[2], nums[3], who=who)
+        return "Свайп: «телефон жены свайп 540 1500 540 500»"
     if q.startswith("печа") or q.startswith("напиши") or q.startswith("текст"):
         m = re.search(r"(?:печать|написать|текст)\s+(.+)$", q)
-        return type_text(m.group(1)) if m else "Что напечатать?"
+        return type_text(m.group(1), who=who) if m else "Что напечатать?"
     if q.startswith("кнопк") or q.startswith("нажми"):
         m = re.search(r"(?:кнопка|нажать)\s+([a-zа-я_]+)", q)
-        return key(m.group(1)) if m else "Какую кнопку? home/back/recents/power/volume_up/volume_down"
+        return key(m.group(1), who=who) if m else \
+            "Какую кнопку? home/back/recents/power/volume_up/volume_down"
     if q.startswith("зали") or q.startswith("закин") or q.startswith("push"):
         m = re.search(r"(?:залить|закинуть|push)\s+(.+)$", q)
-        return push(m.group(1).strip()) if m else "Что залить? Дай путь."
+        return push(m.group(1).strip(), who=who) if m else \
+            "Что залить? Дай путь."
     return ("Не понял: «%s». %s" % (what, help_str()))
 
 
 def help_str():
-    return ("📱 Телефон: «телефон статус» (сеть/adb/батарея), «телефон "
-            "подключи» (сам найдёт порт по mDNS), «телефон спарить <6 цифр> "
-            "<ip:порт>» (один раз, пара навсегда), «телефон фото 5» (скачать "
-            "свежие), «телефон скрин», «телефон зеркало» (экран на ПК), "
-            "«телефон приложения <поиск>», «телефон тап X Y» / «свайп X1 Y1 "
-            "X2 Y2» / «печать текст» / «кнопка home|back|power», «телефон "
-            "залить <путь>». Порт отладки на телефоне меняется — это "
-            "нормально, я ищу актуальный сам.")
+    return ("📱 Телефоны: Шефа (POCO) и жены (Realme). Слова «жены»/«Шефа» "
+            "выбирают телефон: «телефон жены статус», «телефон статус» "
+            "(оба). Дальше: «подключи» (сам найдёт порт по mDNS), «спарить "
+            "<6 цифр> <ip:порт>» (один раз, пара навсегда), «фото 5» "
+            "(скачать свежие), «скрин», «зеркало» (экран на ПК), "
+            "«приложения <поиск>», «тап X Y» / «свайп X1 Y1 X2 Y2» / "
+            "«печать текст» / «кнопка home|back|power», «залить <путь>». "
+            "Порт отладки на телефонах меняется — это нормально, я ищу "
+            "актуальный сам.")
