@@ -655,10 +655,11 @@ async function ask(text, files, disp){
         let ev;
         try { ev = JSON.parse(line); } catch(e) { continue; }
         if (ev.type === "tok"){ acc += ev.text; bubble.textContent = acc; bubble.appendChild(cursor); chat.scrollTop = chat.scrollHeight; }
-        else if (ev.type === "say"){ cursor.remove(); addMsg("say", "⚙️ " + ev.text); bubble.appendChild(cursor); }
-        else if (ev.type === "tool"){ cursor.remove(); addMsg("say", "🛠 инструмент: " + ev.name); bubble.appendChild(cursor); }
-        else if (ev.type === "image"){ cursor.remove(); addImg(ev.b64); bubble.appendChild(cursor); }
-        else if (ev.type === "file"){ cursor.remove(); turnFiles.push(ev); addFilesToBubble(bubble, [ev]); bubble.appendChild(cursor); }
+        else if (ev.type === "say"){ cursor.remove(); addMsg("say", "⚙️ " + ev.text); chat.appendChild(bubble); bubble.appendChild(cursor); }   /* v3.31: пузырь ответа всегда ПОСЛЕ размышлений, в конце ленты */
+        else if (ev.type === "tool"){ cursor.remove(); addMsg("say", "🛠 инструмент: " + ev.name); chat.appendChild(bubble); bubble.appendChild(cursor); }
+        else if (ev.type === "act"){ cursor.remove(); addMsg("say", "🔧 " + (ev.title || ev.name)); chat.appendChild(bubble); bubble.appendChild(cursor); }   /* v3.31: живой пинг сделанного действия */
+        else if (ev.type === "image"){ cursor.remove(); addImg(ev.b64); chat.appendChild(bubble); bubble.appendChild(cursor); }
+        else if (ev.type === "file"){ cursor.remove(); turnFiles.push(ev); addFilesToBubble(bubble, [ev]); chat.appendChild(bubble); bubble.appendChild(cursor); }
         else if (ev.type === "voice"){ wantVoice = true; if (ev.name) vName = ev.name.toLowerCase(); }  /* v3.16: сервер подтвердил приказ голосом */
         else if (ev.type === "waiting"){ dot.className = "dot wait"; statusEl.textContent = "загружаю мозг в видеопамять…"; }
         else if (ev.type === "done"){ acc = ev.text || acc; }

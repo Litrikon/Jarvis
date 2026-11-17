@@ -736,6 +736,15 @@ class Handler(BaseHTTPRequestHandler):
                         return emit({"type": "say", "text": ev.get("text", "")})
                     if et == "waiting":
                         return emit({"type": "waiting"})
+                    if et == "act":
+                        # v3.31.0 (Task 183): живой пинг «🔧 …» после
+                        # каждого исполненного действия — Шеф видит
+                        # работу в реальном времени, а не тишину
+                        return emit({"type": "act",
+                                     "name": ev.get("name", ""),
+                                     "title": brain_core.TOOL_TITLES.get(
+                                         ev.get("name", ""),
+                                         ev.get("name", "?"))})
                     if et == "tool":
                         # карточки «скачать»: пути из результата инструмента
                         for _p in _paths_from_text(ev.get("result", "")):
