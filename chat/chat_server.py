@@ -23,6 +23,13 @@ v3.8.3 (Task 103): push-to-talk «рация» (ptt.py) удалён по при
   Шефа — /api/asr кормит только кнопку 🎤 веб-чата.
 v3.4.0 (Task 101) «СОБЫТИЯ»: GET /api/tts?text=... — озвучка ответа
   голосом Ирины (piper) для кнопки 🔊 в веб-чате.
+v3.32.0 (Task 185) «КНОПКА СТОП»: POST /api/stop — кнопка ⏹ «Стоп» в
+веб-чате (справа снизу) немедленно прерывает рассуждения Джарвиса.
+Мозг: stop_check -> llm_stream_chat проверяет флаг на каждом чанке,
+StopInterrupt летит прямо из think-фазы -> brain_turn отвечает «✋
+Остановился, Шеф» + «📋 Сделал:» (единая механика Task 183). До этого
+написать «стоп» было НЕЛЬЗЯ: «Отправить» блокируется на весь ход (один
+ход — один стрим), а кнопка работает в любой момент.
 v3.15.0 (Task 136) «СКАЧИВАЙ И УЧИСЬ»: (1) файлы в самом чате — событие
   {"type":"file","path","name","size"} в стриме /api/chat: когда Джарвис
   выгружает/отправляет файл («выгрузить_файл»/«отправить_файл») или в
@@ -89,6 +96,15 @@ except Exception:
 CHAT_DIR = os.path.dirname(os.path.abspath(__file__))        # D:\Jarvis\chat
 BASE = os.path.dirname(CHAT_DIR)                             # D:\Jarvis
 PORT = 8123
+
+# v3.32.0 (Task 185): состояние кнопки «Стоп» веб-чата.
+#   gen  — поколение хода: растёт на каждый POST /api/chat; stop_check
+#          хода срабатывает только пока его поколение текущее (старый
+#          стрим не убивает новый ход);
+#   stop — флаг «Шеф просил остановить»;
+#   busy — идёт ли ход прямо сейчас (для честного busy в /api/stop).
+_STOP_LOCK = threading.Lock()
+WEB_STOP = {"gen": 0, "stop": False, "busy": False}
 MAX_UPLOAD = 100 * 1024 * 1024  # v3.1.1: стоп-кран загрузки, как в Telegram
 MAX_VOICE = 30 * 1024 * 1024   # v3.2.0: голосовой ввод (wav 16k ~ 32 КБ/с)
 
@@ -453,6 +469,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, "path": p, "size": sz,
                              "name": os.path.basename(p)})
             return
+        if self.path == "/api/stop":
+            # v3.32.0 (Task 185): кнопка «Стоп» — прервать ход немедленно.
+            # Ход не активен -> флаг был «залипшим» (клик вхолостую уже
+            # отработал) — гасим, чтобы НЕ убить следующий ход на старте.
+            with _STOP_LOCK:
+                busy = WEB_STOP["busy"]
+                WEB_STOP["stop"] = bool(busy)
+            clog("стоп: Шеф нажал «Стоп» (ход активен: %s)" % busy)
+            self._send_json({"ok": True, "busy": busy})
+            return
         if self.path != "/api/chat":
             self.send_response(404)
             self.send_header("Content-Length", "0")
@@ -494,6 +520,13 @@ class Handler(BaseHTTPRequestHandler):
         # v3.15.0 (Task 136) «САМОУЧКА»: ход веб-чата тоже пишет урок-опыт
         # (turn_begin до prompt_fill — уроки попадут в промпт этого хода;
         # turn_finish в finally ниже — при любом исходе, даже при обрыве)
+        # v3.32.0 (Task 185): новый ход — снять чужой «стоп», выдать
+        # поколение; stop_check сработает только для ЭТОГО хода
+        with _STOP_LOCK:
+            WEB_STOP["stop"] = False
+            _gen = WEB_STOP["gen"] = WEB_STOP["gen"] + 1
+            WEB_STOP["busy"] = True
+        _stop_fn = (lambda: (WEB_STOP["gen"] == _gen and WEB_STOP["stop"]))
         jarvis.turn_begin(disp or message)
         _final_txt_holder = [""]   # то, что дойдёт до turn_finish
         _web_files = []             # файлы этого хода для карточек «скачать»
@@ -774,11 +807,16 @@ class Handler(BaseHTTPRequestHandler):
                         ConnectionResetError):
                     return False
 
-            final_txt, _brain_fail = brain_core.brain_loop(
-                jarvis,
-                {"text": utext, "mode": (_mode or "think"),
-                 "stream": True, "sysmsg": sysmsg,
-                 "emit": _emit, "log": clog})
+            _stopped_mid = [False]   # v3.32.0 (Task 185)
+            _turn_ctx = {"text": utext, "mode": (_mode or "think"),
+                         "stream": True, "sysmsg": sysmsg,
+                         "emit": _emit, "log": clog,
+                         "stop_check": _stop_fn}
+            final_txt, _brain_fail = brain_core.brain_turn(
+                jarvis, _turn_ctx)
+            if _turn_ctx.get("_stopped_interrupt"):
+                # v3.32.0: ход оборван кнопкой «Стоп» — пометка в финале
+                _stopped_mid[0] = True
             if not final_txt:
                 # канал отвалился (вкладка закрыта) — тихо заканчиваем
                 return
@@ -794,6 +832,8 @@ class Handler(BaseHTTPRequestHandler):
                     _sz = 0
                 emit({"type": "file", "path": _p,
                       "name": os.path.basename(_p), "size": _sz})
+            if _stopped_mid[0]:
+                final_txt += "\n⏹ (остановлено Шефом)"
             emit({"type": "done", "text": final_txt})
             _final_txt_holder[0] = final_txt
             # v2 (Task 89): общая история + зеркало + дубль в Telegram
@@ -817,6 +857,9 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         finally:
+            # v3.32.0 (Task 185): ход кончился (любым исходом) — не активен
+            with _STOP_LOCK:
+                WEB_STOP["busy"] = False
             # v3.15.0 (Task 136): конец хода — авто-урок в memory/lessons.json
             try:
                 jarvis.turn_finish(_final_txt_holder[0])
@@ -851,8 +894,9 @@ def main():
             time.sleep(0.8)
             os.startfile("http://127.0.0.1:%d" % PORT)
         threading.Thread(target=_open, daemon=True).start()
-    clog("чат-сервер запущен v3.17 «silero-голоса» + ответь голосом + "
-         "файлы в чате + самообучение (pid %s)" % os.getpid())
+    clog("чат-сервер запущен v3.32.0 «КНОПКА СТОП» (⏹ справа снизу — "
+         "прерывает рассуждения в любой момент) + всё прежнее "
+         "(pid %s)" % os.getpid())
     while True:  # v2: serve_forever может упасть — цикл перезапускает
         try:
             srv.serve_forever(poll_interval=0.5)
