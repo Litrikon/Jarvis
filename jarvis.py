@@ -2024,7 +2024,7 @@ def llm_chat(messages, max_tokens=None, temperature=0.7, think=False):
     msgs = list(messages)
     txt = ""
     _think = bool(think)
-    for _attempt in (1, 2):
+    for _attempt in (1, 2, 3):   # v3.32.1: 3 попытки (думание x2 -> запрет)
         body = {"model": MODEL_ID,
                 "messages": _pack_for_ctx(msgs, max_tokens),
                 "max_tokens": max_tokens,
@@ -2062,6 +2062,16 @@ def llm_chat(messages, max_tokens=None, temperature=0.7, think=False):
         # тоже повтор без думания
         _empty_after_think = (not txt.strip() and _think)
         if (_broke_think or _empty_after_think) and _attempt == 1:
+            # v3.32.1 (Task 186): живой сбой 23.11 — думание сжигало весь
+            # лимит (reasoning 5-8k, content 0, finish_reason=length),
+            # «повтор без думания» рвал JSON инструментов лимитом 600.
+            # ТЕПЕРЬ: первый повтор — С тем же думанием, но удвоенным
+            # лимитом: ответу даём родиться (контекст 12288 позволяет).
+            if _think and not _broke_think:
+                log("llm_chat: думание съело лимит (%d ток.) — повтор "
+                    "с удвоенным лимитом" % max_tokens)
+                max_tokens = min(max_tokens * 2, 8000)
+                continue
             log("llm_chat: пустой/оборванный ответ после думания — "
                 "повтор с запретом")
             _think = False  # v3.10.0: и в умном режиме повтор — без думания
